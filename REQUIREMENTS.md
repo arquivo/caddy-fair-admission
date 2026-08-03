@@ -164,16 +164,12 @@ both.
 
 ### 4.1 Ingress / trusted proxy (`app/ingress.py`) — `fairness`
 
-- Reject (403) any request whose peer is not in a configured trusted-proxy allowlist, **except**
-  `/healthz`, `/readyz`, `/metrics`-equivalent paths.
-- Resolve real client IP from `X-Forwarded-For` at a configurable number of hops from the right,
-  falling back to the peer IP.
-- In Caddy terms: this overlaps with Caddy's built-in `trusted_proxies` global option and
-  `client_ip` placeholder machinery — **prefer reusing Caddy's own trusted-proxy resolution instead
-  of reimplementing it**, and have this module consume `{http.request.remote.host}` /ish
-  placeholders rather than parsing XFF itself, unless Caddy's built-in hop-counting semantics don't
-  match FR-010a's "exactly N hops from the right" requirement precisely (needs verification during
-  design, not assumed here).
+- **No custom trusted-proxy/XFF logic in this module at all.** Caddy's own `trusted_proxies` +
+  `trusted_proxies_strict` global options already resolve a real client IP from `X-Forwarded-For`
+  behind a trusted boundary, and a plain `not remote_ip <ranges>` matcher already rejects untrusted
+  peers (with `/healthz`/`/readyz`/`/metrics`-equivalent paths excluded via a path matcher) — both
+  are standard Caddyfile config, not something `fairness` needs to implement or expose settings for.
+- `fairness` simply consumes Caddy's already-resolved `{client_ip}` placeholder.
 
 ### 4.2 Classification (`app/classifier.py`, `app/geoip.py`, `app/auth.py`) — `fairness`
 
@@ -443,8 +439,11 @@ Caddyfile global-options block of its own.
 
 ## 7. Open questions to resolve during design (not decided by this document)
 
-1. Does Caddy's built-in trusted-proxy/`client_ip` placeholder machinery satisfy FR-010a's
-   exact-hop-count XFF resolution, or does this module need its own?
+1. ~~Does Caddy's built-in trusted-proxy/`client_ip` placeholder machinery satisfy FR-010a's
+   exact-hop-count XFF resolution, or does this module need its own?~~ — **decided:** no custom
+   logic needed; Caddy's `trusted_proxies`/`trusted_proxies_strict` + a `not remote_ip` matcher
+   fully cover it (§4.1). Dropped the "exact hop count" requirement itself — it was a Python
+   implementation detail, not something worth preserving for its own sake.
 2. Reuse `reverse_proxy` (upstreams, health checks, `lb_policy`) vs. fully custom load
    balancer/dispatcher — recommended default is to reuse and extend, see §4.6/§4.7.
 3. Can this module register its own admin API routes, or should introspection ride on
