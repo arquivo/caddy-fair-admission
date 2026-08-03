@@ -359,3 +359,80 @@ app module and referenced by the handler modules via `ctx.App("adaptive_admissio
    IP's traffic to backend A and backend B counted together) or per-handler (isolated per backend) —
    current recommendation is app-level, since penalizing an abusive IP should apply system-wide, not
    reset per backend it happens to hit.
+
+## 8. Performance requirements and lessons from the Python implementation
+
+A dated (2026-08-03) production/load-test investigation against the Python system
+(`docs/scaling_remediation_plan.md`, `docs/deployment.md`, `docs/known_limitations.md` in
+`adaptive-admission-controller`) found that its throughput **peaked around 50-100 concurrent
+requests (~327 req/s) and then dropped** as offered concurrency rose to 250 (down to ~80 req/s,
+p99 > 4.5s), with 0% rejections and no FD/queue exhaustion — i.e. the process was CPU-bound, not
+resource-starved. A "wake-storm" hypothesis (`asyncio.Condition.notify_all()` waking every queued
+waiter) was fixed and A/B tested but produced **no measurable improvement**, because the
+architecture only ever has one waiter per backend condition — the fix was correct but not the
+cause. Real profiling (`py-spy`, since `cProfile` misattributes async I/O time) showed CPU time
+diffused across dozens of call sites (event-loop bookkeeping, HTTP client internals, JSON logging,
+middleware chain), none individually above ~2% of samples: **cumulative per-request overhead
+across the whole single-threaded async stack**, not one fixable hot function. The documented
+conclusion was that this requires multi-process scale-out to fix in Python.
+
+**This class of failure is largely eliminated by construction in Go** — goroutines run on real OS
+threads across cores, so there is no single-threaded ceiling to saturate the way `uvicorn`'s one
+event loop did. That is a reason to expect a materially higher ceiling, **not** a license to skip
+verifying it, and not a reason to reintroduce the same shape of problem (many cheap-looking
+per-request costs compounding into one bottleneck) inside a single hot path. Concretely, carried
+forward as requirements for this port:
+
+- **Load test the actual concurrency ramp, don't assume Go's parallelism alone fixes it.** Port an
+  equivalent of `scripts/load_test.py` (ramp-up/hold-open/multi-endpoint concurrency sweep,
+  measuring p50/p95/p99 and throughput vs. offered concurrency) early enough to run it against the
+  Go module before considering this port's performance validated. If throughput still inverts at
+  some concurrency level, profile with `pprof` before hypothesizing a fix — the Python
+  investigation's lesson is that plausible-sounding contention theories (wake-storm) can be wrong
+  even when the underlying fix is harmless to make.
+- **No single global lock serializing all per-request scoring/state updates.** The Python system's
+  per-request scoring did six *sequential* Redis round-trips (not concurrent), serialized on the
+  admission-decision critical path. The in-memory EWMA maps (§3.2/§4.3) must not recreate an
+  equivalent serialization point: prefer per-dimension sharded mutexes or `sync.Map` over one
+  mutex guarding all six dimensions' maps, and update independent dimensions concurrently
+  (goroutines/`errgroup`) rather than sequentially, if profiling later shows this matters — do not
+  add this complexity speculatively before measuring, but do not reach for "one big mutex" as the
+  default either, given it was directly implicated as a design smell (even though not the root
+  cause) in the source system.
+- **Percentile tracking must not re-sort the full sample window on every controller tick.** The
+  Python `LatencyWindow.p95()` re-sorts a 100-sample deque (`O(n log n)`) on every `adjust_loop()`
+  tick (§4.4). Even though the tick is infrequent (default 30s), implement this with an
+  incrementally-maintained structure (e.g. a fixed-size histogram/bucket structure, a running
+  t-digest, or an insertion-sorted structure updated per-sample) so p95 computation is `O(log n)`
+  or better — do it correctly the first time rather than porting the sort-per-tick approach as-is.
+- **Any bounded cache added to this port must use true O(1) eviction**, not a linear scan. The
+  Python `GeoIPLookup` cache evicts via `min(cache, key=...)` — an O(n) scan over up to 10k entries
+  on every eviction. If this port adds an in-memory cache anywhere (e.g. GeoIP lookup results,
+  JWKS key lookups), use a real LRU (ring buffer + map, or an existing Go LRU package), never a
+  scan-to-find-minimum.
+- **Load-balancer instance selection must not rebuild candidate sets from scratch per request.**
+  The Python `LeastLoadedLoadBalancer._active_pool()` rebuilds two filtered dicts from all upstream
+  URLs on every single `select()` call, serialized under one shared lock (§4.6). This port's
+  least-in-flight selection should maintain an incrementally-updated candidate structure (updated
+  on health-check transitions and in-flight count changes) rather than recomputing a full
+  active/healthy partition on every dispatched request.
+- **One structured log call per admission decision, not several.** The Python system does at least
+  two separate JSON-serialization passes per request (the admission event and a separate
+  score-breakdown log, §4.9). This port's structured logging requirement (§4.9) already specifies
+  "one JSON log line per admission decision" — implement that literally as a single `ctx.Logger()`
+  call carrying all fields (including the score breakdown) as structured zap fields, not as a
+  separately-serialized nested blob or a second log call.
+- **Keep the always-executed request/response hot path allocation-light.** Header filtering
+  (hop-by-hop stripping), queue-entry construction, and per-request IP parsing are individually
+  cheap in the Python source but run unconditionally on every request and were named among the
+  diffuse profiling hot spots. Where Go idioms make it easy (e.g. reusing buffers via `sync.Pool`
+  for queue entries, avoiding unnecessary `net.IP`/string conversions when Caddy's own
+  placeholders already provide a parsed value), prefer the lower-allocation form — but do not
+  micro-optimize this speculatively at the expense of clarity; profile first, per the load-testing
+  requirement above.
+- **Upstream connection pooling must be explicitly sized, not left at a library default.** The
+  Python system's shared Redis connection pool (default size 100) was identified as "the tightest
+  shared ceiling in the system," initially configured only implicitly. Since this port drops Redis
+  entirely (§3.2), the equivalent concern is upstream HTTP connection pooling via `reverse_proxy` —
+  its transport's max-idle-connections/max-connections-per-host settings should be explicit,
+  documented config surface (§4.7), not left to Go's `http.Transport` defaults.
