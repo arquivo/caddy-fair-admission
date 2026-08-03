@@ -64,10 +64,11 @@ matching is Caddy's job, not either module's.
 **Ordering is load-bearing and not automatic.** `fairness` must run before `adaptive_admission` in
 the chain so a score exists to prioritize by. Because these are two independently-registered
 third-party directives, Caddy's built-in directive order has no opinion on their relative sequence
-— this must be handled by either registering an explicit `httpcaddyfile.RegisterOrder` position for
-both, or documenting that operators wrap them in an explicit `route { fairness; adaptive_admission;
-reverse_proxy }` block (Caddy's own recommended pattern for third-party directive ordering); see the
-open question in §7.
+— **decided (§7 Q7):** both directives register an explicit `httpcaddyfile.RegisterOrder` position
+(`fairness` immediately before `adaptive_admission`), so a bare Caddyfile with both directives at
+the top level of a `route`/`site` block orders correctly without requiring an explicit `route {
+fairness; adaptive_admission; reverse_proxy }` wrapper. Wrapping in `route { ... }` still works (it
+always does in Caddy) but is no longer a documented requirement for correct ordering.
 
 **There is no dedicated global-options directive for either module** (see §5) — each block declares
 its own settings (GeoIP/JWKS on `fairness` blocks, capacity/LB tuning on `adaptive_admission`
@@ -410,10 +411,10 @@ handle_path /imagesearch* {
 }
 ```
 
-The explicit `route { ... }` wrapper is what guarantees `fairness` runs before
-`adaptive_admission` in the Caddyfile (see the ordering discussion in §3.1) — whether this stays
-a documented requirement or gets additionally enforced via `httpcaddyfile.RegisterOrder` (so a bare,
-non-`route`-wrapped ordering also works) is an open question, §7.
+The `route { ... }` wrapper shown above still works and is a fine way to make ordering visually
+explicit, but it is no longer required for correctness: both directives register an explicit
+`httpcaddyfile.RegisterOrder` position, so `fairness` runs before `adaptive_admission` even in a
+bare, non-`route`-wrapped Caddyfile (§3.1, §7 Q7 — decided).
 
 The equivalent JSON: each block's fully-resolved config (including whatever it imported) becomes its
 own handler config object under `apps.http.servers.<name>.routes[].handle[]`
@@ -464,11 +465,12 @@ Caddyfile global-options block of its own.
    backends, one IP's traffic to backend A and backend B counted together) or per-handler (isolated
    per backend) — current recommendation is app-level, since penalizing an abusive IP should apply
    system-wide, not reset per backend it happens to hit.
-7. Whether directive ordering between `fairness` and `adaptive_admission` should be enforced via
+7. ~~Whether directive ordering between `fairness` and `adaptive_admission` should be enforced via
    `httpcaddyfile.RegisterOrder` (so a bare, non-`route`-wrapped Caddyfile still orders correctly)
-   or left as a documented requirement to wrap both in an explicit `route { ... }` block (§3.1/§5)
-   — recommended default is to attempt `RegisterOrder` and treat the explicit `route` block as a
-   fallback/escape hatch, not decided here.
+   or left as a documented requirement to wrap both in an explicit `route { ... }` block
+   (§3.1/§5)~~ — **decided:** enforced via `httpcaddyfile.RegisterOrder` (`fairness` immediately
+   before `adaptive_admission`); explicit `route { ... }` wrapping remains valid but is no longer
+   required.
 
 ## 8. Performance requirements and lessons from the Python implementation
 
