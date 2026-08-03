@@ -3,10 +3,11 @@
 ## 1. Purpose
 
 Port the full capability set of the existing Python AAC (`adaptive-admission-controller`,
-FastAPI/Starlette reverse-proxy admission control in front of arquivo.pt's backends) into a native
-**Caddy module**, so it runs as goroutines inside the same `caddy` process that will front
+FastAPI/Starlette reverse-proxy admission control in front of arquivo.pt's backends) into native
+**Caddy modules**, so it runs as goroutines inside the same `caddy` process that will front
 arquivo.pt after the Apache→Caddy migration — instead of as a separate uvicorn process fronted by
-Apache/Caddy over HTTP.
+Apache/Caddy over HTTP. This is split into two composable modules within one project — `fairness`
+and `adaptive_admission` (§3.1) — chained together in a Caddy route, not one monolithic handler.
 
 This is a **from-scratch reimplementation**, not a wrapper around the Python process. The project
 name is **`caddy-adaptive-admission-controller`** — "adaptive" is load-bearing: p95-latency-driven,
@@ -20,8 +21,9 @@ Caddy port must not do this.** All configuration — backend definitions, upstre
 controllers, scoring rules, ingress trust settings, GeoIP paths, auth/JWKS settings — must be
 expressible natively inside Caddy's own per-site/per-host configuration, via:
 
-- a **Caddyfile directive** (e.g. `adaptive_admission { ... }`) usable inside a `site` block, and
-- the equivalent **JSON config** node under `apps.http.servers.<name>.routes[].handle`.
+- **Caddyfile directives** (`fairness { ... }` and `adaptive_admission { ... }`, chained together
+  in the same route — see §3.1/§5) usable inside a `site` block, and
+- the equivalent **JSON config** nodes under `apps.http.servers.<name>.routes[].handle`.
 
 No `AAC_*` environment variables, no separate YAML file, no side-channel config path. Anything the
 Python system currently reads from `backends.yaml` or `AAC_`-prefixed env vars must become either
@@ -30,20 +32,50 @@ directive arguments/sub-blocks or, where genuinely global rather than per-site (
 
 ## 3. Architecture shape
 
-### 3.1 Two module roles
+### 3.1 Module roles: `fairness` and `adaptive_admission`
 
-- **HTTP handler module** (`http.handlers.adaptive_admission`) — implements
-  `caddyhttp.MiddlewareHandler.ServeHTTP(w, r, next)`. One instance is configured per Caddyfile
-  `adaptive_admission` block / per JSON route `handle` entry, corresponding 1:1 to one of today's
-  Python "backends" (a path-prefix-matched upstream group). Caddy's own `matcher` blocks
-  (`path_prefix.py:_prefix_matches` port) replace the Python `match.path_prefix` field entirely —
-  route matching is Caddy's job, not this module's.
-- **App module** (`caddy.App`, namespace `adaptive_admission`) — holds state that must be shared
-  *across* backend instances within the same Caddy process: the GeoIP DB readers (opened once, not
-  once per backend), the JWKS verifier/refresh loop (one per configured issuer, not per backend),
-  and — if scoring penalties must be shared across multiple `caddy` processes on the same host in
-  future — a pluggable penalty-store backend. Referenced by handler instances via Caddy's
-  `caddy.App`/module-loading mechanism (`ctx.App("adaptive_admission")`), not by a config file path.
+The system is split into two independently-loadable Caddy modules rather than one monolithic
+handler — Caddy's `ServeHTTP(w, r, next)` middleware-chain model is built for exactly this kind of
+composition (the same way `basicauth`, `rate_limit`, and `reverse_proxy` compose):
+
+- **`fairness`** — `http.handlers.fairness`, backed by its own app module (`caddy.App`, namespace
+  `fairness`). Covers ingress/trusted-proxy consumption and classification (§4.1-4.2) and
+  EWMA-based scoring/penalties (§4.3). Its app module holds the GeoIP DB readers (opened once, not
+  once per backend), the JWKS verifier/refresh loop (one per configured issuer), and the
+  per-dimension EWMA scoring maps (§3.2). On `ServeHTTP`, it computes the request's classification
+  and score, writes them onto the request via `caddyhttp.SetVar` (Caddy's standard mechanism for one
+  handler to pass data to later handlers in the same chain — this also exposes the score as a Caddy
+  placeholder, e.g. `{vars.fairness_score}`, usable for free in logging/matchers elsewhere in the
+  Caddyfile), then calls `next.ServeHTTP()`.
+- **`adaptive_admission`** — `http.handlers.adaptive_admission`, backed by its own app module
+  (`caddy.App`, namespace `adaptive_admission`). Covers capacity control (§4.4), the priority
+  queue/scheduler (§4.5), load balancing (§4.6), and dispatch (§4.7). Its app module holds
+  capacity-controller state (in-flight counts, latency window, adaptive limit) and load-balancer
+  state (sticky map, health map) per backend. On `ServeHTTP`, it reads the score `fairness` set via
+  `caddyhttp.GetVar` — defaulting to a neutral/unpenalized score and proceeding fail-open (§4.3) if
+  `fairness` wasn't chained ahead of it at all, exactly as it already must if `fairness`'s own
+  counters are merely down — enqueues by that score, waits for capacity, then dispatches.
+
+Both are configured per Caddyfile block / per JSON route `handle` entry, corresponding 1:1 to one
+of today's Python "backends" (a path-prefix-matched upstream group); Caddy's own `matcher` blocks
+(`path_prefix.py:_prefix_matches` port) replace the Python `match.path_prefix` field entirely — route
+matching is Caddy's job, not either module's.
+
+**Ordering is load-bearing and not automatic.** `fairness` must run before `adaptive_admission` in
+the chain so a score exists to prioritize by. Because these are two independently-registered
+third-party directives, Caddy's built-in directive order has no opinion on their relative sequence
+— this must be handled by either registering an explicit `httpcaddyfile.RegisterOrder` position for
+both, or documenting that operators wrap them in an explicit `route { fairness; adaptive_admission;
+reverse_proxy }` block (Caddy's own recommended pattern for third-party directive ordering); see the
+open question in §7.
+
+**There is no dedicated global-options directive for either module** (see §5) — each block declares
+its own settings (GeoIP/JWKS on `fairness` blocks, capacity/LB tuning on `adaptive_admission`
+blocks), typically shared across blocks via Caddy's native `import` snippet mechanism rather than a
+bespoke global block, and each app module's `Provision()` dedupes its own expensive shared resources
+by keying on their identity (a GeoIP DB reader keyed by file path, a JWKS verifier/refresh loop
+keyed by issuer URL) rather than requiring the settings to be written down in only one place in the
+Caddyfile.
 
 ### 3.2 In-process shared state (in-memory only, single-instance target)
 
@@ -51,14 +83,16 @@ The Python system's `RedisPenaltyStore` exists only because `uvicorn --workers N
 processes* with no shared memory — this was the whole reason the Python multi-process scaling plan
 was abandoned in favor of this rewrite. A single `caddy` process has no such barrier: all goroutines
 share memory directly, so this port **drops the external-store abstraction entirely** rather than
-reimplementing a `PenaltyStore`-style interface "in case it's needed later." Penalty counters,
-capacity-controller state (`_in_flight`, latency window), and load-balancer state (sticky map,
-health map) are plain in-process data structures guarded by `sync.Mutex`/`sync.RWMutex`, matching
-`asyncio.Lock`/`asyncio.Condition` 1:1 with `sync.Mutex`/`sync.Cond`.
+reimplementing a `PenaltyStore`-style interface "in case it's needed later." Penalty/EWMA counters
+live in the `fairness` app module's state; capacity-controller state (`_in_flight`, latency window)
+and load-balancer state (sticky map, health map) live in the `adaptive_admission` app module's state
+(§3.1). All of it is plain in-process data structures guarded by `sync.Mutex`/`sync.RWMutex`,
+matching `asyncio.Lock`/`asyncio.Condition` 1:1 with `sync.Mutex`/`sync.Cond`.
 
-**Per-entity scoring state is aggregated statistics, not raw request logs.** Storing individual
-request timestamps per IP would be memory-prohibitive at arquivo.pt's scale. Each tracked entity
-(IP, `/24`/`/48`/`/56`, ASN) instead holds one small fixed-size struct:
+**Per-entity scoring state (held by the `fairness` app module) is aggregated statistics, not raw
+request logs.** Storing individual request timestamps per IP would be memory-prohibitive at
+arquivo.pt's scale. Each tracked entity (IP, `/24`/`/48`/`/56`, ASN) instead holds one small
+fixed-size struct:
 
 ```go
 type ClientStats struct {
@@ -89,16 +123,15 @@ speculatively here. Revisit only if multi-instance actually becomes a deployment
 
 Per Caddy's module lifecycle: on every config change (`caddy reload` / admin API `/load`), Caddy
 provisions **new** module instances before tearing down the old ones — instances can briefly
-overlap, and there is no guarantee of "hand off state from old to new instance" for free. Anything
-this plugin holds in memory that must survive a reload (in particular: capacity-controller
-in-flight counts and adaptive limits, load-balancer health/sticky state, GeoIP/JWKS caches, and the
-per-entity EWMA scoring maps from §3.2/§4.3) needs a
-deliberate carry-over strategy — e.g. `caddy.UsagePool` keyed by backend name, so a reload reuses
-the existing state object instead of resetting counters/limits to their configured defaults on
-every `caddy reload`. This must be an explicit design decision, not an accidental side effect of
-whatever `Provision()` happens to do — silently resetting adaptive concurrency limits to
-`initial_concurrency` on every unrelated config reload elsewhere on the same Caddy instance would be
-a regression.
+overlap, and there is no guarantee of "hand off state from old to new instance" for free. Both app
+modules hold state that must survive a reload — `adaptive_admission`'s capacity-controller in-flight
+counts/adaptive limits and load-balancer health/sticky state, and `fairness`'s GeoIP/JWKS caches and
+per-entity EWMA scoring maps (§3.2/§4.3) — and each needs its own deliberate carry-over strategy,
+e.g. `caddy.UsagePool` keyed by backend name, so a reload reuses the existing state object instead
+of resetting counters/limits to their configured defaults on every `caddy reload`. This must be an
+explicit design decision in both app modules, not an accidental side effect of whatever
+`Provision()` happens to do — silently resetting adaptive concurrency limits to `initial_concurrency`
+on every unrelated config reload elsewhere on the same Caddy instance would be a regression.
 
 ### 3.4 Build & distribution
 
@@ -113,19 +146,23 @@ following are required:
   if useful for arquivo.pt's deployment, a container image wrapping it) as a release artifact —
   the primary way arquivo.pt itself deploys this is a binary this project ships, not a Caddyfile
   someone else has to `xcaddy build` by hand.
-- **The module stays independently importable.** The Go package(s) implementing
-  `http.handlers.adaptive_admission` and the `adaptive_admission` app module must remain a normal,
-  standalone Go module (correct `go.mod` path, no hard dependency on anything specific to this
-  repo's own release pipeline), so any third party can compose it into their *own* custom Caddy
-  build the standard way: `xcaddy build --with
+- **Both modules stay independently importable.** The Go packages implementing
+  `http.handlers.fairness`/`fairness` app module and `http.handlers.adaptive_admission`/
+  `adaptive_admission` app module live in one repo but must remain normal, standalone Go packages
+  (correct `go.mod` path, no hard dependency on anything specific to this repo's own release
+  pipeline) — importable either together or independently, since §3.1 already requires
+  `adaptive_admission` to work without `fairness` chained ahead of it. Any third party can compose
+  either or both into their *own* custom Caddy build the standard way: `xcaddy build --with
   github.com/arquivo/caddy-adaptive-admission-controller` alongside whatever other modules they
   need. Do not assume this project's own prebuilt binary is the only supported way to consume it.
 
 ## 4. Functional requirements ported from the Python system
 
 Each item below names the Python source of truth and what it must become in Caddy-native terms.
+§4.1-4.3 belong to the `fairness` module, §4.4-4.7 to `adaptive_admission` (§3.1); §4.8-4.10 span
+both.
 
-### 4.1 Ingress / trusted proxy (`app/ingress.py`)
+### 4.1 Ingress / trusted proxy (`app/ingress.py`) — `fairness`
 
 - Reject (403) any request whose peer is not in a configured trusted-proxy allowlist, **except**
   `/healthz`, `/readyz`, `/metrics`-equivalent paths.
@@ -138,7 +175,7 @@ Each item below names the Python source of truth and what it must become in Cadd
   match FR-010a's "exactly N hops from the right" requirement precisely (needs verification during
   design, not assumed here).
 
-### 4.2 Classification (`app/classifier.py`, `app/geoip.py`, `app/auth.py`)
+### 4.2 Classification (`app/classifier.py`, `app/geoip.py`, `app/auth.py`) — `fairness`
 
 - Per-request context: source IP, `/24` (IPv4) or configurable `/48`/`/56` (IPv6) subnet, ASN,
   country (via MaxMind `.mmdb` city+ASN DBs, each independently fail-open if unopenable), user
@@ -146,11 +183,12 @@ Each item below names the Python source of truth and what it must become in Cadd
   periodic background refresh that fails open — keeps stale/empty key set rather than erroring).
   User classes: `anonymous, researcher, service_account, internal, unknown` (identity-only —
   behavior-based signals live entirely in scoring, never folded into user class).
-- GeoIP DB paths and JWKS issuer/audience/refresh-interval are per-deployment settings — expressed
-  as Caddyfile sub-directives / JSON fields on the app module (shared across backends) rather than
-  repeated per backend block, since one process opens the DB/JWKS config once.
+- GeoIP DB paths and JWKS issuer/audience/refresh-interval are declared per `fairness` block
+  (typically shared across blocks via Caddy's native `import`, §5) — the `fairness` app module
+  dedupes the actual DB opens/JWKS refresh loops by resource identity (§3.1) rather than requiring
+  one process-wide config location.
 
-### 4.3 Scoring / penalties (`app/scoring.py`, `app/config.py`'s `ScoringConfig`) — EWMA-based
+### 4.3 Scoring / penalties (`app/scoring.py`, `app/config.py`'s `ScoringConfig`) — EWMA-based, `fairness`
 
 - A `final = clamp(base_score[user_class] - penalty, min_score, max_score)` per request, where
   `penalty` sums step-function penalties (soft/hard thresholds → soft/hard penalty amounts),
@@ -181,11 +219,12 @@ Each item below names the Python source of truth and what it must become in Cadd
 - Must fail open (fall back to unpenalized base score) if the in-memory counter state is
   unavailable/uninitialized, never 5xx the request.
 - Config surface: exempt countries, IPv6 prefix length (48/56), base scores per user class, score
-  clamp min/max, EWMA tick interval (global) and default + per-backend-override per-dimension
+  clamp min/max, EWMA tick interval (default, per `fairness` block, typically shared via `import`)
+  and default + per-backend-override per-dimension
   `alpha`, soft/hard threshold, soft/hard penalty, and idle-entry TTL (§3.2 GC) — all expressible as
   nested Caddyfile blocks/JSON per backend.
 
-### 4.4 Capacity control (`app/capacity.py`)
+### 4.4 Capacity control (`app/capacity.py`) — `adaptive_admission`
 
 - Two controller kinds, selected per backend:
   - **Fixed**: static concurrency limit.
@@ -204,7 +243,7 @@ Each item below names the Python source of truth and what it must become in Cadd
 - `cost` is uniform (`1`) for v1, matching the Python system's decision log — do not build
   per-request variable cost unless explicitly requested later.
 
-### 4.5 Scheduling / priority queue (`app/scheduler.py`, `app/errors.py`)
+### 4.5 Scheduling / priority queue (`app/scheduler.py`, `app/errors.py`) — `adaptive_admission`
 
 - Backend-scoped bounded priority queue, ordered by score (higher score served first) then arrival
   time (FIFO within same score).
@@ -216,7 +255,7 @@ Each item below names the Python source of truth and what it must become in Cadd
   priority order, not queue-time snapshot order (only correct because cost is uniformly 1 — call
   this out as a load-bearing assumption in code comments, same as the Python source does).
 
-### 4.6 Load balancing (`app/load_balancer.py`)
+### 4.6 Load balancing (`app/load_balancer.py`) — `adaptive_admission`
 
 - Per-backend least-in-flight instance selection across primary `upstreams`, falling back to
   `backup_upstreams` if all primaries are unhealthy, and failing open to the full instance set if
@@ -238,7 +277,7 @@ Each item below names the Python source of truth and what it must become in Cadd
   health-check code is very likely less risky than reimplementing TCP health probing from scratch —
   flagged here as the default recommendation, not yet decided.
 
-### 4.7 Dispatch / reverse proxy (`app/dispatcher.py`)
+### 4.7 Dispatch / reverse proxy (`app/dispatcher.py`) — `adaptive_admission`
 
 - Preserve original request path/query when proxying to the selected instance (`path_prefix` used
   only for backend *selection*, never rewritten into the upstream URL — "drop-in Apache ProxyPass
@@ -264,7 +303,10 @@ Each item below names the Python source of truth and what it must become in Cadd
   histograms: backend request duration, queue wait duration, score distribution) — labeled by
   backend (and instance/class/reason where the Python version does). Caddy already ships Prometheus
   metrics support (`metrics` app/directive) — integrate as additional metrics registered against
-  Caddy's existing Prometheus registry rather than standing up a second `/metrics` endpoint.
+  Caddy's existing Prometheus registry rather than standing up a second `/metrics` endpoint. Metrics
+  originating in `fairness` (score distribution) and `adaptive_admission` (everything else) both
+  register against that same shared registry — the module split changes which package emits a given
+  metric, not the metric surface itself.
 
 ### 4.9 Structured logging (`app/observability.py`)
 
@@ -273,7 +315,10 @@ Each item below names the Python source of truth and what it must become in Cadd
   rejection reason / queue wait ms / backend latency ms / status code. Caddy already emits
   structured (zap-based) JSON logs — emit these as structured log entries via the module's
   `ctx.Logger()` rather than a separate logging subsystem, so operators get one unified log stream
-  instead of two.
+  instead of two. Since `adaptive_admission` is the one that knows the final admitted/rejected
+  outcome, it owns emitting this single log line — it reads the classification/score `fairness` set
+  via `caddyhttp.GetVar` (§3.1) and folds them in as fields, so `fairness` itself never logs
+  separately per request (consistent with §8's "one structured log call per admission decision").
 
 ### 4.10 Admin / introspection API (`app/admin.py`)
 
@@ -286,71 +331,104 @@ Each item below names the Python source of truth and what it must become in Cadd
   introspection data either as a Caddy admin API route extension (if the module system allows
   registering admin endpoints) or as a small set of app-level JSON fields readable via
   `GET /config/...`, rather than standing up a second bearer-token-gated HTTP surface — needs
-  design-phase verification of whether Caddy modules can register admin API routes.
+  design-phase verification of whether Caddy modules can register admin API routes. Since state is
+  now split across two app modules (§3.1), introspection must cover both — `fairness`'s resolved
+  scoring config and GeoIP/JWKS health, and `adaptive_admission`'s capacity/load-balancer snapshot —
+  whether that ends up as one combined surface or two parallel ones is part of this open question.
 
 ## 5. Config schema sketch (Caddyfile + JSON)
 
 Illustrative only — exact field names/nesting to be finalized at design time.
 
-**Caddyfile**, inside a `site` block, one directive per backend:
+**Caddyfile**, inside a `site` block: one `fairness` block and one `adaptive_admission` block per
+backend, chained via an explicit `route` block for ordering (§3.1). There is no separate
+`adaptive_admission_global`/`fairness_global` directive or app-level global-options block — settings
+that are conceptually shared across backends (GeoIP DB paths, JWKS issuer, exempt countries, EWMA
+defaults, capacity-controller tuning, etc.) are just regular fields inside each block, reused across
+blocks with Caddy's own native `import` directive and named snippets (`(snippet-name) { ... }` /
+`import snippet-name`) rather than a bespoke global syntax. See §3.1 for how the underlying app
+modules still avoid opening the same GeoIP DB / starting a duplicate JWKS refresh loop per block:
 
 ```caddyfile
+(shared_fairness_defaults) {
+    geoip_city_db /etc/caddy/GeoLite2-City.mmdb
+    geoip_asn_db  /etc/caddy/GeoLite2-ASN.mmdb
+    auth_issuer   https://sso.arquivo.pt/realms/arquivo
+    auth_jwks_url https://sso.arquivo.pt/realms/arquivo/protocol/openid-connect/certs
+    exempt_country PT
+    ipv6_prefix_length 56
+    ewma_tick_interval 1s
+    idle_entry_ttl     10m
+}
+
 handle_path /textsearch* {
-    adaptive_admission {
-        controller adaptive {
-            min_concurrency    10
-            initial_concurrency 40
-            max_concurrency    200
-            target_p95_ms      800
-            timeout_rate_threshold 0.05
-            error_rate_threshold   0.05
+    route {
+        fairness {
+            import shared_fairness_defaults
+
+            scoring {
+                base_score researcher 100
+                base_score anonymous  60
+                penalty ip alpha=0.2 soft=20:-10 hard=100:-40
+                # ... per-dimension overrides
+            }
         }
 
-        upstream http://page-search-api-1:8080
-        upstream http://page-search-api-2:8080
-        backup_upstream http://page-search-api-standby:8080
+        adaptive_admission {
+            controller adaptive {
+                min_concurrency    10
+                initial_concurrency 40
+                max_concurrency    200
+                target_p95_ms      800
+                timeout_rate_threshold 0.05
+                error_rate_threshold   0.05
+            }
 
-        connect_timeout   5s
-        backend_timeout   30s
-        queue_max_size    500
-        queue_timeout     10s
-        sticky_sessions   on
-        sticky_ttl        5m
+            upstream http://page-search-api-1:8080
+            upstream http://page-search-api-2:8080
+            backup_upstream http://page-search-api-standby:8080
 
-        scoring {
-            base_score researcher 100
-            base_score anonymous  60
-            penalty ip alpha=0.2 soft=20:-10 hard=100:-40
-            # ... per-dimension overrides
+            connect_timeout   5s
+            backend_timeout   30s
+            queue_max_size    500
+            queue_timeout     10s
+            sticky_sessions   on
+            sticky_ttl        5m
         }
+
+        reverse_proxy ...  # or adaptive_admission composes with reverse_proxy directly
     }
-    reverse_proxy ...  # or adaptive_admission composes with reverse_proxy directly
+}
+
+handle_path /imagesearch* {
+    route {
+        fairness {
+            import shared_fairness_defaults
+        }
+        adaptive_admission {
+            # ...this block's own controller/upstream config
+        }
+        reverse_proxy ...
+    }
 }
 ```
 
-Global, process-wide settings (GeoIP DB paths, JWKS issuer/JWKS URL/audience, exempt countries,
-default EWMA tick interval/alpha, idle-entry TTL, IPv6 prefix length) live once at the top of the
-Caddyfile via the app module's global option block, e.g.:
+The explicit `route { ... }` wrapper is what guarantees `fairness` runs before
+`adaptive_admission` in the Caddyfile (see the ordering discussion in §3.1) — whether this stays
+a documented requirement or gets additionally enforced via `httpcaddyfile.RegisterOrder` (so a bare,
+non-`route`-wrapped ordering also works) is an open question, §7.
 
-```caddyfile
-{
-    adaptive_admission_global {
-        geoip_city_db /etc/caddy/GeoLite2-City.mmdb
-        geoip_asn_db  /etc/caddy/GeoLite2-ASN.mmdb
-        auth_issuer   https://sso.arquivo.pt/realms/arquivo
-        auth_jwks_url https://sso.arquivo.pt/realms/arquivo/protocol/openid-connect/certs
-        exempt_country PT
-        ipv6_prefix_length 56
-        ewma_tick_interval 1s
-        idle_entry_ttl     10m
-    }
-}
-```
-
-The equivalent JSON: the per-backend block becomes the handler's config object under
-`apps.http.servers.<name>.routes[].handle[]` (`"handler": "adaptive_admission", ...fields}`); the
-global block becomes `apps.adaptive_admission.{geoip, auth, scoring_defaults, ...}`, loaded as an
-app module and referenced by the handler modules via `ctx.App("adaptive_admission")`.
+The equivalent JSON: each block's fully-resolved config (including whatever it imported) becomes its
+own handler config object under `apps.http.servers.<name>.routes[].handle[]`
+(`"handler": "fairness", ...` then `"handler": "adaptive_admission", ...`, in that order in the
+`handle` array — JSON's array order *is* the execution order, so there is no ordering ambiguity on
+the JSON side the way there is in Caddyfile). JSON config has no equivalent of `import` (there's
+nothing to textually expand), so each route's handler objects are simply fully self-contained/
+repeated, and it's each app module's keyed resource dedup (§3.1), not the config shape, that prevents
+redundant GeoIP/JWKS or capacity-controller-state work when multiple routes' resolved config happens
+to match. Both app modules (`fairness`, `adaptive_admission`) are loaded and referenced by their
+respective handler modules via `ctx.App(...)`, exactly as in §3.1 — neither has a corresponding
+Caddyfile global-options block of its own.
 
 ## 6. Non-goals for v1 (carried forward from the Python system's documented scope cuts)
 
@@ -374,12 +452,19 @@ app module and referenced by the handler modules via `ctx.App("adaptive_admissio
 4. Exact `caddy.UsagePool` (or equivalent) strategy for carrying capacity-controller/load-balancer/
    EWMA-scoring state across a config reload without resetting it to configured defaults every time
    (§3.3).
-5. Whether GeoIP/JWKS state belongs on the app module (shared) or could reasonably be per-handler —
-   current recommendation is app-level (§3.1) to avoid redundant DB opens/JWKS fetches per backend.
-6. Whether per-dimension EWMA maps (§3.2/§4.3) belong on the app module (shared across backends, one
-   IP's traffic to backend A and backend B counted together) or per-handler (isolated per backend) —
-   current recommendation is app-level, since penalizing an abusive IP should apply system-wide, not
-   reset per backend it happens to hit.
+5. ~~Whether GeoIP/JWKS state belongs on the app module (shared) or could reasonably be
+   per-handler~~ — **decided:** the `fairness` app module (§3.1), keyed by resource identity (DB
+   path / issuer URL) rather than requiring a dedicated global-options directive, so blocks share
+   the underlying resource whether or not they used `import` to declare identical settings (§5).
+6. Whether per-dimension EWMA maps (§3.2/§4.3) belong on the `fairness` app module (shared across
+   backends, one IP's traffic to backend A and backend B counted together) or per-handler (isolated
+   per backend) — current recommendation is app-level, since penalizing an abusive IP should apply
+   system-wide, not reset per backend it happens to hit.
+7. Whether directive ordering between `fairness` and `adaptive_admission` should be enforced via
+   `httpcaddyfile.RegisterOrder` (so a bare, non-`route`-wrapped Caddyfile still orders correctly)
+   or left as a documented requirement to wrap both in an explicit `route { ... }` block (§3.1/§5)
+   — recommended default is to attempt `RegisterOrder` and treat the explicit `route` block as a
+   fallback/escape hatch, not decided here.
 
 ## 8. Performance requirements and lessons from the Python implementation
 
