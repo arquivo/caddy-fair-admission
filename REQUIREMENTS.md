@@ -41,12 +41,14 @@ composition (the same way `basicauth`, `rate_limit`, and `reverse_proxy` compose
 - **`fairness`** — `http.handlers.fairness`, backed by its own app module (`caddy.App`, namespace
   `fairness`). Covers ingress/trusted-proxy consumption and classification (§4.1-4.2) and
   EWMA-based scoring/penalties (§4.3). Its app module holds the GeoIP DB readers (opened once, not
-  once per backend), the JWKS verifier/refresh loop (one per configured issuer), and the
-  per-dimension EWMA scoring maps (§3.2). On `ServeHTTP`, it computes the request's classification
-  and score, writes them onto the request via `caddyhttp.SetVar` (Caddy's standard mechanism for one
-  handler to pass data to later handlers in the same chain — this also exposes the score as a Caddy
-  placeholder, e.g. `{vars.fairness_score}`, usable for free in logging/matchers elsewhere in the
-  Caddyfile), then calls `next.ServeHTTP()`.
+  once per backend) and the JWKS verifier/refresh loop (one per configured issuer), deduped by
+  resource identity across blocks — the per-dimension EWMA scoring maps are deliberately **not**
+  here (§3.2/§7 Q6): each `fairness` handler instance keeps its own, isolated per backend. On
+  `ServeHTTP`, it computes the request's classification and score, writes them onto the request via
+  `caddyhttp.SetVar` (Caddy's standard mechanism for one handler to pass data to later handlers in
+  the same chain — this also exposes the score as a Caddy placeholder, e.g.
+  `{vars.fairness_score}`, usable for free in logging/matchers elsewhere in the Caddyfile), then
+  calls `next.ServeHTTP()`.
 - **`adaptive_admission`** — `http.handlers.adaptive_admission`, backed by its own app module
   (`caddy.App`, namespace `adaptive_admission`). Covers capacity control (§4.4), the priority
   queue/scheduler (§4.5), load balancing (§4.6), and dispatch (§4.7). Its app module holds
@@ -85,15 +87,19 @@ processes* with no shared memory — this was the whole reason the Python multi-
 was abandoned in favor of this rewrite. A single `caddy` process has no such barrier: all goroutines
 share memory directly, so this port **drops the external-store abstraction entirely** rather than
 reimplementing a `PenaltyStore`-style interface "in case it's needed later." Penalty/EWMA counters
-live in the `fairness` app module's state; capacity-controller state (`_in_flight`, latency window)
-and load-balancer state (sticky map, health map) live in the `adaptive_admission` app module's state
-(§3.1). All of it is plain in-process data structures guarded by `sync.Mutex`/`sync.RWMutex`,
-matching `asyncio.Lock`/`asyncio.Condition` 1:1 with `sync.Mutex`/`sync.Cond`.
+live per `fairness` handler instance — one isolated set per backend, not shared app-wide (§7 Q6:
+decided per-backend rather than app-level, since backends already have independently-tuned
+thresholds for the same dimension, and real abuse concentrates on one backend rather than
+splitting across several to evade detection). Capacity-controller state (`_in_flight`, latency
+window) and load-balancer state (sticky map, health map) live in the `adaptive_admission` app
+module's state (§3.1). All of it is plain in-process data structures guarded by
+`sync.Mutex`/`sync.RWMutex`, matching `asyncio.Lock`/`asyncio.Condition` 1:1 with
+`sync.Mutex`/`sync.Cond`.
 
-**Per-entity scoring state (held by the `fairness` app module) is aggregated statistics, not raw
-request logs.** Storing individual request timestamps per IP would be memory-prohibitive at
-arquivo.pt's scale. Each tracked entity (IP, `/24`/`/48`/`/56`, ASN) instead holds one small
-fixed-size struct:
+**Per-entity scoring state (held per `fairness` handler instance, isolated per backend) is
+aggregated statistics, not raw request logs.** Storing individual request timestamps per IP would be
+memory-prohibitive at arquivo.pt's scale. Each tracked entity (IP, `/24`/`/48`/`/56`, ASN) instead
+holds one small fixed-size struct:
 
 ```go
 type ClientStats struct {
@@ -103,11 +109,11 @@ type ClientStats struct {
 }
 ```
 
-kept in one `map[string]*ClientStats` per dimension (IP, `/24`(or `/48`/`/56`), ASN), guarded by a
-mutex — sharded mutexes or `sync.Map` only if contention profiling later shows plain locking is a
-bottleneck. See §4.3 for how `EWMARPS` is computed and used for penalty thresholds. At arquivo.pt's
-expected cardinality (order 10^5–10^6 distinct active entities), this is single-digit-to-low-hundreds
-of MB — not a scale that justifies an external store.
+kept in one `map[string]*ClientStats` per dimension (IP, `/24`(or `/48`/`/56`), ASN) **per backend**,
+guarded by a mutex — sharded mutexes or `sync.Map` only if contention profiling later shows plain
+locking is a bottleneck. See §4.3 for how `EWMARPS` is computed and used for penalty thresholds. At
+arquivo.pt's expected cardinality (order 10^5–10^6 distinct active entities per backend), this is
+single-digit-to-low-hundreds of MB per backend — not a scale that justifies an external store.
 
 **Garbage collection:** a background ticker (every ~1 minute, configurable) sweeps each map and
 deletes entries where `now.Sub(LastSeen) > idle_ttl` (default e.g. 10 minutes), so memory is bounded
@@ -336,11 +342,11 @@ both.
   — one entry per backend, as the Python system's per-backend summary already is.
 - `GET /fairness/status` (or similar): **also per-backend**, not one shared blob — each `fairness`
   block's fully resolved scoring config (base scores, per-dimension thresholds/penalties after
-  backend-level override merge, §4.3) is reported per backend, mirroring
-  `adaptive_admission`'s per-backend shape above. Only the genuinely shared resources — GeoIP DB
-  health, JWKS refresh health, and (per §7 Q6) the per-dimension EWMA counters if they end up
-  app-level rather than per-backend — appear once, in a separate shared section, since those are
-  deliberately deduped at the app-module level (§3.1) rather than duplicated per block.
+  backend-level override merge, §4.3) *and* its own per-dimension EWMA counters (§3.2/§7 Q6:
+  decided per-backend, isolated) are reported per backend, mirroring `adaptive_admission`'s
+  per-backend shape above. Only the genuinely shared resources — GeoIP DB health and JWKS refresh
+  health — appear once, in a separate shared section, since those are deliberately deduped at the
+  app-module level (§3.1) rather than duplicated per block.
 
 ## 5. Config schema sketch (Caddyfile + JSON)
 
@@ -474,10 +480,13 @@ Caddyfile global-options block of its own.
    per-handler~~ — **decided:** the `fairness` app module (§3.1), keyed by resource identity (DB
    path / issuer URL) rather than requiring a dedicated global-options directive, so blocks share
    the underlying resource whether or not they used `import` to declare identical settings (§5).
-6. Whether per-dimension EWMA maps (§3.2/§4.3) belong on the `fairness` app module (shared across
+6. ~~Whether per-dimension EWMA maps (§3.2/§4.3) belong on the `fairness` app module (shared across
    backends, one IP's traffic to backend A and backend B counted together) or per-handler (isolated
-   per backend) — current recommendation is app-level, since penalizing an abusive IP should apply
-   system-wide, not reset per backend it happens to hit.
+   per backend)~~ — **decided: per-handler, isolated per backend.** Backends already have
+   independently-tuned thresholds for the same dimension (§4.3's per-backend overrides), so a
+   shared cross-backend counter would be judged against whichever backend's threshold happens to be
+   evaluating it; real abuse concentrates on one backend rather than splitting traffic across
+   several to evade detection, so the isolation has no meaningful downside here.
 7. ~~Whether directive ordering between `fairness` and `adaptive_admission` should be enforced via
    `httpcaddyfile.RegisterOrder` (so a bare, non-`route`-wrapped Caddyfile still orders correctly)
    or left as a documented requirement to wrap both in an explicit `route { ... }` block
