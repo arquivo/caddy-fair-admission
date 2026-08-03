@@ -253,43 +253,44 @@ both.
 
 ### 4.6 Load balancing (`app/load_balancer.py`) — `adaptive_admission`
 
-- Per-backend least-in-flight instance selection across primary `upstreams`, falling back to
-  `backup_upstreams` if all primaries are unhealthy, and failing open to the full instance set if
-  everything is unhealthy (never hard-fail a request due to LB state).
-- Optional sticky sessions keyed by client IP, TTL-expiring, with **fair-share eviction**: evict a
-  sticky pin only when the pinned instance's load has reached `ceil(capacity_hint / candidate
-  count)` *and* a strictly-less-loaded alternative exists.
-- Background health checks: periodic raw TCP probe of down instances, mark recovered/still-down,
-  with matching log events (`upstream_instance_marked_down` / `upstream_instance_recovered`).
+- Compose with Caddy's built-in `reverse_proxy` rather than building a custom load balancer:
+  `lb_policy least_conn` provides least-in-flight instance selection natively, and `reverse_proxy`'s
+  active (`health_uri`/`health_interval`/`health_passes`/`health_fails`) plus passive
+  (`fail_duration`/`max_fails`/`unhealthy_status`/`unhealthy_latency`) health checks replace the
+  Python system's custom TCP-probe health-check loop entirely — no health-check code needed in this
+  module.
+- Sticky sessions: use `reverse_proxy`'s built-in `cookie` (or `client_ip_hash`) affinity policy
+  as-is. **Dropped:** the Python system's fair-share eviction refinement (evict a pin only once the
+  pinned instance's load crosses a threshold and a strictly-less-loaded alternative exists) — Caddy
+  has no built-in equivalent, and it isn't worth a custom `lb_policy` module just to preserve it;
+  plain TTL-expiring stickiness is enough.
+- Primary/backup upstream tiers and "fail open to the full instance set if everything is unhealthy"
+  (never hard-fail a request due to LB state) should be verified against `reverse_proxy`'s actual
+  behavior with multiple `upstreams` during implementation — express via Caddyfile composition if
+  Caddy's own defaults don't already cover it, not a custom dispatcher.
 - Known Python-side scope cut carried forward as an explicit non-goal for v1: `current_limit()` /
   capacity-controller decisions are backend-scoped, not instance-health-aware — an unhealthy
   instance being routed around doesn't shrink the backend's overall concurrency limit. Revisit only
   if explicitly requested.
-- **Caddy overlap:** Caddy's built-in `reverse_proxy` already has upstream selection, health checks,
-  and (via `lb_policy`) various balancing policies. Decide during design whether to (a) reuse
-  `reverse_proxy`'s upstream pool/health-check machinery and only supply a custom `lb_policy` module
-  plugging in least-in-flight + sticky-by-fair-share, or (b) keep this fully custom to preserve the
-  Python system's exact sticky/fair-share semantics. Reusing Caddy's `reverse_proxy` upstream +
-  health-check code is very likely less risky than reimplementing TCP health probing from scratch —
-  flagged here as the default recommendation, not yet decided.
 
 ### 4.7 Dispatch / reverse proxy (`app/dispatcher.py`) — `adaptive_admission`
 
-- Preserve original request path/query when proxying to the selected instance (`path_prefix` used
-  only for backend *selection*, never rewritten into the upstream URL — "drop-in Apache ProxyPass
-  replacement" behavior).
-- Strip hop-by-hop headers; preserve repeated headers such as multiple `Set-Cookie` values.
-- Distinguish connect failures (mark instance down, 502) from response timeouts (503,
-  `reason=backend_timeout`) from generic HTTP errors (502) from successful-but-5xx upstream
-  responses (still counted as "admitted", tracked separately via `backend_errors_total`-equivalent
-  metric) — this exact taxonomy of outcomes must be preserved since it drives both metrics and the
-  adaptive controller's error/timeout rate thresholds.
-- **Caddy overlap:** this entire concern maps closely onto Caddy's own `reverse_proxy` transport/
-  timeout/error-handling. Strongly prefer wrapping/composing with `reverse_proxy` rather than
-  writing a parallel HTTP client stack — this is one of the biggest potential implementation-size
-  reductions versus the Python system, which had to build its own httpx-based proxy layer from
-  scratch. Needs design-phase verification that `reverse_proxy`'s hooks are sufficient to distinguish
-  connect-vs-timeout-vs-5xx the way the adaptive controller requires.
+- Compose with Caddy's built-in `reverse_proxy` directly rather than writing a parallel HTTP client
+  stack. Preserve original request path/query when proxying to the selected instance (`path_prefix`
+  used only for backend *selection*, never rewritten into the upstream URL) and strip hop-by-hop
+  headers while preserving repeated headers such as multiple `Set-Cookie` values — `reverse_proxy`
+  already does both by default.
+- Outcome taxonomy is mostly free from `reverse_proxy`'s own error handling, not custom code:
+  - Connect failures and round-trip timeouts already surface as distinct Caddy errors (triggering
+    `handle_errors`, with `{err.status_code}`/`{err.message}`) — reuse these rather than
+    reimplementing failure classification.
+  - An upstream's own 5xx **response** passes through untouched (Caddy does not treat a written 5xx
+    response as an "error" the way it treats connect/timeout failures) — this already matches the
+    requirement to count it as "admitted" rather than rejected; track it via a normal
+    access-log-based status-code counter, not custom error-classification code.
+  - `backend_errors_total`/timeout/connect-failure metrics (§4.8) should be derived from these
+    existing signals (passive health check counters, `handle_errors`, access log status codes)
+    rather than a bespoke outcome-classification layer.
 
 ### 4.8 Metrics (`app/metrics.py`)
 
@@ -444,8 +445,12 @@ Caddyfile global-options block of its own.
    logic needed; Caddy's `trusted_proxies`/`trusted_proxies_strict` + a `not remote_ip` matcher
    fully cover it (§4.1). Dropped the "exact hop count" requirement itself — it was a Python
    implementation detail, not something worth preserving for its own sake.
-2. Reuse `reverse_proxy` (upstreams, health checks, `lb_policy`) vs. fully custom load
-   balancer/dispatcher — recommended default is to reuse and extend, see §4.6/§4.7.
+2. ~~Reuse `reverse_proxy` (upstreams, health checks, `lb_policy`) vs. fully custom load
+   balancer/dispatcher — recommended default is to reuse and extend, see §4.6/§4.7.~~ — **decided:**
+   fully reuse `reverse_proxy` (upstreams, `lb_policy least_conn`, active+passive health checks,
+   dispatch/error handling); no custom load balancer or HTTP client stack. Sticky sessions use
+   `reverse_proxy`'s built-in `cookie`/`client_ip_hash` affinity as-is — the Python system's
+   fair-share sticky-eviction refinement is dropped, not ported (§4.6).
 3. Can this module register its own admin API routes, or should introspection ride on
    `GET /config/...` against app-level state instead of a bespoke `/admin/*` surface?
 4. Exact `caddy.UsagePool` (or equivalent) strategy for carrying capacity-controller/load-balancer/
