@@ -45,22 +45,45 @@ directive arguments/sub-blocks or, where genuinely global rather than per-site (
   future — a pluggable penalty-store backend. Referenced by handler instances via Caddy's
   `caddy.App`/module-loading mechanism (`ctx.App("adaptive_admission")`), not by a config file path.
 
-### 3.2 In-process shared state replaces Redis (single-instance target)
+### 3.2 In-process shared state (in-memory only, single-instance target)
 
-The Python system's `RedisPenaltyStore` exists because `uvicorn --workers N` runs N *separate
+The Python system's `RedisPenaltyStore` exists only because `uvicorn --workers N` runs N *separate
 processes* with no shared memory — this was the whole reason the Python multi-process scaling plan
-was abandoned in favor of this rewrite. A single `caddy` process has no such barrier: all
-goroutines share memory directly. For the primary target deployment (one Caddy process per host),
-penalty counters, capacity-controller state (`_in_flight`, latency window), and load-balancer state
-(sticky map, health map) should be plain in-process data structures guarded by `sync.Mutex` /
-`sync.RWMutex`, matching `asyncio.Lock`/`asyncio.Condition` 1:1 with `sync.Mutex`/`sync.Cond`.
+was abandoned in favor of this rewrite. A single `caddy` process has no such barrier: all goroutines
+share memory directly, so this port **drops the external-store abstraction entirely** rather than
+reimplementing a `PenaltyStore`-style interface "in case it's needed later." Penalty counters,
+capacity-controller state (`_in_flight`, latency window), and load-balancer state (sticky map,
+health map) are plain in-process data structures guarded by `sync.Mutex`/`sync.RWMutex`, matching
+`asyncio.Lock`/`asyncio.Condition` 1:1 with `sync.Mutex`/`sync.Cond`.
 
-**Open question carried into design, not resolved by this doc:** if arquivo.pt ever runs multiple
-Caddy instances behind a shared front (matching the Python system's existing "Multi-instance load
-balancing scope limits" documented gap), the penalty store and sticky-session state would need an
-external backend again (Redis or otherwise) via the same `PenaltyStore`-style interface abstraction
-used today — but this is explicitly **out of scope for v1**, exactly as it was cut from the Python
-system's scope for the same reason.
+**Per-entity scoring state is aggregated statistics, not raw request logs.** Storing individual
+request timestamps per IP would be memory-prohibitive at arquivo.pt's scale. Each tracked entity
+(IP, `/24`/`/48`/`/56`, ASN) instead holds one small fixed-size struct:
+
+```go
+type ClientStats struct {
+    LastSeen time.Time
+    EWMARPS  float64
+    Inflight int
+}
+```
+
+kept in one `map[string]*ClientStats` per dimension (IP, `/24`(or `/48`/`/56`), ASN), guarded by a
+mutex — sharded mutexes or `sync.Map` only if contention profiling later shows plain locking is a
+bottleneck. See §4.3 for how `EWMARPS` is computed and used for penalty thresholds. At arquivo.pt's
+expected cardinality (order 10^5–10^6 distinct active entities), this is single-digit-to-low-hundreds
+of MB — not a scale that justifies an external store.
+
+**Garbage collection:** a background ticker (every ~1 minute, configurable) sweeps each map and
+deletes entries where `now.Sub(LastSeen) > idle_ttl` (default e.g. 10 minutes), so memory is bounded
+by *recently active* entities rather than all-time-seen ones.
+
+**Multi-instance clustering is explicitly out of scope for v1** (unchanged from the Python system's
+own documented "Multi-instance load balancing scope limits" gap, see also §6): if arquivo.pt ever
+runs multiple Caddy instances behind a shared front, each instance would only see a fraction of the
+traffic per entity, and scoring/sticky state would need to be reconciled across instances somehow —
+solving that (via Redis or any other external store) is deliberately **not** designed in
+speculatively here. Revisit only if multi-instance actually becomes a deployment requirement.
 
 ### 3.3 Config reload semantics to design around
 
@@ -68,7 +91,8 @@ Per Caddy's module lifecycle: on every config change (`caddy reload` / admin API
 provisions **new** module instances before tearing down the old ones — instances can briefly
 overlap, and there is no guarantee of "hand off state from old to new instance" for free. Anything
 this plugin holds in memory that must survive a reload (in particular: capacity-controller
-in-flight counts and adaptive limits, load-balancer health/sticky state, GeoIP/JWKS caches) needs a
+in-flight counts and adaptive limits, load-balancer health/sticky state, GeoIP/JWKS caches, and the
+per-entity EWMA scoring maps from §3.2/§4.3) needs a
 deliberate carry-over strategy — e.g. `caddy.UsagePool` keyed by backend name, so a reload reuses
 the existing state object instead of resetting counters/limits to their configured defaults on
 every `caddy reload`. This must be an explicit design decision, not an accidental side effect of
@@ -105,22 +129,40 @@ Each item below names the Python source of truth and what it must become in Cadd
   as Caddyfile sub-directives / JSON fields on the app module (shared across backends) rather than
   repeated per backend block, since one process opens the DB/JWKS config once.
 
-### 4.3 Scoring / penalties (`app/scoring.py`, `app/config.py`'s `ScoringConfig`)
+### 4.3 Scoring / penalties (`app/scoring.py`, `app/config.py`'s `ScoringConfig`) — EWMA-based
 
 - A `final = clamp(base_score[user_class] - penalty, min_score, max_score)` per request, where
-  `penalty` sums step-function penalties (soft/hard thresholds → soft/hard penalty amounts) over a
-  rolling window, independently per dimension: `ip, net24, net6, asn, country, user`.
-- Exempt countries: still track/increment counters (observability) but never contribute their
+  `penalty` sums step-function penalties (soft/hard thresholds → soft/hard penalty amounts),
+  independently per dimension: `ip, net24, net6, asn, country, user`.
+- **Design refinement vs. the Python source:** the Python system's per-dimension counters are plain
+  rolling-window request counts (`window_seconds`). This port instead drives thresholds off an
+  **EWMA (exponentially weighted moving average) of requests/sec**, per dimension — a technique
+  widely used in load balancers/proxies (Envoy, HAProxy, TCP congestion control) to avoid reacting
+  to momentary spikes while still accumulating penalty against sustained load. A normal user's
+  brief 20-request burst decays back out quickly; a crawler holding ~20 rps for minutes, or an ASN
+  spiking to thousands of rps, progressively accumulates penalty. Updated on a fixed tick (default
+  1s) per tracked entity:
+  ```
+  ewma(t) = alpha * requests_in_last_tick + (1 - alpha) * ewma(t-1)
+  ```
+  `alpha` (default e.g. `0.2`) is a per-dimension-configurable smoothing factor — lower alpha reacts
+  more slowly/smoothly, higher alpha weights the most recent tick more heavily. This **replaces**
+  the Python system's `window_seconds` rolling-window semantics for this port; window-based counting
+  is not carried forward.
+- Thresholds (`soft`/`hard` → penalty amounts) are evaluated against each dimension's current
+  `EWMARPS` value (§3.2's `ClientStats.EWMARPS`) rather than a raw window count.
+- Exempt countries: still track/increment EWMA counters (observability) but never contribute their
   penalty to the final score.
-- Backend-level overrides that deep-merge onto global defaults per dimension (mirroring
+- Backend-level overrides deep-merge onto global defaults per dimension (mirroring
   `resolve_scoring_config`'s override-merge, including its aliasing-safety concern — Go structs are
   value types by default so this class of bug is less likely, but any shared default maps/slices
   must still be deep-copied before per-backend mutation).
-- Must fail open (fall back to unpenalized base score) if the counter backend is unavailable, never
-  5xx the request.
+- Must fail open (fall back to unpenalized base score) if the in-memory counter state is
+  unavailable/uninitialized, never 5xx the request.
 - Config surface: exempt countries, IPv6 prefix length (48/56), base scores per user class, score
-  clamp min/max, and default + per-backend-override penalty windows (window seconds, soft/hard
-  threshold, soft/hard penalty) — all expressible as nested Caddyfile blocks/JSON per backend.
+  clamp min/max, EWMA tick interval (global) and default + per-backend-override per-dimension
+  `alpha`, soft/hard threshold, soft/hard penalty, and idle-entry TTL (§3.2 GC) — all expressible as
+  nested Caddyfile blocks/JSON per backend.
 
 ### 4.4 Capacity control (`app/capacity.py`)
 
@@ -257,7 +299,7 @@ handle_path /textsearch* {
         scoring {
             base_score researcher 100
             base_score anonymous  60
-            penalty ip window=60s soft=20:-10 hard=100:-40
+            penalty ip alpha=0.2 soft=20:-10 hard=100:-40
             # ... per-dimension overrides
         }
     }
@@ -266,8 +308,8 @@ handle_path /textsearch* {
 ```
 
 Global, process-wide settings (GeoIP DB paths, JWKS issuer/JWKS URL/audience, exempt countries,
-default penalty windows, IPv6 prefix length) live once at the top of the Caddyfile via the app
-module's global option block, e.g.:
+default EWMA tick interval/alpha, idle-entry TTL, IPv6 prefix length) live once at the top of the
+Caddyfile via the app module's global option block, e.g.:
 
 ```caddyfile
 {
@@ -278,6 +320,8 @@ module's global option block, e.g.:
         auth_jwks_url https://sso.arquivo.pt/realms/arquivo/protocol/openid-connect/certs
         exempt_country PT
         ipv6_prefix_length 56
+        ewma_tick_interval 1s
+        idle_entry_ttl     10m
     }
 }
 ```
@@ -291,8 +335,9 @@ app module and referenced by the handler modules via `ctx.App("adaptive_admissio
 
 - No dry-run/observe-only mode (unless requested later).
 - No per-request variable cost — cost is uniformly 1.
-- No cross-instance shared state (Redis or otherwise) — single Caddy process per host is the target
-  deployment; multi-instance clustering is out of scope, same as it was cut from the Python system.
+- No cross-instance shared state — single Caddy process per host is the target deployment;
+  multi-instance clustering (and whatever external store it would require) is out of scope, same as
+  it was cut from the Python system.
 - No coupling to the separate Apache→Caddy web-server migration project — this plugin is usable
   standalone in any Caddy config once built; sequencing of the two migrations is a deployment
   decision, not a design dependency.
@@ -305,7 +350,12 @@ app module and referenced by the handler modules via `ctx.App("adaptive_admissio
    balancer/dispatcher — recommended default is to reuse and extend, see §4.6/§4.7.
 3. Can this module register its own admin API routes, or should introspection ride on
    `GET /config/...` against app-level state instead of a bespoke `/admin/*` surface?
-4. Exact `caddy.UsagePool` (or equivalent) strategy for carrying capacity-controller/load-balancer
-   state across a config reload without resetting it to configured defaults every time (§3.3).
+4. Exact `caddy.UsagePool` (or equivalent) strategy for carrying capacity-controller/load-balancer/
+   EWMA-scoring state across a config reload without resetting it to configured defaults every time
+   (§3.3).
 5. Whether GeoIP/JWKS state belongs on the app module (shared) or could reasonably be per-handler —
    current recommendation is app-level (§3.1) to avoid redundant DB opens/JWKS fetches per backend.
+6. Whether per-dimension EWMA maps (§3.2/§4.3) belong on the app module (shared across backends, one
+   IP's traffic to backend A and backend B counted together) or per-handler (isolated per backend) —
+   current recommendation is app-level, since penalizing an abusive IP should apply system-wide, not
+   reset per backend it happens to hit.
