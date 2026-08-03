@@ -100,6 +100,27 @@ whatever `Provision()` happens to do — silently resetting adaptive concurrency
 `initial_concurrency` on every unrelated config reload elsewhere on the same Caddy instance would be
 a regression.
 
+### 3.4 Build & distribution
+
+Caddy modules are compiled in, not dynamically loaded, so this project must own producing a
+buildable/distributable `caddy` binary rather than assuming operators will figure that out
+themselves — but it must not *only* be consumable as a private prebuilt binary either. Both of the
+following are required:
+
+- **This repo builds and publishes its own `caddy` binary.** CI uses
+  [`xcaddy`](https://github.com/caddyserver/xcaddy) (`xcaddy build --with
+  github.com/arquivo/caddy-adaptive-admission-controller=.`) to produce a ready-to-run binary (and,
+  if useful for arquivo.pt's deployment, a container image wrapping it) as a release artifact —
+  the primary way arquivo.pt itself deploys this is a binary this project ships, not a Caddyfile
+  someone else has to `xcaddy build` by hand.
+- **The module stays independently importable.** The Go package(s) implementing
+  `http.handlers.adaptive_admission` and the `adaptive_admission` app module must remain a normal,
+  standalone Go module (correct `go.mod` path, no hard dependency on anything specific to this
+  repo's own release pipeline), so any third party can compose it into their *own* custom Caddy
+  build the standard way: `xcaddy build --with
+  github.com/arquivo/caddy-adaptive-admission-controller` alongside whatever other modules they
+  need. Do not assume this project's own prebuilt binary is the only supported way to consume it.
+
 ## 4. Functional requirements ported from the Python system
 
 Each item below names the Python source of truth and what it must become in Caddy-native terms.
