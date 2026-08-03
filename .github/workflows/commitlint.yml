@@ -1,0 +1,8 @@
+name: Commitlint
+
+on:
+  pull_request:
+
+jobs:
+  commitlint:
+    uses: arquivo/.github/.github/workflows/commitlint.yml@main
