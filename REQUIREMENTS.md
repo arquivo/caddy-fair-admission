@@ -318,21 +318,26 @@ both.
   via `caddyhttp.GetVar` (§3.1) and folds them in as fields, so `fairness` itself never logs
   separately per request (consistent with §8's "one structured log call per admission decision").
 
-### 4.10 Admin / introspection API (`app/admin.py`)
+### 4.10 Admin / introspection API (`app/admin.py`) — `fairness` + `adaptive_admission`
 
-- Read-only (no hot-reload endpoints needed — Caddy's own admin API already does config reload):
-  per-backend summary (controller type, current limit, mean latency, queue size, upstream/healthy
-  counts), full resolved policy/scoring config, current limit, and upstream snapshot
-  (url/healthy/in-flight/sticky-count/is-backup). Token-gated; fails closed (403) if no token is
-  configured.
-- **Caddy overlap:** Caddy already has an admin API on `localhost:2019`. Prefer exposing this
-  introspection data either as a Caddy admin API route extension (if the module system allows
-  registering admin endpoints) or as a small set of app-level JSON fields readable via
-  `GET /config/...`, rather than standing up a second bearer-token-gated HTTP surface — needs
-  design-phase verification of whether Caddy modules can register admin API routes. Since state is
-  now split across two app modules (§3.1), introspection must cover both — `fairness`'s resolved
-  scoring config and GeoIP/JWKS health, and `adaptive_admission`'s capacity/load-balancer snapshot —
-  whether that ends up as one combined surface or two parallel ones is part of this open question.
+- Read-only (no hot-reload endpoints needed — Caddy's own admin API already does config reload).
+  **Decided (§7 Q3):** both app modules implement Caddy's `caddy.AdminRouter` interface
+  (`Routes() []caddy.AdminRoute`) to register their own routes directly on Caddy's existing admin
+  API (`localhost:2019`) — the same mechanism `reverse_proxy` already uses for
+  `GET /reverse_proxy/upstreams` and the PKI app for `GET /pki/ca/<id>`. No second HTTP server and
+  no bespoke auth layer: access control is whatever Caddy's own admin API already provides
+  (loopback-only by default, remote access only via Caddy's own `remote { ... }` ACL/mutual-TLS
+  config) — the Python system's independent bearer-token gate is **dropped**, not ported.
+- `GET /adaptive_admission/status` (or similar): per-backend summary — controller type, current
+  limit, mean latency, queue size, upstream snapshot (url/healthy/in-flight/sticky-count/is-backup)
+  — one entry per backend, as the Python system's per-backend summary already is.
+- `GET /fairness/status` (or similar): **also per-backend**, not one shared blob — each `fairness`
+  block's fully resolved scoring config (base scores, per-dimension thresholds/penalties after
+  backend-level override merge, §4.3) is reported per backend, mirroring
+  `adaptive_admission`'s per-backend shape above. Only the genuinely shared resources — GeoIP DB
+  health, JWKS refresh health, and (per §7 Q6) the per-dimension EWMA counters if they end up
+  app-level rather than per-backend — appear once, in a separate shared section, since those are
+  deliberately deduped at the app-module level (§3.1) rather than duplicated per block.
 
 ## 5. Config schema sketch (Caddyfile + JSON)
 
@@ -452,8 +457,10 @@ Caddyfile global-options block of its own.
    dispatch/error handling); no custom load balancer or HTTP client stack. Sticky sessions use
    `reverse_proxy`'s built-in `cookie`/`client_ip_hash` affinity as-is — the Python system's
    fair-share sticky-eviction refinement is dropped, not ported (§4.6).
-3. Can this module register its own admin API routes, or should introspection ride on
-   `GET /config/...` against app-level state instead of a bespoke `/admin/*` surface?
+3. ~~Can this module register its own admin API routes, or should introspection ride on
+   `GET /config/...` against app-level state instead of a bespoke `/admin/*` surface?~~ —
+   **decided:** yes — both app modules implement `caddy.AdminRouter`, registering routes directly
+   on Caddy's own admin API, no bespoke bearer-token-gated surface (§4.10).
 4. Exact `caddy.UsagePool` (or equivalent) strategy for carrying capacity-controller/load-balancer/
    EWMA-scoring state across a config reload without resetting it to configured defaults every time
    (§3.3).
