@@ -123,16 +123,19 @@ speculatively here. Revisit only if multi-instance actually becomes a deployment
 ### 3.3 Config reload semantics to design around
 
 Per Caddy's module lifecycle: on every config change (`caddy reload` / admin API `/load`), Caddy
-provisions **new** module instances before tearing down the old ones — instances can briefly
-overlap, and there is no guarantee of "hand off state from old to new instance" for free. Both app
-modules hold state that must survive a reload — `adaptive_admission`'s capacity-controller in-flight
-counts/adaptive limits and load-balancer health/sticky state, and `fairness`'s GeoIP/JWKS caches and
-per-entity EWMA scoring maps (§3.2/§4.3) — and each needs its own deliberate carry-over strategy,
-e.g. `caddy.UsagePool` keyed by backend name, so a reload reuses the existing state object instead
-of resetting counters/limits to their configured defaults on every `caddy reload`. This must be an
-explicit design decision in both app modules, not an accidental side effect of whatever
-`Provision()` happens to do — silently resetting adaptive concurrency limits to `initial_concurrency`
-on every unrelated config reload elsewhere on the same Caddy instance would be a regression.
+provisions **new** module instances before tearing down the old ones. **Decided (§7 Q4): resetting
+mutable state on every reload is acceptable.** `adaptive_admission`'s capacity-controller in-flight
+counts/adaptive limit and load-balancer health/sticky state, and `fairness`'s per-entity EWMA
+scoring maps (§3.2/§4.3), simply reinitialize to their configured defaults each time `Provision()`
+runs — no `caddy.UsagePool`-based carry-over, no per-backend name field, needed for this. A
+`caddy reload` briefly re-ramping adaptive concurrency from `initial_concurrency` and re-warming
+EWMA counters from zero is an acceptable cost, not a regression to design around.
+
+This is a distinct concern from §3.1's GeoIP DB/JWKS-refresh-loop resource dedup, which is
+unaffected by this decision — that still uses `caddy.UsagePool`, but keyed by the resource's own
+natural identity (the DB file path string, the JWKS issuer URL string) rather than an invented
+backend name, purely to avoid redundant opens/refresh loops when multiple blocks reference the same
+resource within one config.
 
 ### 3.4 Build & distribution
 
@@ -461,9 +464,12 @@ Caddyfile global-options block of its own.
    `GET /config/...` against app-level state instead of a bespoke `/admin/*` surface?~~ —
    **decided:** yes — both app modules implement `caddy.AdminRouter`, registering routes directly
    on Caddy's own admin API, no bespoke bearer-token-gated surface (§4.10).
-4. Exact `caddy.UsagePool` (or equivalent) strategy for carrying capacity-controller/load-balancer/
+4. ~~Exact `caddy.UsagePool` (or equivalent) strategy for carrying capacity-controller/load-balancer/
    EWMA-scoring state across a config reload without resetting it to configured defaults every time
-   (§3.3).
+   (§3.3).~~ — **decided:** no carry-over — resetting this state on every reload is acceptable;
+   `Provision()` simply reinitializes fresh state each time (§3.3). The separate GeoIP/JWKS
+   resource-dedup mechanism (§3.1) is unaffected, since it's keyed by the resource's own identity,
+   not a backend name.
 5. ~~Whether GeoIP/JWKS state belongs on the app module (shared) or could reasonably be
    per-handler~~ — **decided:** the `fairness` app module (§3.1), keyed by resource identity (DB
    path / issuer URL) rather than requiring a dedicated global-options directive, so blocks share
