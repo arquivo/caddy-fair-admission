@@ -2,7 +2,13 @@ module github.com/arquivo/caddy-adaptive-admission-controller
 
 go 1.26.3
 
-require github.com/caddyserver/caddy/v2 v2.11.4
+require (
+	github.com/MicahParks/jwkset v0.11.1
+	github.com/MicahParks/keyfunc/v3 v3.8.1
+	github.com/caddyserver/caddy/v2 v2.11.4
+	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/oschwald/geoip2-golang/v2 v2.2.0
+)
 
 require (
 	cel.dev/expr v0.25.1 // indirect
@@ -68,6 +74,7 @@ require (
 	github.com/mitchellh/go-ps v1.0.0 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/oschwald/maxminddb-golang/v2 v2.3.0 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
