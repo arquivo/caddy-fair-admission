@@ -19,6 +19,10 @@ const defaultJWKSRefreshInterval = 5 * time.Minute
 // (§5) which already carry them don't fail to parse against a Phase-4-only
 // build.
 type Config struct {
+	// Backend labels this block's metrics/logs (§4.8/§4.9). Empty defaults to
+	// "default" via backendLabel() — purely a label, never used for routing.
+	Backend string `json:"backend,omitempty"`
+
 	// GeoIPCityDB is the path to a MaxMind city/country .mmdb database.
 	// Empty, missing, or unopenable: country lookups silently return "" (no
 	// error, no panic) — fail-open per §4.2.
@@ -54,6 +58,15 @@ type Config struct {
 	// traffic for longer than this is swept from its dimension map. Zero/
 	// unset uses defaultIdleEntryTTL (scoring.go).
 	IdleEntryTTL time.Duration `json:"idle_entry_ttl,omitempty"`
+}
+
+// backendLabel returns the configured Backend label, or "default" if unset.
+// Safe to call on a nil *Config.
+func (c *Config) backendLabel() string {
+	if c == nil || c.Backend == "" {
+		return "default"
+	}
+	return c.Backend
 }
 
 // ipv6PrefixLength returns the configured IPv6 bucketing prefix length, or

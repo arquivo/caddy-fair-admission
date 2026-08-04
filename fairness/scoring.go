@@ -471,25 +471,42 @@ func (s *scoringState) entryEWMARPS(dim, key string) float64 {
 }
 
 // computeScore computes the final fairness score for a classified request
-// (§4.3): final = clamp(base_score[user_class] - total_penalty, min, max).
-// Each dimension contributes independently based on its *current* EWMARPS
-// (as of the last completed tick — this does not compute a "live" EWMA
-// mid-tick, per the task spec). A dimension the request doesn't apply to
+// (§4.3). It's a thin wrapper around computeScoreBreakdown that discards the
+// per-dimension detail — see that method for the full contract (fail-open
+// behavior, exempt-country handling, etc.).
+func (s *scoringState) computeScore(c Classification, exemptCountries map[string]bool) float64 {
+	score, _ := s.computeScoreBreakdown(c, exemptCountries)
+	return score
+}
+
+// computeScoreBreakdown computes the final fairness score for a classified
+// request (§4.3): final = clamp(base_score[user_class] - total_penalty, min,
+// max). Each dimension contributes independently based on its *current*
+// EWMARPS (as of the last completed tick — this does not compute a "live"
+// EWMA mid-tick, per the task spec). A dimension the request doesn't apply to
 // (dimensionKey ok=false) contributes 0. The country dimension is still
 // tracked/read normally when exempt, but its penalty is always excluded from
 // the sum regardless of its EWMARPS (§4.3 exempt-country behavior).
 //
+// The returned map (for §4.9's structured logging, via module.go) carries
+// "base", "penalty_<dimension>" (only for dimensions that actually
+// contributed a non-zero penalty), "total_penalty", and "final" — enough to
+// reconstruct exactly how the score was derived without re-running this
+// method.
+//
 // Fail-open (§4.3): a nil *scoringState (e.g. a Handler used without
 // Provision, as in some unit tests) returns the class's base score from
 // hardcoded defaults with zero penalty, never panics.
-func (s *scoringState) computeScore(c Classification, exemptCountries map[string]bool) float64 {
+func (s *scoringState) computeScoreBreakdown(c Classification, exemptCountries map[string]bool) (float64, map[string]float64) {
 	if s == nil {
 		defaults := newDefaultScoringConfig()
-		return baseScoreFor(defaults.BaseScores, c.UserClass)
+		base := baseScoreFor(defaults.BaseScores, c.UserClass)
+		return base, map[string]float64{"base": base, "total_penalty": 0, "final": base}
 	}
 
 	base := baseScoreFor(s.cfg.BaseScores, c.UserClass)
 	var totalPenalty float64
+	breakdown := map[string]float64{"base": base}
 
 	for _, dim := range scoringDimensions {
 		key, ok := dimensionKey(dim, c)
@@ -505,10 +522,17 @@ func (s *scoringState) computeScore(c Classification, exemptCountries map[string
 			continue
 		}
 		rps := s.entryEWMARPS(dim, key)
-		totalPenalty += penaltyContribution(pc, rps)
+		penalty := penaltyContribution(pc, rps)
+		if penalty != 0 {
+			breakdown["penalty_"+dim] = penalty
+			totalPenalty += penalty
+		}
 	}
 
-	return clamp(base-totalPenalty, s.cfg.MinScore, s.cfg.MaxScore)
+	final := clamp(base-totalPenalty, s.cfg.MinScore, s.cfg.MaxScore)
+	breakdown["total_penalty"] = totalPenalty
+	breakdown["final"] = final
+	return final, breakdown
 }
 
 // parsePenaltyArgs parses the space-separated key=value tokens following

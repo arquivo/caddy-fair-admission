@@ -8,13 +8,22 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
+// dispatchOutcome reports what happened during a dispatch call, for
+// ServeHTTP to fold into its structured log line (§4.9) after dispatch
+// returns.
+type dispatchOutcome struct {
+	statusCode int
+	latency    time.Duration
+	timedOut   bool
+}
+
 // dispatch calls next (§4.7 — normally Caddy's own reverse_proxy directive,
 // chained immediately after adaptive_admission per RegisterDirectiveOrder in
 // module.go) while timing the call, then records the outcome onto the
 // Controller and releases the ticket's one unit of capacity. This is the
 // only place capacity granted by ServeHTTP's Enqueue/Granted gets released —
 // every path below calls Release exactly once.
-func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) (dispatchOutcome, error) {
 	rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 
 	start := time.Now()
@@ -23,7 +32,17 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, next caddyhtt
 
 	statusCode, timedOut := classifyOutcome(rec.statusCode, err)
 	h.controller.Release(1, latency, statusCode, timedOut)
-	return err
+
+	backend := h.Config.backendLabel()
+	admissionMetrics.requestDuration.WithLabelValues(backend).Observe(latency.Seconds())
+	if timedOut {
+		admissionMetrics.backendTimeouts.WithLabelValues(backend).Inc()
+	}
+	if statusCode >= 500 {
+		admissionMetrics.backendErrors.WithLabelValues(backend).Inc()
+	}
+
+	return dispatchOutcome{statusCode: statusCode, latency: latency, timedOut: timedOut}, err
 }
 
 // classifyOutcome derives the status code and timeout classification to

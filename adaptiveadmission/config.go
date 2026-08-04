@@ -27,6 +27,10 @@ const (
 // and matches Phase 8's own "fairness + adaptive_admission + reverse_proxy
 // chained" done-when wording literally.
 type Config struct {
+	// Backend labels this block's metrics/logs (§4.8/§4.9). Empty defaults to
+	// "default" via backendLabel() — purely a label, never used for routing.
+	Backend string `json:"backend,omitempty"`
+
 	Controller ControllerConfig `json:"controller,omitempty"`
 
 	// QueueMaxSize is QueueConfig.MaxSize (§4.5). Zero/unset means
@@ -88,4 +92,12 @@ func (cc ControllerConfig) buildController() (*Controller, error) {
 // queueConfig derives this handler's QueueConfig (queue.go).
 func (c Config) queueConfig() QueueConfig {
 	return QueueConfig{MaxSize: c.QueueMaxSize, WaitTimeout: c.QueueTimeout}
+}
+
+// backendLabel returns the configured Backend label, or "default" if unset.
+func (c Config) backendLabel() string {
+	if c.Backend == "" {
+		return "default"
+	}
+	return c.Backend
 }

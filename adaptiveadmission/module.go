@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -41,6 +43,11 @@ const fairnessScoreVarKey = "fairness_score"
 // privileged or penalized (fail-open per §3.1).
 const neutralScore float64 = 0
 
+// fairnessLogFieldsVarKey mirrors fairness's own logFieldsVarKey constant
+// (fairness/module.go) by string value only, per the same cross-package
+// convention as fairnessScoreVarKey above.
+const fairnessLogFieldsVarKey = "fairness_log_fields"
+
 // Handler is the http.handlers.adaptive_admission middleware. It admits a
 // request through a priority queue backed by a capacity controller
 // (queue.go/capacity.go), then dispatches to the next handler in the chain
@@ -55,6 +62,12 @@ type Handler struct {
 
 	controller *Controller
 	scheduler  *Scheduler
+
+	// logger is set in Provision (nil-Context-safe via ctx.Logger()'s own
+	// dev-logger fallback). Several existing unit tests construct a Handler
+	// directly without ever calling Provision, so every use of logger below
+	// guards against nil rather than assuming Provision ran.
+	logger *zap.Logger
 }
 
 // CaddyModule returns the Caddy module information.
@@ -68,12 +81,28 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision constructs this instance's Controller and Scheduler fresh —
 // mirroring fairness's scoringState placement (§7 Q6), this state is never
 // carried over across a config reload (§3.3): every Provision call starts
-// from configured defaults with brand-new background goroutines.
-func (h *Handler) Provision(_ caddy.Context) error {
+// from configured defaults with brand-new background goroutines. It also
+// registers this config load's Prometheus collectors (metrics.go) against
+// ctx's registry and sets up structured logging (§4.9).
+func (h *Handler) Provision(ctx caddy.Context) error {
 	controller, err := h.Config.Controller.buildController()
 	if err != nil {
 		return err
 	}
+
+	initAdmissionMetrics(ctx.GetMetricsRegistry())
+	h.logger = ctx.Logger()
+
+	backend := h.Config.backendLabel()
+	admissionMetrics.concurrencyLimit.WithLabelValues(backend).Set(float64(controller.Limit()))
+	controller.SetOnLimitChange(func(oldLimit, newLimit int) {
+		direction := "grow"
+		if newLimit < oldLimit {
+			direction = "shrink"
+		}
+		admissionMetrics.limitChanges.WithLabelValues(backend, direction).Inc()
+		admissionMetrics.concurrencyLimit.WithLabelValues(backend).Set(float64(newLimit))
+	})
 	controller.Start()
 
 	scheduler := NewScheduler(h.Config.queueConfig(), controller)
@@ -99,8 +128,13 @@ func (h *Handler) Cleanup() error {
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler. It reads the fairness
 // score that fairness (or another earlier handler) set via caddyhttp.SetVar,
-// enqueues the request, waits for admission, then dispatches (§4.5).
+// enqueues the request, waits for admission, then dispatches (§4.5),
+// recording metrics and emitting one structured log line per request (§4.8,
+// §4.9).
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	backend := h.Config.backendLabel()
+	admissionMetrics.requestsTotal.WithLabelValues(backend).Inc()
+
 	score := neutralScore
 	if v := caddyhttp.GetVar(r.Context(), fairnessScoreVarKey); v != nil {
 		if f, ok := v.(float64); ok {
@@ -108,13 +142,94 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
+	enqueuedAt := time.Now()
 	ticket, reason := h.scheduler.Enqueue(score)
+	admissionMetrics.queueSize.WithLabelValues(backend).Set(float64(h.scheduler.Depth()))
+
 	if reason != RejectNone {
+		admissionMetrics.requestsRejected.WithLabelValues(backend, reason.String()).Inc()
+		h.logDecision(r, logDecisionParams{backend: backend, admitted: false, rejectReason: reason})
 		return caddyhttp.Error(http.StatusTooManyRequests, fmt.Errorf("adaptive_admission: %s", reason))
 	}
 
 	<-ticket.Granted()
-	return h.dispatch(w, r, next)
+	queueWait := time.Since(enqueuedAt)
+	admissionMetrics.queueWaitDuration.WithLabelValues(backend).Observe(queueWait.Seconds())
+	admissionMetrics.requestsAdmitted.WithLabelValues(backend).Inc()
+	// InFlight() can read up to 1 higher than genuinely in-flight work here
+	// and below -- see Controller.InFlight's doc (capacity.go).
+	admissionMetrics.requestsInFlight.WithLabelValues(backend).Set(float64(h.controller.InFlight()))
+
+	outcome, err := h.dispatch(w, r, next)
+	admissionMetrics.requestsInFlight.WithLabelValues(backend).Set(float64(h.controller.InFlight()))
+
+	h.logDecision(r, logDecisionParams{
+		backend:    backend,
+		admitted:   true,
+		queueWait:  queueWait,
+		latency:    outcome.latency,
+		statusCode: outcome.statusCode,
+	})
+
+	return err
+}
+
+// logDecisionParams carries the fields logDecision needs beyond what it
+// reads from r's fairness_log_fields var.
+type logDecisionParams struct {
+	backend      string
+	admitted     bool
+	rejectReason RejectReason
+	queueWait    time.Duration
+	latency      time.Duration
+	statusCode   int
+}
+
+// logDecision emits the single structured log line per admission decision
+// (§4.9), folding in fairness's classification/score-breakdown fields (read
+// via caddyhttp.GetVar, never a Go import of the fairness package — §3.4).
+// A nil logger (a Handler used without Provision, as in several existing
+// unit tests) makes this a no-op rather than panicking.
+func (h *Handler) logDecision(r *http.Request, p logDecisionParams) {
+	if h.logger == nil {
+		return
+	}
+	fields := []zap.Field{
+		zap.String("backend", p.backend),
+		zap.Bool("admitted", p.admitted),
+	}
+	if p.admitted {
+		fields = append(fields,
+			zap.Int64("queue_wait_ms", p.queueWait.Milliseconds()),
+			zap.Int64("backend_latency_ms", p.latency.Milliseconds()),
+			zap.Int("status_code", p.statusCode),
+		)
+	} else {
+		fields = append(fields, zap.String("reject_reason", p.rejectReason.String()))
+	}
+
+	if lf, ok := caddyhttp.GetVar(r.Context(), fairnessLogFieldsVarKey).(map[string]any); ok {
+		if v, ok := lf["ip"].(string); ok {
+			fields = append(fields, zap.String("ip", v))
+		}
+		if v, ok := lf["asn"].(uint64); ok {
+			fields = append(fields, zap.Uint64("asn", v))
+		}
+		if v, ok := lf["country"].(string); ok {
+			fields = append(fields, zap.String("country", v))
+		}
+		if v, ok := lf["user_class"].(string); ok {
+			fields = append(fields, zap.String("user_class", v))
+		}
+		if v, ok := lf["exempt"].(bool); ok {
+			fields = append(fields, zap.Bool("exempt", v))
+		}
+		if v, ok := lf["score_breakdown"].(map[string]float64); ok {
+			fields = append(fields, zap.Any("score_breakdown", v))
+		}
+	}
+
+	h.logger.Info("admission_decision", fields...)
 }
 
 // UnmarshalCaddyfile sets up the handler from Caddyfile tokens, per the §5
@@ -141,6 +256,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		for d.NextBlock(0) {
 			switch d.Val() {
+			case "backend":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.Backend = d.Val()
+
 			case "controller":
 				if err := h.unmarshalController(d); err != nil {
 					return err

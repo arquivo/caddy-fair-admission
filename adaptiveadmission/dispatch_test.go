@@ -82,7 +82,7 @@ func TestHandler_Dispatch_RecordsLatencyAndReleasesCapacity(t *testing.T) {
 		return nil
 	})
 
-	if err := h.dispatch(rec, req, next); err != nil {
+	if _, err := h.dispatch(rec, req, next); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
 	if got := c.InFlight(); got != 0 {

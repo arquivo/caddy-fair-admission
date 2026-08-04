@@ -29,7 +29,6 @@ func TestHandler_ServeHTTP_DispatchesAndReleasesCapacityOnSuccess(t *testing.T) 
 	c := NewFixedController(1)
 	s := NewScheduler(QueueConfig{MaxSize: 10}, c)
 	s.Start()
-	defer s.Stop()
 
 	h := &Handler{controller: c, scheduler: s}
 
@@ -48,8 +47,13 @@ func TestHandler_ServeHTTP_DispatchesAndReleasesCapacityOnSuccess(t *testing.T) 
 	if !called {
 		t.Fatal("next handler was not called")
 	}
+	// Stop drains the dispatch loop's speculative next-ticket reservation
+	// (Controller.InFlight's doc) before asserting InFlight -- checking it
+	// immediately after ServeHTTP returns would race the loop's own
+	// re-Acquire for a ticket that doesn't exist yet.
+	s.Stop()
 	if got := c.InFlight(); got != 0 {
-		t.Errorf("InFlight() after ServeHTTP returned = %d, want 0 (capacity released)", got)
+		t.Errorf("InFlight() after Stop = %d, want 0 (capacity released)", got)
 	}
 	if got := c.window.total; got != 1 {
 		t.Fatalf("outcome window total = %d, want 1", got)
@@ -96,7 +100,6 @@ func TestHandler_ServeHTTP_UpstreamHandlerError_ClassifiesGatewayTimeout(t *test
 	c := NewFixedController(1)
 	s := NewScheduler(QueueConfig{MaxSize: 10}, c)
 	s.Start()
-	defer s.Stop()
 
 	h := &Handler{controller: c, scheduler: s}
 
@@ -114,8 +117,11 @@ func TestHandler_ServeHTTP_UpstreamHandlerError_ClassifiesGatewayTimeout(t *test
 	if got := c.window.timeouts; got != 1 {
 		t.Errorf("recorded timeouts = %d, want 1", got)
 	}
+	// See the InFlight()-after-Stop comment in
+	// TestHandler_ServeHTTP_DispatchesAndReleasesCapacityOnSuccess above.
+	s.Stop()
 	if got := c.InFlight(); got != 0 {
-		t.Errorf("InFlight() after ServeHTTP returned = %d, want 0 (capacity released even on error)", got)
+		t.Errorf("InFlight() after Stop = %d, want 0 (capacity released even on error)", got)
 	}
 }
 

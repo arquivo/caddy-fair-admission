@@ -45,6 +45,15 @@ const classificationVarKey = "fairness_classification"
 // string value is load-bearing, not just an internal convention.
 const fairnessScoreVarKey = "fairness_score"
 
+// logFieldsVarKey is the caddyhttp variable key this handler writes a
+// builtin-typed map of identity/score-breakdown fields to (§4.9), so
+// adaptive_admission can fold them into its single structured log line
+// without importing fairness's internal Classification/UserClass types
+// (§3.4's package-independence boundary — every value in this map is a
+// builtin/primitive type, e.g. string(classification.UserClass) rather than
+// the UserClass type itself).
+const logFieldsVarKey = "fairness_log_fields"
+
 // Handler is the http.handlers.fairness middleware. It consumes Caddy's
 // already-resolved client IP (§4.1), computes a Classification (§4.2), and
 // scores the request (§4.3) for each request. Config is embedded so both
@@ -168,8 +177,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	now := time.Now()
 	h.scoring.track(classification, now)
-	score := h.scoring.computeScore(classification, h.Config.exemptCountrySet())
+	exempt := h.Config.exemptCountrySet()
+	score, breakdown := h.scoring.computeScoreBreakdown(classification, exempt)
 	caddyhttp.SetVar(r.Context(), fairnessScoreVarKey, score)
+
+	backend := h.Config.backendLabel()
+	fairnessMetrics.scoreDistribution.WithLabelValues(backend, string(classification.UserClass)).Observe(score)
+
+	caddyhttp.SetVar(r.Context(), logFieldsVarKey, map[string]any{
+		"ip":              classification.IP,
+		"asn":             uint64(classification.ASN),
+		"country":         classification.Country,
+		"user_class":      string(classification.UserClass),
+		"exempt":          exempt[classification.Country],
+		"score_breakdown": breakdown,
+	})
 
 	return next.ServeHTTP(w, r)
 }
@@ -181,6 +203,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		for d.NextBlock(0) {
 			switch d.Val() {
+			case "backend":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.Backend = d.Val()
+
 			case "geoip_city_db":
 				if !d.NextArg() {
 					return d.ArgErr()

@@ -34,10 +34,12 @@ func (App) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision sets up the app's shared resource pools.
-func (a *App) Provision(_ caddy.Context) error {
+// Provision sets up the app's shared resource pools and registers this
+// config load's Prometheus collectors (metrics.go) against ctx's registry.
+func (a *App) Provision(ctx caddy.Context) error {
 	a.geoPool = caddy.NewUsagePool()
 	a.authPool = caddy.NewUsagePool()
+	initFairnessMetrics(ctx.GetMetricsRegistry())
 	return nil
 }
 

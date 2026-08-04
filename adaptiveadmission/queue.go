@@ -11,6 +11,13 @@
 // is uniformly 1 (§4.4/§4.5): a single Acquire(1) always corresponds to
 // admitting exactly one ticket, so there's no ambiguity about which queued
 // ticket a given acquired unit "belongs to".
+//
+// Accepted tradeoff: because capacity is acquired before a ticket exists to
+// grant it to, the dispatch loop holds one "lookahead" reservation whenever
+// it's idle and blocked in waitPopHead waiting for the next ticket. This
+// makes Controller.InFlight() (and the requests_in_flight gauge built on it,
+// metrics.go) read up to 1 higher than genuinely in-flight work while idle.
+// It doesn't affect admission correctness — see Controller.InFlight's doc.
 package adaptiveadmission
 
 import (
@@ -167,6 +174,15 @@ func (s *Scheduler) Enqueue(score float64) (*Ticket, RejectReason) {
 	heap.Push(&s.pq, t)
 	s.cond.Signal()
 	return t, RejectNone
+}
+
+// Depth returns the number of tickets currently queued (not yet granted) —
+// used to drive the queue_size gauge (§4.8). Safe to call concurrently with
+// Enqueue/the dispatch loop.
+func (s *Scheduler) Depth() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pq)
 }
 
 // projectedWaitLocked estimates the wait a request joining the queue right

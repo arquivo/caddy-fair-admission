@@ -267,6 +267,14 @@ type Controller struct {
 	lastErrorShrink   time.Time
 	lastP95Shrink     time.Time
 
+	// onLimitChange, if set, is invoked from adjust() whenever it actually
+	// changes the limit (delta != 0) — module.go uses this to drive the
+	// adaptive_limit_changes_total counter and concurrency_limit gauge
+	// (§4.8) without coupling this file to Prometheus. Must be set (via
+	// SetOnLimitChange) before Start(); not safe to change concurrently with
+	// a running adjustment loop.
+	onLimitChange func(oldLimit, newLimit int)
+
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
@@ -306,6 +314,13 @@ func (c *Controller) Kind() ControllerKind {
 	return c.kind
 }
 
+// SetOnLimitChange registers f to be called from adjust() whenever it
+// actually changes the limit. Not safe to call concurrently with a running
+// adjustment loop — set this before Start().
+func (c *Controller) SetOnLimitChange(f func(oldLimit, newLimit int)) {
+	c.onLimitChange = f
+}
+
 // Limit returns the current concurrency limit.
 func (c *Controller) Limit() int {
 	c.mu.Lock()
@@ -314,6 +329,15 @@ func (c *Controller) Limit() int {
 }
 
 // InFlight returns the current in-flight cost total.
+//
+// When driven through adaptiveadmission's Scheduler (queue.go), this can
+// read up to 1 higher than genuinely in-flight work while the system is
+// idle: the dispatch loop's acquire-before-pop design always holds one
+// speculative reservation while blocked waiting for the next ticket to
+// arrive. This is an accepted, documented consequence of that design (see
+// queue.go's package doc), not a bug — it only affects idle-state readings
+// of this method and the requests_in_flight gauge derived from it
+// (metrics.go), never admission correctness or overload protection.
 func (c *Controller) InFlight() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -476,6 +500,10 @@ func (c *Controller) adjust(now time.Time) {
 	c.limit = newLimit
 	delta := newLimit - oldLimit
 	c.mu.Unlock()
+
+	if delta != 0 && c.onLimitChange != nil {
+		c.onLimitChange(oldLimit, newLimit)
+	}
 
 	// Wake immediately on a limit increase (§4.4): modeled as "freeing"
 	// delta units of capacity through the same bounded Signal mechanism as
