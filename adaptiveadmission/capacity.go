@@ -27,6 +27,19 @@ const (
 	ControllerAdaptive
 )
 
+// String renders k as the same "fixed"/"adaptive" spelling used by
+// ControllerConfig.Kind (config.go), for admin API output (admin.go, §4.10).
+func (k ControllerKind) String() string {
+	switch k {
+	case ControllerFixed:
+		return controllerKindFixed
+	case ControllerAdaptive:
+		return controllerKindAdaptive
+	default:
+		return "unknown"
+	}
+}
+
 // AdaptiveConfig is the tuning surface for an adaptive Controller (§4.4).
 type AdaptiveConfig struct {
 	MinConcurrency     int

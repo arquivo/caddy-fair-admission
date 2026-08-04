@@ -470,6 +470,40 @@ func (s *scoringState) entryEWMARPS(dim, key string) float64 {
 	return 0
 }
 
+// resolvedConfig returns this instance's fully-resolved ScoringConfig, for
+// admin introspection (admin.go, §4.10). Safe to call on a nil
+// *scoringState (returns fresh defaults). The returned value's maps are the
+// live ones held by s — callers must treat them as read-only (they're
+// marshaled to JSON immediately, never mutated).
+func (s *scoringState) resolvedConfig() ScoringConfig {
+	if s == nil {
+		return newDefaultScoringConfig()
+	}
+	return s.cfg
+}
+
+// entryCounts returns the number of tracked entities per dimension, for
+// admin introspection (admin.go, §4.10) — a size, not the per-entity
+// EWMARPS values themselves (see entryEWMARPS for that finer-grained read).
+// Safe to call on a nil *scoringState (returns zero counts for every
+// dimension).
+func (s *scoringState) entryCounts() map[string]int {
+	counts := make(map[string]int, len(scoringDimensions))
+	for _, dim := range scoringDimensions {
+		counts[dim] = 0
+	}
+	if s == nil {
+		return counts
+	}
+	for _, dim := range scoringDimensions {
+		dm := s.dims[dim]
+		dm.mu.Lock()
+		counts[dim] = len(dm.entries)
+		dm.mu.Unlock()
+	}
+	return counts
+}
+
 // computeScore computes the final fairness score for a classified request
 // (§4.3). It's a thin wrapper around computeScoreBreakdown that discards the
 // per-dimension detail — see that method for the full contract (fail-open

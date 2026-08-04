@@ -93,7 +93,8 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // acquires (via its UsagePools) the GeoIP readers and JWKS verifier this
 // block's config asks for. An empty path/URL for any of these means that
 // resource simply isn't configured on this block — no pool interaction, no
-// error.
+// error. It also registers this instance with the App (app.go) so the admin
+// introspection API (admin.go, §4.10) can report its live state.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	appIface, err := ctx.App("fairness")
 	if err != nil {
@@ -138,6 +139,8 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.scoring = newScoringState(resolved, h.Config.ewmaTickInterval(), h.Config.idleEntryTTL())
 	h.scoring.start()
 
+	app.registerHandler(h.Config.backendLabel(), h)
+
 	return nil
 }
 
@@ -147,13 +150,15 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 // config reload replaces this instance) causes the pool to actually close
 // it. It also stops this instance's own EWMA-tick and idle-GC goroutines
 // (scoring.go) — required so a config reload's old Handler instance doesn't
-// leak background goroutines once it's replaced (§3.3).
+// leak background goroutines once it's replaced (§3.3) — and unregisters
+// this instance from the App (app.go).
 func (h *Handler) Cleanup() error {
 	h.scoring.stop()
 
 	if h.app == nil {
 		return nil
 	}
+	h.app.unregisterHandler(h.Config.backendLabel(), h)
 	if h.GeoIPCityDB != "" {
 		h.app.releaseGeoReader(h.GeoIPCityDB)
 	}

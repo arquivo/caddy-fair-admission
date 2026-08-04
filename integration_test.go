@@ -338,3 +338,140 @@ func TestIntegration_EndToEnd_FailoverRoutesAroundUnhealthyUpstream(t *testing.T
 		}
 	}
 }
+
+// TestIntegration_EndToEnd_AdminStatusEndpoints exercises Phase 10's admin
+// introspection API against a genuinely running instance with the admin
+// listener enabled (unlike loadCaddy, which disables it) — per
+// implementation_plan.md's Phase 10 "done when": hitting both endpoints
+// returns the documented per-backend shape, matching live state after
+// synthetic traffic.
+func TestIntegration_EndToEnd_AdminStatusEndpoints(t *testing.T) {
+	jwksURL, researcherToken := startJWKSServerAndSignToken(t, "researcher")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	// Reserve a free port for the admin listener rather than using the real
+	// default (localhost:2019), so this test can't collide with a developer's
+	// own running Caddy instance.
+	adminLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	adminAddr := adminLn.Addr().String()
+	adminLn.Close()
+
+	input := fmt.Sprintf(`
+:19084 {
+	fairness {
+		auth_jwks_url %s
+	}
+	adaptive_admission {
+		controller fixed {
+			limit 5
+		}
+		queue_max_size 10
+		queue_timeout 5s
+	}
+	reverse_proxy %s
+}
+`, jwksURL, upstream.Listener.Addr().String())
+
+	cfg := adaptCaddyfile(t, input)
+	cfg["admin"] = map[string]any{"listen": adminAddr}
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := caddy.Load(cfgJSON, false); err != nil {
+		t.Fatalf("caddy.Load: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := caddy.Stop(); err != nil {
+			t.Errorf("caddy.Stop: %v", err)
+		}
+	})
+	time.Sleep(150 * time.Millisecond)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Send an authenticated (JWT) request through the full chain so the
+	// admin endpoints have live state to report: a JWKS pool reference and a
+	// tracked "researcher"-classified entry in fairness's EWMA state.
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://127.0.0.1:19084/", nil)
+	req.Header.Set("Authorization", "Bearer "+researcherToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("synthetic request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("synthetic request status = %d, want 200", resp.StatusCode)
+	}
+
+	aaResp, err := client.Get("http://" + adminAddr + "/adaptive_admission/status")
+	if err != nil {
+		t.Fatalf("GET /adaptive_admission/status: %v", err)
+	}
+	defer aaResp.Body.Close()
+	if aaResp.StatusCode != http.StatusOK {
+		t.Fatalf("/adaptive_admission/status status = %d, want 200", aaResp.StatusCode)
+	}
+	var aaBody struct {
+		Backends []struct {
+			Backend        string  `json:"backend"`
+			ControllerKind string  `json:"controller_kind"`
+			Limit          int     `json:"limit"`
+			InFlight       int     `json:"in_flight"`
+			MeanLatencyMs  float64 `json:"mean_latency_ms"`
+			QueueSize      int     `json:"queue_size"`
+		} `json:"backends"`
+	}
+	if err := json.NewDecoder(aaResp.Body).Decode(&aaBody); err != nil {
+		t.Fatalf("decode /adaptive_admission/status: %v", err)
+	}
+	if len(aaBody.Backends) != 1 {
+		t.Fatalf("adaptive_admission backends = %+v, want 1 entry", aaBody.Backends)
+	}
+	if got := aaBody.Backends[0]; got.Backend != "default" || got.ControllerKind != "fixed" || got.Limit != 5 {
+		t.Errorf("adaptive_admission backend status = %+v, want backend=default controller_kind=fixed limit=5", got)
+	}
+
+	fResp, err := client.Get("http://" + adminAddr + "/fairness/status")
+	if err != nil {
+		t.Fatalf("GET /fairness/status: %v", err)
+	}
+	defer fResp.Body.Close()
+	if fResp.StatusCode != http.StatusOK {
+		t.Fatalf("/fairness/status status = %d, want 200", fResp.StatusCode)
+	}
+	var fBody struct {
+		Backends []struct {
+			Backend              string             `json:"backend"`
+			BaseScores           map[string]float64 `json:"base_scores"`
+			DimensionEntryCounts map[string]int     `json:"dimension_entry_counts"`
+		} `json:"backends"`
+		Shared struct {
+			GeoIP []map[string]any `json:"geoip"`
+			JWKS  []struct {
+				Key        string `json:"key"`
+				Healthy    bool   `json:"healthy"`
+				References int    `json:"references"`
+			} `json:"jwks"`
+		} `json:"shared"`
+	}
+	if err := json.NewDecoder(fResp.Body).Decode(&fBody); err != nil {
+		t.Fatalf("decode /fairness/status: %v", err)
+	}
+	if len(fBody.Backends) != 1 || fBody.Backends[0].Backend != "default" {
+		t.Fatalf("fairness backends = %+v, want 1 entry with backend=default", fBody.Backends)
+	}
+	if got := fBody.Backends[0].DimensionEntryCounts["ip"]; got < 1 {
+		t.Errorf(`fairness backend dimension_entry_counts["ip"] = %d, want >= 1 (the synthetic request's client IP)`, got)
+	}
+	if len(fBody.Shared.JWKS) != 1 || !fBody.Shared.JWKS[0].Healthy || fBody.Shared.JWKS[0].References < 1 {
+		t.Errorf("fairness shared JWKS health = %+v, want 1 healthy entry with >= 1 reference", fBody.Shared.JWKS)
+	}
+}

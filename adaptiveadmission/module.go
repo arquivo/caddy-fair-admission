@@ -63,6 +63,12 @@ type Handler struct {
 	controller *Controller
 	scheduler  *Scheduler
 
+	// app is the adaptive_admission App this Handler registered itself
+	// with in Provision (nil if that registration was skipped — see
+	// Provision's doc — or if Provision never ran at all). Cleanup only
+	// unregisters when non-nil.
+	app *App
+
 	// logger is set in Provision (nil-Context-safe via ctx.Logger()'s own
 	// dev-logger fallback). Several existing unit tests construct a Handler
 	// directly without ever calling Provision, so every use of logger below
@@ -83,7 +89,20 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // carried over across a config reload (§3.3): every Provision call starts
 // from configured defaults with brand-new background goroutines. It also
 // registers this config load's Prometheus collectors (metrics.go) against
-// ctx's registry and sets up structured logging (§4.9).
+// ctx's registry, sets up structured logging (§4.9), and registers this
+// instance with the adaptive_admission App so the admin API (admin.go, §4.10)
+// can report its live state.
+//
+// The App registration is skipped when ctx is the zero-value caddy.Context
+// (detected via the embedded ctx.Context field being nil, which no
+// real Caddy-constructed Context ever is) — two of this file's own existing
+// unit tests (TestHandler_ProvisionAndCleanup_FixedController,
+// TestHandler_Provision_InvalidControllerConfigReturnsError) construct
+// exactly such a Context directly, and caddy.Context.App panics on it (it
+// dereferences a nil internal *caddy.Config). A production Provision call
+// always carries a real Context from Caddy's own module-loading path, so
+// this guard never affects real deployments — see metrics.go's near-identical
+// comment for the same underlying hazard.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	controller, err := h.Config.Controller.buildController()
 	if err != nil {
@@ -110,18 +129,35 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 	h.controller = controller
 	h.scheduler = scheduler
+
+	if ctx.Context != nil {
+		appIface, err := ctx.App("adaptive_admission")
+		if err != nil {
+			return err
+		}
+		app, ok := appIface.(*App)
+		if !ok {
+			return fmt.Errorf("adaptive_admission: unexpected app module type %T", appIface)
+		}
+		h.app = app
+		app.registerHandler(backend, h)
+	}
+
 	return nil
 }
 
 // Cleanup stops this instance's scheduler and controller, in that order
 // (the scheduler's dispatch loop must exit before the controller it drives
-// is torn down).
+// is torn down), and unregisters it from the App if it was registered.
 func (h *Handler) Cleanup() error {
 	if h.scheduler != nil {
 		h.scheduler.Stop()
 	}
 	if h.controller != nil {
 		h.controller.Stop()
+	}
+	if h.app != nil {
+		h.app.unregisterHandler(h.Config.backendLabel(), h)
 	}
 	return nil
 }
