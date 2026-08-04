@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -25,16 +26,37 @@ func init() {
 // caddyhttp.GetVar(r.Context(), classificationVarKey).
 const classificationVarKey = "fairness_classification"
 
+// fairnessScoreVarKey is the caddyhttp variable key this handler writes its
+// computed fairness score to (§4.3). Documented in REQUIREMENTS.md §3.1 as
+// becoming usable as the Caddy placeholder {vars.fairness_score} — the
+// string value is load-bearing, not just an internal convention.
+const fairnessScoreVarKey = "fairness_score"
+
 // Handler is the http.handlers.fairness middleware. It consumes Caddy's
-// already-resolved client IP (§4.1) and computes a Classification (§4.2) for
-// each request. Config is embedded so both Caddyfile and JSON config flow
-// through the same fields.
+// already-resolved client IP (§4.1), computes a Classification (§4.2), and
+// scores the request (§4.3) for each request. Config is embedded so both
+// Caddyfile and JSON config flow through the same fields.
+//
+// ServeHTTP uses a pointer receiver (not value) because scoring holds a
+// *scoringState backed by per-dimension mutexes and background goroutines —
+// see scoring.go. Holding it via a pointer field means copying a Handler
+// value would only copy the pointer, not the mutexes themselves, but the
+// pointer receiver is kept throughout for consistency and to avoid ever
+// tempting a future change to store scoringState by value.
 type Handler struct {
 	Config
 
 	app  *App
 	geo  *geoLookup
 	auth *verifier
+
+	// scoringOverrides holds only the fields a `scoring { }` sub-block
+	// explicitly specified (nil if the block was absent entirely); resolved
+	// onto defaults in Provision via resolveScoringConfig (scoring.go).
+	scoringOverrides *scoringOverrides
+	// scoring is this instance's isolated EWMA scoring state (§3.2/§7 Q6),
+	// constructed fresh in Provision and torn down in Cleanup.
+	scoring *scoringState
 }
 
 // CaddyModule returns the Caddy module information.
@@ -86,6 +108,14 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		h.auth = v
 	}
 
+	// Scoring state (§3.2/§4.3) is constructed fresh here, isolated per
+	// Handler instance (§7 Q6) — never carried over across a config reload
+	// (§3.3): every Provision call gets brand-new maps and a brand-new pair
+	// of background goroutines.
+	resolved := resolveScoringConfig(h.scoringOverrides)
+	h.scoring = newScoringState(resolved, h.Config.ewmaTickInterval(), h.Config.idleEntryTTL())
+	h.scoring.start()
+
 	return nil
 }
 
@@ -93,8 +123,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 // references to any shared GeoIP readers / JWKS verifier it acquired in
 // Provision, so the last handler referencing a given resource (e.g. after a
 // config reload replaces this instance) causes the pool to actually close
-// it.
+// it. It also stops this instance's own EWMA-tick and idle-GC goroutines
+// (scoring.go) — required so a config reload's old Handler instance doesn't
+// leak background goroutines once it's replaced (§3.3).
 func (h *Handler) Cleanup() error {
+	h.scoring.stop()
+
 	if h.app == nil {
 		return nil
 	}
@@ -111,20 +145,25 @@ func (h *Handler) Cleanup() error {
 }
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler. It computes the
-// request's Classification and hands it off to later handlers in the chain
-// via caddyhttp.SetVar (§3.1), then proceeds — this handler never rejects a
-// request itself.
-func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+// request's Classification and fairness score and hands both off to later
+// handlers in the chain via caddyhttp.SetVar (§3.1), then proceeds — this
+// handler never rejects a request itself.
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ip := resolveClientIP(r)
 	classification := classify(&h.Config, h.geo, h.auth, ip, r)
 	caddyhttp.SetVar(r.Context(), classificationVarKey, classification)
+
+	now := time.Now()
+	h.scoring.track(classification, now)
+	score := h.scoring.computeScore(classification, h.Config.exemptCountrySet())
+	caddyhttp.SetVar(r.Context(), fairnessScoreVarKey, score)
+
 	return next.ServeHTTP(w, r)
 }
 
 // UnmarshalCaddyfile sets up the handler from Caddyfile tokens, per the §5
-// schema. The `scoring { }` sub-block belongs to Phase 5 (§4.3) and is
-// intentionally consumed-but-ignored here rather than rejected, since
-// shared_fairness_defaults-style snippets may already carry it.
+// schema. The `scoring { }` sub-block (§4.3) is parsed by parseScoringBlock
+// into a *scoringOverrides, later resolved onto defaults in Provision.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		for d.NextBlock(0) {
@@ -199,11 +238,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.IdleEntryTTL = dur
 
 			case "scoring":
-				// Phase 5 sub-block (§4.3) — not handled by this phase yet;
-				// consume its tokens without erroring so §5-schema
-				// Caddyfiles still parse.
-				for d.NextBlock(1) {
+				overrides, err := parseScoringBlock(d)
+				if err != nil {
+					return err
 				}
+				h.scoringOverrides = overrides
 
 			default:
 				return d.Errf("unrecognized fairness subdirective '%s'", d.Val())
@@ -217,6 +256,85 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	var m Handler
 	err := m.UnmarshalCaddyfile(h.Dispenser)
 	return &m, err
+}
+
+// parseScoringBlock parses a `scoring { }` sub-block's tokens (§4.3/§5) into
+// a *scoringOverrides, later overlaid onto newDefaultScoringConfig() by
+// resolveScoringConfig (scoring.go). Grammar:
+//
+//	scoring {
+//	    base_score <user_class> <float>          # repeatable
+//	    penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f>  # repeatable
+//	    min_score <float>
+//	    max_score <float>
+//	}
+func parseScoringBlock(d *caddyfile.Dispenser) (*scoringOverrides, error) {
+	o := &scoringOverrides{}
+
+	for d.NextBlock(1) {
+		switch d.Val() {
+		case "base_score":
+			args := d.RemainingArgs()
+			if len(args) != 2 {
+				return nil, d.ArgErr()
+			}
+			uc := UserClass(args[0])
+			if !validUserClasses[uc] {
+				return nil, d.Errf("unrecognized user class %q for base_score", args[0])
+			}
+			v, err := strconv.ParseFloat(args[1], 64)
+			if err != nil {
+				return nil, d.Errf("invalid base_score value %q: %v", args[1], err)
+			}
+			if o.baseScores == nil {
+				o.baseScores = make(map[UserClass]float64)
+			}
+			o.baseScores[uc] = v
+
+		case "penalty":
+			args := d.RemainingArgs()
+			if len(args) < 1 {
+				return nil, d.ArgErr()
+			}
+			dim := args[0]
+			if !validScoringDimensions[dim] {
+				return nil, d.Errf("unrecognized scoring dimension %q for penalty", dim)
+			}
+			pc, err := parsePenaltyArgs(args[1:])
+			if err != nil {
+				return nil, d.Errf("invalid penalty config for dimension %q: %v", dim, err)
+			}
+			if o.penalties == nil {
+				o.penalties = make(map[string]PenaltyConfig)
+			}
+			o.penalties[dim] = pc
+
+		case "min_score":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			v, err := strconv.ParseFloat(d.Val(), 64)
+			if err != nil {
+				return nil, d.Errf("invalid min_score %q: %v", d.Val(), err)
+			}
+			o.minScore = &v
+
+		case "max_score":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			v, err := strconv.ParseFloat(d.Val(), 64)
+			if err != nil {
+				return nil, d.Errf("invalid max_score %q: %v", d.Val(), err)
+			}
+			o.maxScore = &v
+
+		default:
+			return nil, d.Errf("unrecognized scoring subdirective '%s'", d.Val())
+		}
+	}
+
+	return o, nil
 }
 
 // Interface guards.

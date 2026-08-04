@@ -47,10 +47,13 @@ type Config struct {
 	// 56. Zero means "use the default" (56, matching the §5 example).
 	IPv6PrefixLength int `json:"ipv6_prefix_length,omitempty"`
 
-	// EWMATickInterval and IdleEntryTTL are Phase 5 (§4.3/§3.2) config —
-	// parsed now, unused until scoring lands.
+	// EWMATickInterval is the fixed-tick interval scoring.go's EWMA updater
+	// runs on (§4.3). Zero/unset uses defaultEWMATickInterval (scoring.go).
 	EWMATickInterval time.Duration `json:"ewma_tick_interval,omitempty"`
-	IdleEntryTTL     time.Duration `json:"idle_entry_ttl,omitempty"`
+	// IdleEntryTTL is the idle-entry GC threshold (§3.2): an entity with no
+	// traffic for longer than this is swept from its dimension map. Zero/
+	// unset uses defaultIdleEntryTTL (scoring.go).
+	IdleEntryTTL time.Duration `json:"idle_entry_ttl,omitempty"`
 }
 
 // ipv6PrefixLength returns the configured IPv6 bucketing prefix length, or
