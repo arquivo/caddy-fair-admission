@@ -1,0 +1,106 @@
+# Phase 8 example: fairness + adaptive_admission + reverse_proxy chained
+# end-to-end against real backend instances, with active+passive health
+# checks and load-balancer stickiness (§4.6/§4.7).
+#
+# Shows both supported directive-ordering forms (§3.1, §7 Q7 — decided):
+#   - form A (:8080): bare top-level directives, relying on the
+#     RegisterDirectiveOrder position each module registers in its init()
+#     (fairness < adaptive_admission < reverse_proxy) for correct ordering
+#     with no extra syntax.
+#   - form B (:8081): an explicit route { } block. Still valid and produces
+#     identical ordering/behavior — useful when interleaving with other
+#     directives that must run at a specific point regardless of
+#     RegisterDirectiveOrder.
+#
+# reverse_proxy's own health checks replace this project's custom TCP-probe
+# health-check loop entirely (§4.6) — no health-check code lives in
+# adaptive_admission. page-search-api-standby is listed as an extra upstream
+# rather than a distinct "backup tier": Caddy's reverse_proxy has no built-in
+# primary/backup concept, and per §4.6 that's an accepted trade-off of
+# reusing reverse_proxy as-is rather than building a custom load balancer —
+# it will still only receive traffic once health checks mark the primaries
+# down, and reverse_proxy fails open to the full upstream set (backup
+# included) if every upstream is ever marked unhealthy at once.
+#
+# Run: caddy run --config examples/fairness-adaptive-admission.Caddyfile --adapter caddyfile
+
+(shared_fairness_defaults) {
+	exempt_country PT
+	ipv6_prefix_length 56
+	ewma_tick_interval 1s
+	idle_entry_ttl 10m
+}
+
+(shared_scoring) {
+	scoring {
+		base_score researcher 100
+		base_score anonymous  60
+		penalty ip alpha=0.2 soft=20:-10 hard=100:-40
+	}
+}
+
+# Form A -- bare top-level directives.
+:8080 {
+	fairness {
+		import shared_fairness_defaults
+		import shared_scoring
+	}
+
+	adaptive_admission {
+		controller adaptive {
+			min_concurrency        10
+			initial_concurrency    40
+			max_concurrency        200
+			target_p95             800ms
+			timeout_rate_threshold 0.05
+			error_rate_threshold   0.05
+			adjust_interval        30s
+		}
+
+		queue_max_size 500
+		queue_timeout  10s
+	}
+
+	reverse_proxy page-search-api-1:8080 page-search-api-2:8080 page-search-api-standby:8080 {
+		lb_policy least_conn
+
+		health_uri      /healthz
+		health_interval 10s
+		health_timeout  5s
+
+		fail_duration     30s
+		max_fails         3
+		unhealthy_status  5xx
+		unhealthy_latency 2s
+	}
+}
+
+# Form B -- identical behavior, explicit route { } wrapping (still valid,
+# no longer required since RegisterDirectiveOrder is registered -- §7 Q7).
+# Demonstrates cookie-based stickiness (§4.6) instead of least_conn.
+:8081 {
+	route {
+		fairness {
+			import shared_fairness_defaults
+			import shared_scoring
+		}
+
+		adaptive_admission {
+			controller fixed {
+				limit 50
+			}
+
+			queue_max_size 500
+			queue_timeout  10s
+		}
+
+		reverse_proxy page-search-api-1:8080 page-search-api-2:8080 {
+			lb_policy cookie
+
+			health_uri      /healthz
+			health_interval 10s
+			fail_duration   30s
+			max_fails       3
+		}
+	}
+}

@@ -17,6 +17,19 @@ import (
 func init() {
 	caddy.RegisterModule(Handler{})
 	httpcaddyfile.RegisterHandlerDirective("fairness", parseCaddyfile)
+
+	// httpcaddyfile.RegisterDirectiveOrder cannot anchor one plugin
+	// directive relative to another plugin's directive — only relative to a
+	// directive in Caddy's own standard distribution. So fairness and
+	// adaptive_admission (adaptiveadmission/module.go) each anchor to a
+	// different standard directive instead of to each other: fairness here
+	// anchors "before request_header" (early-middleware section);
+	// adaptive_admission anchors "before reverse_proxy" (just before
+	// dispatch). Since "request_header" unconditionally precedes
+	// "reverse_proxy" in Caddy's defaultDirectiveOrder, this guarantees
+	// fairness always runs before adaptive_admission regardless of which
+	// package's init() happens to run first (§3.1, §7 Q7).
+	httpcaddyfile.RegisterDirectiveOrder("fairness", httpcaddyfile.Before, "request_header")
 }
 
 // classificationVarKey is the caddyhttp variable key this handler writes its

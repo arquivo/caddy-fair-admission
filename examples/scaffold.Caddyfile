@@ -1,11 +1,16 @@
 # Phase 2 scaffolding sanity check: proves fairness + adaptive_admission
-# (currently no-op passthroughs) load, chain, and proxy correctly.
+# load, chain, and proxy correctly. See fairness-adaptive-admission.Caddyfile
+# for a realistic end-to-end example with reverse_proxy.
 # Run: caddy run --config examples/scaffold.Caddyfile --adapter caddyfile
 
 :8080 {
 	route {
 		fairness
-		adaptive_admission
+		adaptive_admission {
+			controller fixed {
+				limit 50
+			}
+		}
 		respond "ok" 200
 	}
 }
