@@ -127,10 +127,13 @@ func bucketUpperBound(i int) time.Duration {
 	return time.Duration(ms * float64(time.Millisecond))
 }
 
-// outcomeSample records which bucket a single recorded outcome landed in and
-// its timeout/error classification, so outcomeWindow can undo it in O(1)
-// once evicted from the ring.
+// outcomeSample records which bucket a single recorded outcome landed in,
+// its exact latency (for exact O(1) mean-latency eviction, separate from the
+// bucket-quantized percentile machinery), and its timeout/error
+// classification, so outcomeWindow can undo it in O(1) once evicted from the
+// ring.
 type outcomeSample struct {
+	latency  time.Duration
 	bucket   int
 	timedOut bool
 	isError  bool
@@ -145,10 +148,11 @@ type outcomeWindow struct {
 	pos    int
 	filled int // number of valid entries so far, caps at size
 
-	buckets  [histBucketCount]int
-	total    int
-	timeouts int
-	errors   int
+	buckets    [histBucketCount]int
+	total      int
+	timeouts   int
+	errors     int
+	sumLatency time.Duration
 }
 
 func newOutcomeWindow(size int) *outcomeWindow {
@@ -165,6 +169,7 @@ func (w *outcomeWindow) record(latency time.Duration, timedOut, isError bool) {
 		old := w.ring[w.pos]
 		w.buckets[old.bucket]--
 		w.total--
+		w.sumLatency -= old.latency
 		if old.timedOut {
 			w.timeouts--
 		}
@@ -176,9 +181,10 @@ func (w *outcomeWindow) record(latency time.Duration, timedOut, isError bool) {
 	}
 
 	b := bucketFor(latency)
-	w.ring[w.pos] = outcomeSample{bucket: b, timedOut: timedOut, isError: isError}
+	w.ring[w.pos] = outcomeSample{latency: latency, bucket: b, timedOut: timedOut, isError: isError}
 	w.buckets[b]++
 	w.total++
+	w.sumLatency += latency
 	if timedOut {
 		w.timeouts++
 	}
@@ -186,6 +192,15 @@ func (w *outcomeWindow) record(latency time.Duration, timedOut, isError bool) {
 		w.errors++
 	}
 	w.pos = (w.pos + 1) % w.size
+}
+
+// meanLatency returns the rolling mean of the window's current samples, or 0
+// if empty. O(1) — sumLatency is maintained incrementally by record().
+func (w *outcomeWindow) meanLatency() time.Duration {
+	if w.total == 0 {
+		return 0
+	}
+	return w.sumLatency / time.Duration(w.total)
 }
 
 // percentile returns the latency value below which at least a p fraction of
@@ -239,8 +254,12 @@ type Controller struct {
 	limit    int
 	inFlight int
 
-	// Adaptive-only fields below; unused (zero value) on a Fixed
-	// controller.
+	// window tracks recent Release() outcomes for both controller kinds:
+	// MeanLatency() (read by the scheduler in queue.go for its Little's-law
+	// wait projection, §4.5, which applies to fixed-limit backends too) and,
+	// for an adaptive controller only, the percentile/timeout-rate/
+	// error-rate reads the adjustment loop uses. cfg is adaptive-only (zero
+	// value on a Fixed controller).
 	cfg    AdaptiveConfig
 	window *outcomeWindow
 
@@ -254,9 +273,11 @@ type Controller struct {
 }
 
 // NewFixedController returns a Controller with a static concurrency limit
-// that never changes.
+// that never changes. It still maintains an outcome window (for
+// MeanLatency(), read by the scheduler) even though nothing here reads its
+// percentile/rate fields.
 func NewFixedController(limit int) *Controller {
-	c := &Controller{kind: ControllerFixed, limit: limit}
+	c := &Controller{kind: ControllerFixed, limit: limit, window: newOutcomeWindow(defaultWindowSize)}
 	c.cond = sync.NewCond(&c.mu)
 	return c
 }
@@ -312,22 +333,44 @@ func (c *Controller) Acquire(cost int) {
 	c.mu.Unlock()
 }
 
-// Release frees cost units of capacity and, for an adaptive controller,
-// records the outcome (latency, status code, timeout) into the rolling
-// window the adjustment loop reads from. statusCode >= 500 counts as an
-// error for the error-rate branch (§4.4); a Fixed controller ignores the
-// outcome fields entirely beyond freeing capacity.
+// Release frees cost units of capacity and records the outcome (latency,
+// status code, timeout) into the rolling window — for both controller
+// kinds, since MeanLatency() is meaningful for a Fixed controller's backend
+// too (§4.5's wait projection isn't adaptive-only). statusCode >= 500 counts
+// as an error for the adaptive adjustment loop's error-rate branch; a Fixed
+// controller simply never reads timeoutRate()/errorRate()/percentile().
 //
 // Wakes exactly cost waiters via bounded Signal() calls — never Broadcast().
 func (c *Controller) Release(cost int, latency time.Duration, statusCode int, timedOut bool) {
 	c.mu.Lock()
 	c.inFlight -= cost
-	if c.kind == ControllerAdaptive {
-		c.window.record(latency, timedOut, statusCode >= 500)
-	}
+	c.window.record(latency, timedOut, statusCode >= 500)
 	c.mu.Unlock()
 
 	c.wake(cost)
+}
+
+// ReleaseUnused frees cost units of capacity that were acquired but never
+// used for actual work (e.g. the scheduler's dispatch loop in queue.go
+// acquiring capacity, then finding nothing queued to grant it to before
+// shutting down). Unlike Release, this never touches the outcome window —
+// there is no latency or status code to record for capacity that did
+// nothing.
+func (c *Controller) ReleaseUnused(cost int) {
+	c.mu.Lock()
+	c.inFlight -= cost
+	c.mu.Unlock()
+
+	c.wake(cost)
+}
+
+// MeanLatency returns the rolling mean latency of Release()-recorded
+// outcomes, or 0 if none have been recorded yet. Read by the scheduler
+// (queue.go) for its Little's-law wait projection (§4.5).
+func (c *Controller) MeanLatency() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.window.meanLatency()
 }
 
 // wake signals up to n waiters, bounded — never Broadcast(). Extra Signal
