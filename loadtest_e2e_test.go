@@ -30,7 +30,7 @@ import (
 
 // loadTestReportPath is where the captured report (implementation_plan.md
 // Phase 11's "done when" deliverable) is written on each run.
-const loadTestReportPath = "LOAD_TEST_REPORT.md"
+const loadTestReportPath = "docs/LOAD_TEST_REPORT.md"
 
 func TestLoadTest_FullChain_ConcurrencySweep(t *testing.T) {
 	if os.Getenv("RUN_LOADTEST_E2E") != "1" {
