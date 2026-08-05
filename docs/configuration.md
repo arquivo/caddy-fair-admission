@@ -1,0 +1,261 @@
+# Configuration reference
+
+This is the authoritative reference for every Caddyfile directive both modules accept, and for the
+scoring/admission mechanics behind them. For narrative walkthroughs of how this behaves against
+real traffic patterns, see [`scenarios.md`](scenarios.md). For the admin API and metrics this
+config surface feeds, see [`monitoring.md`](monitoring.md).
+
+Both modules are configured with a Caddyfile block per backend/route (`fairness { ... }` and
+`adaptive_admission { ... }`), or the equivalent JSON under
+`apps.http.servers.<name>.routes[].handle`. There is no separate global-options directive or
+bespoke config file for either module — settings that are conceptually shared across backends
+(GeoIP paths, JWKS issuer, scoring defaults, ...) are just regular fields inside each block, reused
+across blocks with Caddy's native `import`/named-snippet mechanism. See
+[`examples/`](../examples/) for runnable files exercising every directive below.
+
+## 1. `fairness` block
+
+| Directive | Args | Default | Notes |
+|---|---|---|---|
+| `backend <string>` | 1 | `"default"` | A label only — used in metrics/logs/admin output, never affects routing. |
+| `geoip_city_db <path>` | 1 | unset (no country/ASN lookups) | Path to a MaxMind city `.mmdb`. Fails open independently of `geoip_asn_db` if unopenable. |
+| `geoip_asn_db <path>` | 1 | unset | Path to a MaxMind ASN `.mmdb`. Fails open independently of `geoip_city_db`. |
+| `auth_issuer <string>` | 1 | `""` | Expected JWT `iss` claim; not itself validated at parse time. |
+| `auth_jwks_url <url>` | 1 | `""` (auth disabled) | JWKS endpoint for verifying bearer tokens (RS256), refreshed on a background loop. |
+| `auth_audience <string>` | 1 | `""` | Expected JWT `aud` claim; not itself validated at parse time. |
+| `exempt_country <ISO-3166-1 alpha-2>` | 1, repeatable | none | Marks a country as exempt from `country`-dimension penalties (see §5). Exact string match. |
+| `ipv6_prefix_length <int>` | 1 | `56` | **Must be exactly `48` or `56`** — any other value is a Caddyfile parse error. |
+| `ewma_tick_interval <duration>` | 1 | `1s` | How often the EWMA updater re-evaluates every tracked entity's rate (see §2). |
+| `idle_entry_ttl <duration>` | 1 | `10m` | Entities with no traffic for longer than this are garbage-collected. Swept by a fixed, non-configurable 1-minute ticker; reclaimed strictly when idle time is `>` the TTL, not `>=`. |
+| `scoring { ... }` | sub-block | absent → pure defaults | See §1.1. |
+
+Any unrecognized top-level token is a Caddyfile parse error
+(`unrecognized fairness subdirective '%s'`).
+
+### 1.1 `scoring { }` sub-block
+
+```caddyfile
+scoring {
+    base_score <user_class> <float>                          # repeatable, one of 5 classes
+    penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f>   # repeatable, one of 6 dimensions
+    min_score <float>
+    max_score <float>
+}
+```
+
+- `base_score <class> <value>` — sets the starting score for one of the 5 user classes (§4). Both
+  args required; the class name must be one of the 5 valid classes.
+- `penalty <dimension> alpha=.. soft=t:p hard=t:p` — overrides one dimension's EWMA/penalty
+  tuning (§2/§3). `alpha=`, `soft=`, and `hard=` are all required together, in any order.
+  `soft=`/`hard=` are `threshold:penalty` pairs; the penalty's sign is cosmetic (magnitude is
+  normalized internally), so `soft=20:-10` and `soft=20:10` are equivalent.
+- `min_score <float>` / `max_score <float>` — clamp bounds for the final score (default `0`/`100`).
+  Only explicitly-set values override the defaults; unset stays at the default rather than being
+  treated as `0`.
+- Overrides are per-field: a `penalty asn ...` line changes only the `asn` dimension, leaving the
+  other five at their defaults, and a `base_score researcher 100` line doesn't reset the other four
+  classes. There is no cross-field validation — nothing stops you from setting `min_score` above
+  `max_score` or a `soft` threshold above `hard`; both are accepted as-is.
+
+## 2. What EWMA is, and why
+
+Each of the 6 scoring dimensions (§3) tracks how fast traffic from a given entity (one IP, one
+`/24`, one ASN, ...) is arriving, so it can apply a penalty once that rate is sustained rather than
+a one-off burst. The mechanism is an **exponentially weighted moving average (EWMA)** of requests
+per second, not a rolling window / sliding count — this is a deliberate departure from a naive
+"count requests in the last N seconds" approach, because a fixed window either forgets a sustained
+abuser the instant they pause for N seconds, or requires storing individual request timestamps
+(expensive at scale). EWMA instead keeps exactly one floating-point number per tracked entity and
+updates it on a fixed tick:
+
+```
+rate  = requests_since_last_tick / tick_interval_seconds
+ewma  = alpha * rate + (1 - alpha) * ewma_previous
+```
+
+- **`ewma_tick_interval`** (this system's version of a "window" — default `1s`) is how often this
+  update runs, for every tracked entity, across all 6 dimensions. It also sets the denominator
+  for `rate`: a 2-second tick that saw 10 requests computes `rate = 5`, not `10` — the EWMA always
+  operates on a normalized per-second rate regardless of tick length.
+- **`alpha`** (per-dimension, default `0.2`) controls how much weight the *most recent* tick gets
+  vs. everything before it. A higher alpha reacts to a rate change faster but is noisier; a lower
+  alpha smooths out brief spikes but takes longer to reflect sustained load.
+- Between ticks, requests just increment a pending counter — the EWMA math itself only runs at
+  tick boundaries, and penalties are evaluated against the EWMA value as of the *last completed
+  tick*, never a mid-tick estimate.
+
+**Worked trace** (`alpha = 0.2`, `tick_interval = 1s`, starting `ewma = 0`), one request arriving
+in every tick for 4 seconds straight:
+
+| Tick | requests this tick | rate | `ewma = 0.2*rate + 0.8*ewma_prev` |
+|---|---|---|---|
+| 1 | 1 | 1.0 | `0.2*1.0 + 0.8*0.0` = **0.20** |
+| 2 | 1 | 1.0 | `0.2*1.0 + 0.8*0.20` = **0.36** |
+| 3 | 1 | 1.0 | `0.2*1.0 + 0.8*0.36` = **0.49** |
+| 4 | 1 | 1.0 | `0.2*1.0 + 0.8*0.49` = **0.59** |
+
+The EWMA climbs toward the steady-state rate (1.0 here) but never jumps straight to it — a
+sustained rate is required to actually cross a threshold, while a single-tick burst decays back out
+almost as fast as it arrived (see [`scenarios.md`](scenarios.md) for a full walkthrough of a normal
+user's browsing burst vs. a sustained crawler).
+
+## 3. Soft vs. hard penalties
+
+Each of the 6 dimensions has its own `PenaltyConfig{alpha, soft_threshold, soft_penalty,
+hard_threshold, hard_penalty}`. Given a dimension's current EWMA rate:
+
+```
+rps > hard_threshold  → hard_penalty
+rps > soft_threshold  → soft_penalty     (and rps <= hard_threshold)
+otherwise             → 0
+```
+
+Boundaries are **strictly exclusive** (`>`, not `>=`): a rate exactly equal to the soft threshold
+contributes no penalty yet; a rate exactly equal to the hard threshold still only gets the soft
+penalty. Soft and hard are **not additive within a dimension** — only the single highest-qualifying
+tier applies. Across dimensions, though, contributions **do** sum: a request classified into a
+penalized `ip` *and* a penalized `asn` pays both. The final score is:
+
+```
+final = clamp(base_score[user_class] - sum_of_all_6_dimension_penalties, min_score, max_score)
+```
+
+### Default per-dimension tuning
+
+| Dimension | Tracks | Applies to | alpha | soft (threshold:penalty) | hard (threshold:penalty) |
+|---|---|---|---|---|---|
+| `ip` | single client IP | any resolved IP | 0.2 | 20 : 10 | 100 : 40 |
+| `net24` | IPv4 `/24` subnet | IPv4 only | 0.2 | 100 : 10 | 500 : 40 |
+| `net6` | IPv6 `/48` or `/56` (per `ipv6_prefix_length`) | IPv6 only | 0.2 | 100 : 10 | 500 : 40 |
+| `asn` | autonomous system | GeoIP ASN DB configured & resolves | 0.2 | 500 : 10 | 2000 : 40 |
+| `country` | country | GeoIP city DB configured & resolves | 0.2 | 2000 : 10 | 10000 : 40 |
+| `user` | JWT subject | authenticated requests only | 0.2 | 20 : 10 | 100 : 40 |
+
+**Why aggregate dimensions get much higher thresholds than `ip`/`user`:** a single IP or user
+sustaining 20+ rps is unusual behavior worth penalizing lightly, but a `/24` subnet, an ASN, or a
+whole country legitimately carries far more traffic from many distinct real users — a shared campus
+network, a mobile carrier's NAT gateway, or a large ISP can easily produce hundreds of req/s of
+completely ordinary browsing. Penalizing at `ip`-dimension thresholds for these aggregate
+dimensions would punish innocent traffic sharing an address block. The defaults above are a
+starting point, not a guarantee — see [`scenarios.md`](scenarios.md) for a case where the defaults
+under-react to a genuinely abusive ASN and need a backend-level override.
+
+## 4. User classes & base scores
+
+| Class | Meaning | Default `base_score` |
+|---|---|---|
+| `researcher` | JWT-verified, trusted | 100 |
+| `service_account` | JWT-verified, trusted | 100 |
+| `internal` | JWT-verified, trusted | 100 |
+| `anonymous` | no bearer token presented | 60 |
+| `unknown` | token presented but unverifiable (e.g. JWKS unreachable, bad signature) | 60 |
+
+Classification is identity-only — behavior (request rate, penalties) is never folded back into the
+class itself, only into the score via the 6 dimensions above. `unknown` deliberately shares
+`anonymous`'s base score rather than being penalized further: an unverifiable token is not evidence
+of bad intent (it may just mean the JWKS endpoint is temporarily unreachable — a fail-open
+condition), so it isn't trusted *less* than presenting no token at all.
+
+## 5. Exempt countries
+
+`exempt_country <CC>` (repeatable, exact ISO 3166-1 alpha-2 match, no wildcards/case-folding) marks
+a country whose `country`-dimension penalty never contributes to `total_penalty`. The dimension is
+still tracked and counted for observability (visible via `/fairness/status`'s
+`dimension_entry_counts`, see [`monitoring.md`](monitoring.md)) — exemption only suppresses its
+penalty contribution, and has no effect on the other 5 dimensions (`ip`/`net24`/`net6`/`asn`/`user`
+are evaluated independently regardless of country).
+
+## 6. `adaptive_admission` block
+
+```caddyfile
+adaptive_admission {
+    backend <string>
+
+    controller fixed {
+        limit <int>
+    }
+    # or:
+    controller adaptive {
+        min_concurrency        <int>
+        initial_concurrency    <int>
+        max_concurrency        <int>
+        target_p95             <duration>
+        timeout_rate_threshold <float>
+        error_rate_threshold   <float>
+        adjust_interval        <duration>
+    }
+
+    queue_max_size <int>
+    queue_timeout  <duration>
+}
+```
+
+| Directive | Default | Notes |
+|---|---|---|
+| `backend <string>` | `"default"` | Label only, as in `fairness`. |
+| `controller <fixed\|adaptive>` | — (required) | Selects the capacity-control strategy for this backend. |
+| `queue_max_size <int>` | `0` (unbounded) | Max tickets the priority queue holds before rejecting new arrivals with `queue_full`. |
+| `queue_timeout <duration>` | `0` (unbounded) | Max Little's-law-projected wait before rejecting with `queue_wait_exceeded` (§7). |
+
+`controller fixed { limit <int> }` — a static concurrency ceiling. `limit` must be `> 0`.
+
+`controller adaptive { ... }` — self-tuning concurrency, re-evaluated every `adjust_interval`
+(default 30s if unset). `min_concurrency`, `initial_concurrency`, and `max_concurrency` are all
+**required** (each must be `> 0`); `target_p95`/`timeout_rate_threshold`/`error_rate_threshold`
+default to `0` (disabling the p95-driven branches entirely) if left unset.
+
+### Adaptive adjustment table
+
+At each `adjust_interval` tick, at most **one** branch fires, checked in this exact priority order:
+
+| # | Condition | Multiplier | Direction | Cooldown |
+|---|---|---|---|---|
+| 1 | timeout rate > `timeout_rate_threshold` | ×0.60 | shrink | 60s (own timer) |
+| 2 | error rate > `error_rate_threshold` | ×0.75 | shrink | 30s (own timer) |
+| 3 | p95 latency > 2 × `target_p95` | ×0.70 | shrink | 30s (shared with #4) |
+| 4 | p95 latency > `target_p95` | ×0.85 | shrink | 30s (shared with #3) |
+| 5 | p95 latency < 0.5 × `target_p95` | ×1.05 | grow | none |
+
+A shrink never drops the limit below 1 (regardless of `min_concurrency`, as a deadlock guard); a
+grow makes forward progress even when the multiplier would otherwise round down to no change (e.g.
+limit 1 growing always becomes at least 2). Every change is clamped to
+`[min_concurrency, max_concurrency]`. Growing the limit immediately wakes enough blocked requests
+to use the new capacity — it doesn't wait for the next request to finish and release its slot.
+
+## 7. Queue semantics
+
+The priority queue orders tickets by **score descending**, then **arrival order (FIFO)** within
+equal scores — a higher-scored request is always served first, but two requests with the same
+score are served in the order they arrived. Two distinct rejection reasons, both surfaced as HTTP
+429 but logged/labeled separately (see [`monitoring.md`](monitoring.md)):
+
+- **`queue_full`** — the queue already holds `queue_max_size` tickets when a new one arrives.
+- **`queue_wait_exceeded`** — a Little's-law-style projection already exceeds `queue_timeout`
+  before the ticket even joins the queue:
+
+  ```
+  projected_wait = queue_depth * mean_latency / concurrency_limit
+  ```
+
+  This projection is skipped (never rejects) until at least one request has completed and produced
+  a real latency sample — an empty/cold queue never gets rejected on a wait estimate that doesn't
+  exist yet.
+
+## 8. How `fairness` and `adaptive_admission` hand off
+
+`fairness`, if present, must run before `adaptive_admission` in the chain — both directives
+register an explicit ordering position (`fairness` immediately before `adaptive_admission`, which
+in turn runs immediately before `reverse_proxy`), so a bare Caddyfile with both directives at the
+top level of a route orders correctly without needing an explicit `route { }` wrapper (though
+wrapping in `route { }` still works and is sometimes clearer). The two modules never import each
+other's Go internals — the only coupling is Caddy's own `caddyhttp.SetVar`/`GetVar` request-scoped
+variable mechanism:
+
+- `fairness` writes the computed score under a `fairness_score` variable.
+- `adaptive_admission` reads it via `GetVar`; if `fairness` wasn't chained ahead at all (or the
+  variable isn't a `float64` for any reason), it falls back to a neutral score of `0` — every
+  request hitting this fallback is treated identically, neither privileged nor penalized, rather
+  than causing an error.
+- `fairness` also writes a `fairness_log_fields` variable (IP, ASN, country, user class, exemption
+  flag, per-dimension score breakdown) that `adaptive_admission` folds into its own structured log
+  line — `fairness` never logs a request on its own (see [`monitoring.md`](monitoring.md)).
