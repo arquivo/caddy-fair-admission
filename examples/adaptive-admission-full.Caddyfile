@@ -1,0 +1,68 @@
+# Exhaustive adaptive_admission reference: every top-level directive, and
+# both controller kinds with every sub-field set, each on its own commented
+# line. Not meant to be realistic tuning -- see docs/configuration.md for
+# what each field means. Validate with:
+#   caddy validate --config examples/adaptive-admission-full.Caddyfile --adapter caddyfile
+
+# Site block 1 -- controller fixed: a static concurrency ceiling.
+:8080 {
+	adaptive_admission {
+		# Label used in metrics/logs/admin output only.
+		backend page-search-api-fixed
+
+		controller fixed {
+			# Static concurrency ceiling -- never adjusted at runtime.
+			limit 100
+		}
+
+		# Reject new arrivals with queue_full once 500 requests are already
+		# queued waiting for capacity.
+		queue_max_size 500
+		# Reject an arrival with queue_wait_exceeded if the Little's-law
+		# projected wait (queue_depth * mean_latency / limit) already
+		# exceeds this before it even joins the queue.
+		queue_timeout 10s
+	}
+
+	reverse_proxy page-search-api-1:8080 page-search-api-2:8080
+}
+
+# Site block 2 -- controller adaptive: every self-tuning sub-field set
+# explicitly (docs/configuration.md §6 has the full multiplier/cooldown
+# table this drives).
+:8081 {
+	adaptive_admission {
+		backend page-search-api-adaptive
+
+		controller adaptive {
+			# Floor: shrinking never drops the limit below this (in
+			# addition to the hard-coded absolute floor of 1).
+			min_concurrency 10
+			# Starting limit before the first adjust_interval tick.
+			initial_concurrency 40
+			# Ceiling: growing never raises the limit above this.
+			max_concurrency 300
+			# Target p95 backend latency this controller tries to hold.
+			# Crossing 2x this triggers the harsher x0.70 shrink; crossing
+			# 1x triggers the milder x0.85 shrink; dropping under 0.5x
+			# triggers growth.
+			target_p95 750ms
+			# Shrink hard (x0.60, 60s cooldown) once more than this
+			# fraction of requests time out -- checked first, before every
+			# other branch, each tick.
+			timeout_rate_threshold 0.05
+			# Shrink (x0.75, 30s cooldown) once more than this fraction of
+			# requests error -- checked second.
+			error_rate_threshold 0.10
+			# How often all of the above conditions are re-evaluated (one
+			# branch fires per tick, per docs/configuration.md §6's
+			# priority order).
+			adjust_interval 30s
+		}
+
+		queue_max_size 1000
+		queue_timeout  15s
+	}
+
+	reverse_proxy page-search-api-3:8080 page-search-api-4:8080
+}

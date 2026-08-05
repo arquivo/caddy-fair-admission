@@ -1,0 +1,83 @@
+# Exhaustive fairness reference: every top-level directive and every
+# scoring { } sub-directive in one block, each on its own commented line.
+# Not meant to be realistic tuning -- see docs/configuration.md for what
+# each field means and docs/scenarios.md for worked, realistic tuning
+# decisions. Validate with:
+#   caddy validate --config examples/fairness-full.Caddyfile --adapter caddyfile
+
+:8080 {
+	fairness {
+		# Label used in metrics/logs/admin output only -- never affects
+		# routing (docs/configuration.md §1).
+		backend page-search-api
+
+		# MaxMind city DB, enabling the country dimension and country-based
+		# classification/logging. Fails open (no country lookups) if unset
+		# or unopenable.
+		geoip_city_db /etc/caddy/GeoLite2-City.mmdb
+		# MaxMind ASN DB, enabling the asn dimension. Independent of
+		# geoip_city_db -- either can be set without the other.
+		geoip_asn_db /etc/caddy/GeoLite2-ASN.mmdb
+
+		# Expected JWT issuer claim for the user dimension/user-class
+		# classification. Not itself validated at parse time.
+		auth_issuer https://idp.example.com/
+		# JWKS endpoint used to verify bearer-token signatures (RS256),
+		# refreshed on a background loop. Required for auth to do anything
+		# -- without this, every request classifies as anonymous.
+		auth_jwks_url https://idp.example.com/.well-known/jwks.json
+		# Expected JWT audience claim. Not itself validated at parse time.
+		auth_audience page-search-api
+
+		# Repeatable: countries whose country-dimension penalty never
+		# contributes to total_penalty (still tracked -- docs/configuration.md
+		# §5). Two lines here, one per exempt country.
+		exempt_country PT
+		exempt_country ES
+
+		# IPv6 client addresses are aggregated at this prefix length for the
+		# net6 dimension. Must be exactly 48 or 56.
+		ipv6_prefix_length 48
+
+		# How often every tracked entity's EWMA rate is recomputed, across
+		# all 6 dimensions (docs/configuration.md §2). Tighter than the 1s
+		# default, reacting faster at the cost of noisier per-tick rates.
+		ewma_tick_interval 500ms
+		# Entities idle longer than this are garbage-collected (swept by a
+		# fixed, non-configurable 1-minute ticker regardless of this value).
+		idle_entry_ttl 15m
+
+		scoring {
+			# Base score for every one of the 5 user classes
+			# (docs/configuration.md §4) -- all five restated here even
+			# though only anonymous/unknown differ from the trusted three
+			# in the defaults, to show every valid class name.
+			base_score researcher       100
+			base_score service_account  100
+			base_score internal         100
+			base_score anonymous        60
+			base_score unknown          60
+
+			# One penalty override per dimension (all 6), each restating
+			# this project's own defaults from docs/configuration.md §3 --
+			# a real config would normally only override the dimensions
+			# that actually need different tuning.
+			penalty ip      alpha=0.2 soft=20:10   hard=100:40
+			penalty net24   alpha=0.2 soft=100:10  hard=500:40
+			penalty net6    alpha=0.2 soft=100:10  hard=500:40
+			penalty asn     alpha=0.2 soft=500:10  hard=2000:40
+			penalty country alpha=0.2 soft=2000:10 hard=10000:40
+			penalty user    alpha=0.2 soft=20:10   hard=100:40
+
+			# Clamp bounds for the final score after all penalties are
+			# summed and subtracted from the base score.
+			min_score 0
+			max_score 100
+		}
+	}
+
+	# fairness alone doesn't gate or proxy anything -- pair it with
+	# adaptive_admission (see examples/adaptive-admission-full.Caddyfile)
+	# and reverse_proxy in a real deployment.
+	respond "ok" 200
+}

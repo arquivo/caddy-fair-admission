@@ -24,17 +24,35 @@
 #
 # Run: caddy run --config examples/fairness-adaptive-admission.Caddyfile --adapter caddyfile
 
+# Named snippet: fairness settings shared by both site blocks below (kept out
+# of the classification/scoring block itself so it can be `import`ed twice
+# without repeating every field).
 (shared_fairness_defaults) {
+	# PT traffic is never penalized on the country dimension (still tracked
+	# for observability -- see docs/configuration.md §5).
 	exempt_country PT
+	# IPv6 client addresses are aggregated at a /56 for the net6 dimension
+	# (the only other valid value is 48 -- docs/configuration.md §1).
 	ipv6_prefix_length 56
+	# Re-evaluate every tracked entity's EWMA once a second (the default --
+	# see docs/configuration.md §2 for what this "tick" controls).
 	ewma_tick_interval 1s
+	# Entities idle for more than 10 minutes are garbage-collected.
 	idle_entry_ttl 10m
 }
 
+# Named snippet: scoring overrides shared by both site blocks below.
 (shared_scoring) {
 	scoring {
+		# Authenticated researchers start at the maximum base score.
 		base_score researcher 100
+		# Anonymous (no bearer token) traffic starts lower, per
+		# docs/configuration.md §4.
 		base_score anonymous  60
+		# Override just the ip dimension's soft/hard penalty amounts (the
+		# thresholds 20/100 are left at their defaults here; only the
+		# penalty magnitudes are restated -- the leading "-" is cosmetic,
+		# see docs/configuration.md §1.1).
 		penalty ip alpha=0.2 soft=20:-10 hard=100:-40
 	}
 }
@@ -42,32 +60,53 @@
 # Form A -- bare top-level directives.
 :8080 {
 	fairness {
+		# Pull in the shared GeoIP/EWMA/TTL settings defined above.
 		import shared_fairness_defaults
+		# Pull in the shared base-score/penalty overrides defined above.
 		import shared_scoring
 	}
 
 	adaptive_admission {
+		# Self-tuning concurrency, re-evaluated every adjust_interval --
+		# see docs/configuration.md §6 for the full multiplier/cooldown
+		# table this drives.
 		controller adaptive {
+			# Never shrink below 10 concurrent requests.
 			min_concurrency        10
+			# Start at 40 concurrent requests before the first adjustment.
 			initial_concurrency    40
+			# Never grow above 200 concurrent requests.
 			max_concurrency        200
+			# Target p95 backend latency this controller tries to hold.
 			target_p95             800ms
+			# Shrink hard (x0.60) if more than 5% of requests are timing out.
 			timeout_rate_threshold 0.05
+			# Shrink (x0.75) if more than 5% of requests error.
 			error_rate_threshold   0.05
+			# Re-evaluate all of the above every 30 seconds.
 			adjust_interval        30s
 		}
 
+		# Reject with queue_full once 500 requests are already queued.
 		queue_max_size 500
+		# Reject with queue_wait_exceeded once the Little's-law-projected
+		# wait for a new arrival would exceed 10 seconds.
 		queue_timeout  10s
 	}
 
+	# Least-in-flight-connections load balancing across three upstreams,
+	# with active+passive health checking.
 	reverse_proxy page-search-api-1:8080 page-search-api-2:8080 page-search-api-standby:8080 {
+		# Prefer the upstream with the fewest in-flight requests.
 		lb_policy least_conn
 
+		# Active health check: poll this path every 10s, 5s timeout.
 		health_uri      /healthz
 		health_interval 10s
 		health_timeout  5s
 
+		# Passive health check: after 3 failures (5xx status or a response
+		# slower than 2s), mark an upstream unhealthy for 30s.
 		fail_duration     30s
 		max_fails         3
 		unhealthy_status  5xx
@@ -86,6 +125,8 @@
 		}
 
 		adaptive_admission {
+			# A static concurrency ceiling instead of form A's adaptive
+			# controller -- both controller kinds are valid on any route.
 			controller fixed {
 				limit 50
 			}
@@ -94,6 +135,8 @@
 			queue_timeout  10s
 		}
 
+		# Sticky sessions via a load-balancer-managed cookie instead of
+		# least-in-flight-connections.
 		reverse_proxy page-search-api-1:8080 page-search-api-2:8080 {
 			lb_policy cookie
 

@@ -3,14 +3,30 @@
 # for a realistic end-to-end example with reverse_proxy.
 # Run: caddy run --config examples/scaffold.Caddyfile --adapter caddyfile
 
+# Listen on :8080 (bare port -- no TLS, fine for local sanity checks).
 :8080 {
+	# Wrapping in route { } is optional (see form B in
+	# fairness-adaptive-admission.Caddyfile) but harmless -- shown here for
+	# the same effect as bare top-level directives.
 	route {
+		# fairness with zero configuration: every directive falls back to
+		# its default (see docs/configuration.md §1) -- no GeoIP DBs, no
+		# auth, default EWMA tuning on all 6 scoring dimensions.
 		fairness
+		# adaptive_admission gates admission to whatever comes next in the
+		# chain (here, just a static "ok" response, so there's no real
+		# backend to protect -- this block only exists to prove the two
+		# modules chain and provision correctly).
 		adaptive_admission {
+			# A static concurrency ceiling of 50 in-flight requests; no
+			# adaptive tuning, no queue limits (queue_max_size/queue_timeout
+			# both default to unbounded -- see docs/configuration.md §6).
 			controller fixed {
 				limit 50
 			}
 		}
+		# No real backend here -- just prove the chain completes and
+		# returns a response through both modules.
 		respond "ok" 200
 	}
 }
