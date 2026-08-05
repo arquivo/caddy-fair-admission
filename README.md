@@ -54,9 +54,22 @@ docker run --rm -p 8080:8080 -p 2019:2019 \
   caddy-fair-admission
 ```
 
+Or pull the image already published to
+[Docker Hub](https://hub.docker.com/r/arquivo/caddy-adaptive-admission-controller) instead of
+building it yourself:
+
+```sh
+docker pull arquivo/caddy-adaptive-admission-controller:latest
+docker run --rm -p 8080:8080 -p 2019:2019 \
+  -v "$(pwd)/examples/fairness-adaptive-admission.Caddyfile:/etc/caddy/Caddyfile:ro" \
+  arquivo/caddy-adaptive-admission-controller:latest
+```
+
 CI (`.github/workflows/build.yml`) runs `go vet`, `go test ./...`, and this same `xcaddy build` on
 every push/PR to `main`. Tagged releases (`.github/workflows/release.yml`) build and publish binary
-artifacts for linux/darwin/windows.
+artifacts for linux/darwin/windows. Every push to `main` and every `v*.*.*` tag also builds and
+pushes the Docker image (`.github/workflows/docker-publish.yml`), tagged with the branch, semver
+version, and commit SHA as appropriate.
 
 ## Usage
 
