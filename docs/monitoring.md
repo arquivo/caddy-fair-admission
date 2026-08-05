@@ -208,8 +208,11 @@ Fields folded in from `fairness` **when a `fairness` handler ran earlier in the 
 entirely if `fairness` wasn't configured for this route): `ip` (string), `asn` (uint64, the numeric
 AS number, only present when GeoIP ASN lookup resolved), `country` (string, ISO alpha-2, only
 present when GeoIP city lookup resolved), `user_class` (string), `exempt` (bool, whether `country`
-was on the `exempt_country` list for this request), `score_breakdown` (object, per-dimension
-penalty contribution).
+was on the `exempt_country` list for this request), `score_breakdown` (object — always has `base`
+and `final`; always has `total_penalty` after fairness has computed a score, present as `0` if no
+dimension contributed a penalty; and one `penalty_<dimension>` key per dimension that actually
+contributed a non-zero penalty this request, e.g. `penalty_asn` — dimensions contributing `0` are
+omitted entirely rather than listed with a `0` value).
 
 **Example — admitted request:**
 
@@ -227,7 +230,7 @@ penalty contribution).
   "country": "PT",
   "user_class": "anonymous",
   "exempt": false,
-  "score_breakdown": { "ip": 0, "net24": 0, "net6": 0, "asn": 0, "country": 0, "user": 0 }
+  "score_breakdown": { "base": 60, "total_penalty": 0, "final": 60 }
 }
 ```
 
@@ -247,6 +250,6 @@ lowest-priority tier and it lost the race against a full queue):
   "country": "SG",
   "user_class": "anonymous",
   "exempt": false,
-  "score_breakdown": { "ip": 0, "net24": 0, "net6": 0, "asn": 10, "country": 0, "user": 0 }
+  "score_breakdown": { "base": 60, "penalty_asn": 10, "total_penalty": 10, "final": 50 }
 }
 ```

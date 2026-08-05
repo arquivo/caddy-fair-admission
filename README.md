@@ -44,6 +44,16 @@ go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 xcaddy build --with github.com/arquivo/caddy-adaptive-admission-controller=.
 ```
 
+Or build a container image with the [`Dockerfile`](Dockerfile), which does the same `xcaddy build`
+inside Caddy's own official builder image and copies the result into Caddy's own runtime image:
+
+```sh
+docker build -t caddy-fair-admission .
+docker run --rm -p 8080:8080 -p 2019:2019 \
+  -v "$(pwd)/examples/fairness-adaptive-admission.Caddyfile:/etc/caddy/Caddyfile:ro" \
+  caddy-fair-admission
+```
+
 CI (`.github/workflows/build.yml`) runs `go vet`, `go test ./...`, and this same `xcaddy build` on
 every push/PR to `main`. Tagged releases (`.github/workflows/release.yml`) build and publish binary
 artifacts for linux/darwin/windows.
