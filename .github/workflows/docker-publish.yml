@@ -4,11 +4,14 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*.*.*"
   pull_request:
     branches:
       - main
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
 
 jobs:
   docker-build:
@@ -17,11 +20,14 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
         with:
+          context: ${{ inputs.tag && 'git' || 'workflow' }}
           images: |
             arquivo/caddy-adaptive-admission-controller
           tags: |

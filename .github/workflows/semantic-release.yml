@@ -1,0 +1,67 @@
+name: Semantic Release
+
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  # GITHUB_TOKEN-authored pushes don't trigger other workflows, so the tag
+  # semantic-release creates below won't fire release.yml/docker-publish.yml
+  # on its own. Detect whether a new tag actually appeared and call them
+  # directly instead of relying on their (now unused) tag-push triggers.
+  baseline:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: tag
+        run: echo "tag=$(git tag --sort=-creatordate | head -n1)" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: baseline
+    uses: arquivo/.github/.github/workflows/semantic-release.yml@main
+    secrets: inherit
+
+  detect:
+    needs: [baseline, release]
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.check.outputs.released }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: check
+        run: |
+          latest="$(git tag --sort=-creatordate | head -n1)"
+          if [ -n "$latest" ] && [ "$latest" != "${{ needs.baseline.outputs.tag }}" ]; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release-binaries:
+    needs: detect
+    if: needs.detect.outputs.released == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.detect.outputs.tag }}
+    secrets: inherit
+
+  docker-image:
+    needs: detect
+    if: needs.detect.outputs.released == 'true'
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      tag: ${{ needs.detect.outputs.tag }}
+    secrets: inherit

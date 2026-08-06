@@ -66,10 +66,18 @@ docker run --rm -p 8080:8080 -p 2019:2019 \
 ```
 
 CI (`.github/workflows/build.yml`) runs `go vet`, `go test ./...`, and this same `xcaddy build` on
-every push/PR to `main`. Tagged releases (`.github/workflows/release.yml`) build and publish binary
-artifacts for linux/darwin/windows. Every push to `main` and every `v*.*.*` tag also builds and
-pushes the Docker image (`.github/workflows/docker-publish.yml`), tagged with the branch, semver
-version, and commit SHA as appropriate.
+every push/PR to `main`. Releases are cut automatically, not by hand: once `Build` passes on
+`main`, [semantic-release](https://github.com/semantic-release/semantic-release)
+(`.github/workflows/semantic-release.yml`, using
+[Arquivo's shared reusable workflow](https://github.com/arquivo/.github)) inspects the
+[Conventional Commits](https://www.conventionalcommits.org/) merged since the last release —
+enforced on PRs by `commitlint.yml` — and, if any warrant a release, bumps the version, updates
+`CHANGELOG.md`, and publishes a GitHub Release with a `vX.Y.Z` tag. GitHub doesn't let a push
+made with a workflow's own token trigger other workflows, so `semantic-release.yml` itself
+detects whether a new tag actually appeared and, if so, calls `.github/workflows/release.yml`
+(cross-compiles and attaches binary artifacts for linux/darwin/windows to the release) and
+`.github/workflows/docker-publish.yml` (builds and pushes the Docker image, tagged with the
+branch, semver version, and commit SHA as appropriate) directly, in the same run.
 
 ## Usage
 
