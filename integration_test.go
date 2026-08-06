@@ -14,6 +14,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -65,6 +68,31 @@ func loadCaddy(t *testing.T, input string) {
 	})
 	// Give the listener a moment to come up before the test fires requests.
 	time.Sleep(150 * time.Millisecond)
+}
+
+// expectCaddyLoadError adapts input (which must itself adapt successfully --
+// these tests target Provision-time validation errors, not adapter/parse
+// errors) and attempts to load it as the running Caddy config. It fails the
+// test if caddy.Load unexpectedly succeeds, and otherwise returns the error
+// it produced.
+func expectCaddyLoadError(t *testing.T, input string) error {
+	t.Helper()
+	cfg := adaptCaddyfile(t, input)
+	cfg["admin"] = map[string]any{"disabled": true}
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	loadErr := caddy.Load(cfgJSON, false)
+	if loadErr == nil {
+		t.Cleanup(func() {
+			if err := caddy.Stop(); err != nil {
+				t.Errorf("caddy.Stop: %v", err)
+			}
+		})
+		t.Fatal("caddy.Load unexpectedly succeeded, want a Provision-time validation error")
+	}
+	return loadErr
 }
 
 // handleChain walks apps.http.servers.srv0.routes[0].handle[], descending
@@ -367,6 +395,9 @@ func TestIntegration_EndToEnd_AdminStatusEndpoints(t *testing.T) {
 :19084 {
 	fairness {
 		auth_jwks_url %s
+		scoring {
+			penalty ip
+		}
 	}
 	adaptive_admission {
 		controller fixed {
@@ -473,5 +504,273 @@ func TestIntegration_EndToEnd_AdminStatusEndpoints(t *testing.T) {
 	}
 	if len(fBody.Shared.JWKS) != 1 || !fBody.Shared.JWKS[0].Healthy || fBody.Shared.JWKS[0].References < 1 {
 		t.Errorf("fairness shared JWKS health = %+v, want 1 healthy entry with >= 1 reference", fBody.Shared.JWKS)
+	}
+}
+
+// The tests below cover the Provision-time config errors added for opt-in
+// scoring dimensions (REQUIREMENTS.md §4.3 design refinement,
+// docs/configuration.md §1.1): enabling asn/country/user via `penalty <dim>`
+// without its prerequisite (geoip_asn_db/geoip_city_db/auth_jwks_url)
+// actually configured *and working* must hard-fail config load, with
+// distinct wording for "not configured at all" vs. "configured but failed
+// to open/initialize".
+
+func TestIntegration_ConfigError_AsnEnabled_NotConfigured(t *testing.T) {
+	input := `
+:19085 {
+	fairness {
+		scoring {
+			penalty asn
+		}
+	}
+}
+`
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), `geoip_asn_db is not configured`) {
+		t.Errorf("error = %v, want it to mention geoip_asn_db is not configured", err)
+	}
+}
+
+func TestIntegration_ConfigError_AsnEnabled_FailedToOpen(t *testing.T) {
+	badPath := filepath.Join(t.TempDir(), "does-not-exist.mmdb")
+	input := fmt.Sprintf(`
+:19086 {
+	fairness {
+		geoip_asn_db %s
+		scoring {
+			penalty asn
+		}
+	}
+}
+`, badPath)
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), "failed to open") {
+		t.Errorf("error = %v, want it to mention the DB failed to open", err)
+	}
+}
+
+func TestIntegration_ConfigError_CountryEnabled_NotConfigured(t *testing.T) {
+	input := `
+:19087 {
+	fairness {
+		scoring {
+			penalty country
+		}
+	}
+}
+`
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), `geoip_city_db is not configured`) {
+		t.Errorf("error = %v, want it to mention geoip_city_db is not configured", err)
+	}
+}
+
+func TestIntegration_ConfigError_CountryEnabled_FailedToOpen(t *testing.T) {
+	badPath := filepath.Join(t.TempDir(), "does-not-exist.mmdb")
+	input := fmt.Sprintf(`
+:19088 {
+	fairness {
+		geoip_city_db %s
+		scoring {
+			penalty country
+		}
+	}
+}
+`, badPath)
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), "failed to open") {
+		t.Errorf("error = %v, want it to mention the DB failed to open", err)
+	}
+}
+
+func TestIntegration_ConfigError_UserEnabled_NotConfigured(t *testing.T) {
+	input := `
+:19089 {
+	fairness {
+		scoring {
+			penalty user
+		}
+	}
+}
+`
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), `auth_jwks_url is not configured`) {
+		t.Errorf("error = %v, want it to mention auth_jwks_url is not configured", err)
+	}
+}
+
+func TestIntegration_ConfigError_UserEnabled_FailedToInitialize(t *testing.T) {
+	input := `
+:19090 {
+	fairness {
+		auth_jwks_url ://bad-url
+		scoring {
+			penalty user
+		}
+	}
+}
+`
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), "failed to initialize") {
+		t.Errorf("error = %v, want it to mention the JWKS URL failed to initialize", err)
+	}
+}
+
+// Positive control: enabling `user` against a genuinely working JWKS
+// endpoint must load cleanly -- the three tests above only prove the error
+// paths fire; this proves they don't false-positive on a valid setup.
+func TestIntegration_ConfigError_UserEnabled_ValidJWKS_LoadsCleanly(t *testing.T) {
+	jwksURL, _ := startJWKSServerAndSignToken(t, "researcher")
+	input := fmt.Sprintf(`
+:19091 {
+	fairness {
+		auth_jwks_url %s
+		scoring {
+			penalty user
+		}
+	}
+}
+`, jwksURL)
+	loadCaddy(t, input)
+}
+
+// TestIntegration_Provision_ValidationFailure_ReleasesAcquiredPoolRefs guards
+// the h.releaseAcquired() fix in Provision's validation-failure paths
+// (module.go): a *caddy.Load whose config fails validation must not leak the
+// JWKS background refresh goroutine it acquired before failing. Caddy does
+// not call Cleanup on a Handler whose own Provision returned an error, so
+// without releaseAcquired() being called explicitly, each failed load here
+// would leak one goroutine forever. Repeating the failing load many times
+// and asserting the goroutine count doesn't grow is the only black-box
+// signal available -- the fairness App itself is reprovisioned fresh (new,
+// empty UsagePools) on every successful *caddy.Load*, so a post-hoc refcount
+// check on a subsequent load can't observe a leak from an earlier failed one
+// directly; only the underlying goroutine can.
+func TestIntegration_Provision_ValidationFailure_ReleasesAcquiredPoolRefs(t *testing.T) {
+	jwksURL, _ := startJWKSServerAndSignToken(t, "researcher")
+	badPath := filepath.Join(t.TempDir(), "does-not-exist.mmdb")
+	input := fmt.Sprintf(`
+:19092 {
+	fairness {
+		auth_jwks_url %s
+		geoip_asn_db %s
+		scoring {
+			penalty user
+			penalty asn
+		}
+	}
+}
+`, jwksURL, badPath)
+
+	// Warm up and let any steady-state background goroutines (e.g. from
+	// package init or earlier tests) settle before taking the baseline.
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	before := runtime.NumGoroutine()
+
+	const attempts = 20
+	for i := 0; i < attempts; i++ {
+		if err := expectCaddyLoadError(t, input); !strings.Contains(err.Error(), "asn") {
+			t.Fatalf("attempt %d: error = %v, want it to mention the asn validation failure", i, err)
+		}
+	}
+
+	// Give any (incorrectly) lingering goroutines a moment to be counted,
+	// then retry a few times to absorb scheduler noise before failing.
+	var after int
+	for i := 0; i < 10; i++ {
+		runtime.GC()
+		time.Sleep(50 * time.Millisecond)
+		after = runtime.NumGoroutine()
+		if after <= before+2 {
+			break
+		}
+	}
+	if after > before+2 {
+		t.Errorf("goroutine count after %d failed loads = %d, want <= %d (baseline %d) -- releaseAcquired() may not be releasing the JWKS verifier's background refresh goroutine", attempts, after, before+2, before)
+	}
+}
+
+// TestIntegration_EndToEnd_NoScoringBlock_ZeroDimensionsTracked is the
+// end-to-end counterpart to scoring_test.go's
+// TestResolveScoringConfig_NoScoringBlockEnablesNoDimensions: a fairness
+// block with no `scoring { }` sub-block at all must, through the *real*
+// Caddyfile-adapter → JSON → caddy.Load pipeline (not just a direct
+// UnmarshalCaddyfile call in-process), still end up with zero dimensions
+// tracked. This specifically guards against the Handler.ScoringOverrides
+// field (and its nil-vs-populated distinction) failing to survive that JSON
+// round-trip -- the same class of bug that made every opt-in `penalty <dim>`
+// line silently inert at real runtime before ScoringOverrides was exported.
+func TestIntegration_EndToEnd_NoScoringBlock_ZeroDimensionsTracked(t *testing.T) {
+	adminLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	adminAddr := adminLn.Addr().String()
+	adminLn.Close()
+
+	input := `
+:19093 {
+	fairness {
+		backend no-scoring-block
+	}
+	respond "ok" 200
+}
+`
+	cfg := adaptCaddyfile(t, input)
+	cfg["admin"] = map[string]any{"listen": adminAddr}
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := caddy.Load(cfgJSON, false); err != nil {
+		t.Fatalf("caddy.Load: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := caddy.Stop(); err != nil {
+			t.Errorf("caddy.Stop: %v", err)
+		}
+	})
+	time.Sleep(150 * time.Millisecond)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	resp, err := client.Get("http://127.0.0.1:19093/")
+	if err != nil {
+		t.Fatalf("synthetic request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("synthetic request status = %d, want 200", resp.StatusCode)
+	}
+
+	fResp, err := client.Get("http://" + adminAddr + "/fairness/status")
+	if err != nil {
+		t.Fatalf("GET /fairness/status: %v", err)
+	}
+	defer fResp.Body.Close()
+	if fResp.StatusCode != http.StatusOK {
+		t.Fatalf("/fairness/status status = %d, want 200", fResp.StatusCode)
+	}
+	var fBody struct {
+		Backends []struct {
+			Backend              string             `json:"backend"`
+			BaseScores           map[string]float64 `json:"base_scores"`
+			DimensionEntryCounts map[string]int     `json:"dimension_entry_counts"`
+		} `json:"backends"`
+	}
+	if err := json.NewDecoder(fResp.Body).Decode(&fBody); err != nil {
+		t.Fatalf("decode /fairness/status: %v", err)
+	}
+	if len(fBody.Backends) != 1 || fBody.Backends[0].Backend != "no-scoring-block" {
+		t.Fatalf("fairness backends = %+v, want 1 entry with backend=no-scoring-block", fBody.Backends)
+	}
+	if got := fBody.Backends[0].DimensionEntryCounts; len(got) != 0 {
+		t.Errorf("dimension_entry_counts = %+v, want empty -- no `scoring { }` block was given, so no dimension should ever be tracked", got)
+	}
+	// Base scores still apply even with zero dimensions enabled (§4.3 design
+	// refinement: base_score is independent of dimension enablement).
+	if len(fBody.Backends[0].BaseScores) == 0 {
+		t.Errorf("base_scores = %+v, want the hardcoded defaults to still be present", fBody.Backends[0].BaseScores)
 	}
 }

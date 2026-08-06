@@ -36,20 +36,12 @@ curl -s http://localhost:2019/fairness/status | jq .
       "min_score": 0,
       "max_score": 100,
       "dimensions": {
-        "asn": { "Alpha": 0.2, "SoftThreshold": 500, "SoftPenalty": 10, "HardThreshold": 2000, "HardPenalty": 40 },
-        "country": { "Alpha": 0.2, "SoftThreshold": 2000, "SoftPenalty": 10, "HardThreshold": 10000, "HardPenalty": 40 },
         "ip": { "Alpha": 0.2, "SoftThreshold": 20, "SoftPenalty": 10, "HardThreshold": 100, "HardPenalty": 40 },
-        "net24": { "Alpha": 0.2, "SoftThreshold": 100, "SoftPenalty": 10, "HardThreshold": 500, "HardPenalty": 40 },
-        "net6": { "Alpha": 0.2, "SoftThreshold": 100, "SoftPenalty": 10, "HardThreshold": 500, "HardPenalty": 40 },
-        "user": { "Alpha": 0.2, "SoftThreshold": 20, "SoftPenalty": 10, "HardThreshold": 100, "HardPenalty": 40 }
+        "country": { "Alpha": 0.2, "SoftThreshold": 2000, "SoftPenalty": 10, "HardThreshold": 10000, "HardPenalty": 40 }
       },
       "dimension_entry_counts": {
-        "asn": 143,
-        "country": 37,
         "ip": 8912,
-        "net24": 2201,
-        "net6": 55,
-        "user": 12
+        "country": 37
       }
     }
   ],
@@ -69,8 +61,12 @@ curl -s http://localhost:2019/fairness/status | jq .
 
 - `backends[]` is sorted by `backend` label. One entry per distinct `fairness` handler block in
   the running config (i.e. one per `backend <label>` value actually in use).
-- `base_scores` keys are the 5 `UserClass` string values; `dimensions` keys are the 6 dimension
-  names (`ip`, `net24`, `net6`, `asn`, `country`, `user`).
+- `base_scores` keys are always the 5 `UserClass` string values, regardless of scoring config.
+  `dimensions` (and `dimension_entry_counts`) keys, by contrast, are **only the dimensions this
+  backend's `scoring { }` block actually enabled** via a `penalty <dimension>` line (see
+  [`configuration.md`](configuration.md) §1.1) — a dimension that was never enabled is simply
+  absent from both maps, not present with a zero-valued entry. A backend with no `scoring { }` block
+  at all (or one with zero `penalty` lines) reports both as empty objects (`{}`).
 - **`dimensions.*` fields serialize using their capitalized Go struct field names** (`Alpha`,
   `SoftThreshold`, `SoftPenalty`, `HardThreshold`, `HardPenalty`), not snake_case — `PenaltyConfig`
   has no `json` struct tags. Everything else in this response is snake_case. This is a genuine

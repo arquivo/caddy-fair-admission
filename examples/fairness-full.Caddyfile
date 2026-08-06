@@ -58,10 +58,11 @@
 			base_score anonymous        60
 			base_score unknown          60
 
-			# One penalty override per dimension (all 6), each restating
-			# this project's own defaults from docs/configuration.md §3 --
-			# a real config would normally only override the dimensions
-			# that actually need different tuning.
+			# Enabling all 6 dimensions (each is opt-in -- see
+			# docs/configuration.md §1.1 -- so a real config would normally
+			# only enable the ones it actually needs), each restating this
+			# project's own defaults from docs/configuration.md §3 for
+			# clarity.
 			penalty ip      alpha=0.2 soft=20:10   hard=100:40
 			penalty net24   alpha=0.2 soft=100:10  hard=500:40
 			penalty net6    alpha=0.2 soft=100:10  hard=500:40

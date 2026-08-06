@@ -15,9 +15,14 @@ import (
 	"time"
 )
 
-// scoringDimensions is the fixed, ordered set of dimensions scoring tracks
-// (§3.2/§4.3). Order doesn't affect correctness (each dimension's map is
-// independent) but keeps tick/gc iteration deterministic for tests/logging.
+// scoringDimensions is the fixed set of dimension names the Caddyfile
+// grammar recognizes (§3.2/§4.3) and defaultPenaltyFor can resolve tuning
+// for. It is NOT the set of dimensions active on any given Handler — that's
+// whichever keys end up in a resolved ScoringConfig.Dimensions, driven
+// entirely by which `penalty <dim>` lines a `scoring { }` block declared
+// (scoringOverrides.EnabledDimensions). A dimension absent from every
+// `penalty` line is never tracked, ticked, or scored, regardless of its
+// presence in this list.
 var scoringDimensions = [...]string{"ip", "net24", "net6", "asn", "country", "user"}
 
 // validScoringDimensions is scoringDimensions as a lookup set, for Caddyfile
@@ -124,6 +129,14 @@ type ScoringConfig struct {
 // another Handler's resolved config, by construction rather than by
 // discipline (the Python source's aliasing footgun, per §4.3).
 //
+// Its BaseScores/MinScore/MaxScore are resolveScoringConfig's actual
+// defaults (base scores and the clamp range apply regardless of which
+// dimensions are enabled). Its Dimensions map, however, is used only as a
+// per-dimension tuning lookup table (see defaultPenaltyFor) for whichever
+// dimensions a `scoring { }` block actually enables via `penalty <dim>` —
+// resolveScoringConfig does NOT seed a resolved config's Dimensions from
+// this map wholesale; every dimension is opt-in (§4.3 design refinement).
+//
 // Defaults chosen (documented per the task's "illustrative only" allowance):
 //   - BaseScores: researcher/service_account/internal get full trust (100);
 //     anonymous gets a lower base (60, matching §5's example); unknown (a
@@ -159,40 +172,80 @@ func newDefaultScoringConfig() ScoringConfig {
 	}
 }
 
-// scoringOverrides holds only the fields a `scoring { }` Caddyfile sub-block
-// actually specified (§4.3/§5's "backend-level overrides deep-merge onto
-// global defaults per dimension"). Nil/zero-value fields mean "not
-// specified, use the default" — resolveScoringConfig overlays these onto
-// newDefaultScoringConfig() rather than replacing it wholesale.
-type scoringOverrides struct {
-	baseScores map[UserClass]float64
-	penalties  map[string]PenaltyConfig
-	minScore   *float64
-	maxScore   *float64
+// defaultPenaltyFor returns dim's built-in default tuning, used when a
+// `penalty <dim>` Caddyfile line enables a dimension without restating
+// alpha=/soft=/hard= explicitly. Returns the zero PenaltyConfig for an
+// unrecognized dim (callers only ever pass a name already validated against
+// validScoringDimensions).
+func defaultPenaltyFor(dim string) PenaltyConfig {
+	return newDefaultScoringConfig().Dimensions[dim]
 }
 
-// resolveScoringConfig starts from a fresh newDefaultScoringConfig() and
-// overlays only what o explicitly specifies. Because PenaltyConfig and the
-// BaseScores values are plain value types, and the base config's maps are
-// freshly allocated per call, overlaying here can never cause one Handler's
-// resolved config to alias another's (§4.3's aliasing-safety requirement).
-// o may be nil (no scoring{} block at all): returns pure defaults.
+// scoringOverrides holds only the fields a `scoring { }` Caddyfile sub-block
+// actually specified. Nil/zero-value fields mean "not specified, use the
+// default" — resolveScoringConfig overlays these onto newDefaultScoringConfig
+// for BaseScores/MinScore/MaxScore, but Dimensions works differently: a
+// dimension only ends up in the resolved config's Dimensions map if it's a
+// key in EnabledDimensions (every dim named by any `penalty <dim>` line,
+// bare or with explicit tuning — §4.3 design refinement, dimensions are
+// opt-in). Penalties holds tuning only for dimensions given explicit
+// alpha=/soft=/hard= args; its keys are always a subset of
+// EnabledDimensions's keys — a bare `penalty <dim>` line adds dim to
+// EnabledDimensions without adding it to Penalties, so resolveScoringConfig
+// falls back to defaultPenaltyFor(dim) for it.
+//
+// Fields are exported (unlike a plain internal-use struct) specifically so
+// encoding/json's Marshal/Unmarshal — which Caddy's real Caddyfile-adapter →
+// JSON → caddy.Load pipeline performs on the containing Handler — doesn't
+// silently drop this data. An unexported field/struct here would parse fine
+// via UnmarshalCaddyfile but vanish before Provision ever saw it in that
+// pipeline, since encoding/json skips unexported fields on both sides.
+type scoringOverrides struct {
+	BaseScores        map[UserClass]float64    `json:"base_scores,omitempty"`
+	EnabledDimensions map[string]bool          `json:"enabled_dimensions,omitempty"`
+	Penalties         map[string]PenaltyConfig `json:"penalties,omitempty"`
+	MinScore          *float64                 `json:"min_score,omitempty"`
+	MaxScore          *float64                 `json:"max_score,omitempty"`
+}
+
+// resolveScoringConfig starts from a fresh newDefaultScoringConfig() for
+// BaseScores/MinScore/MaxScore, but starts Dimensions empty — every
+// dimension is opt-in (§4.3 design refinement). Only dimensions named in
+// o.EnabledDimensions end up in the resolved Dimensions map, using
+// o.Penalties's explicit tuning if given, else defaultPenaltyFor(dim).
+// Because PenaltyConfig and the BaseScores values are plain value types, and
+// the base config's maps are freshly allocated per call, overlaying here can
+// never cause one Handler's resolved config to alias another's (§4.3's
+// aliasing-safety requirement). o may be nil (no scoring{} block at all, or
+// one with zero `penalty` lines): returns pure BaseScores/MinScore/MaxScore
+// defaults with an empty (non-nil) Dimensions — no dimension is ever
+// tracked or penalized in that case.
 func resolveScoringConfig(o *scoringOverrides) ScoringConfig {
-	cfg := newDefaultScoringConfig()
+	defaults := newDefaultScoringConfig()
+	cfg := ScoringConfig{
+		BaseScores: defaults.BaseScores,
+		MinScore:   defaults.MinScore,
+		MaxScore:   defaults.MaxScore,
+		Dimensions: map[string]PenaltyConfig{},
+	}
 	if o == nil {
 		return cfg
 	}
-	for uc, v := range o.baseScores {
+	for uc, v := range o.BaseScores {
 		cfg.BaseScores[uc] = v
 	}
-	for dim, pc := range o.penalties {
-		cfg.Dimensions[dim] = pc
+	for dim := range o.EnabledDimensions {
+		if pc, ok := o.Penalties[dim]; ok {
+			cfg.Dimensions[dim] = pc
+		} else {
+			cfg.Dimensions[dim] = defaultPenaltyFor(dim)
+		}
 	}
-	if o.minScore != nil {
-		cfg.MinScore = *o.minScore
+	if o.MinScore != nil {
+		cfg.MinScore = *o.MinScore
 	}
-	if o.maxScore != nil {
-		cfg.MaxScore = *o.maxScore
+	if o.MaxScore != nil {
+		cfg.MaxScore = *o.MaxScore
 	}
 	return cfg
 }
@@ -300,8 +353,11 @@ type scoringState struct {
 	wg       sync.WaitGroup
 }
 
-// newScoringState builds a fresh scoringState: empty per-dimension maps,
-// resolved cfg, and tick/idle intervals (already defaulted by the caller via
+// newScoringState builds a fresh scoringState: one per-dimension map for
+// each dimension actually enabled in cfg.Dimensions (§4.3 — dimensions are
+// opt-in, so a cfg with an empty Dimensions map yields an empty dims map:
+// nothing is ever tracked, ticked, or GC'd), resolved cfg, and tick/idle
+// intervals (already defaulted by the caller via
 // Config.ewmaTickInterval()/idleEntryTTL()). It does not start the
 // background goroutines — call start() separately once fully constructed.
 func newScoringState(cfg ScoringConfig, tickInterval, idleTTL time.Duration) *scoringState {
@@ -311,9 +367,9 @@ func newScoringState(cfg ScoringConfig, tickInterval, idleTTL time.Duration) *sc
 	if idleTTL <= 0 {
 		idleTTL = defaultIdleEntryTTL
 	}
-	dims := make(map[string]*dimensionMap, len(scoringDimensions))
-	for _, d := range scoringDimensions {
-		dims[d] = &dimensionMap{entries: make(map[string]*ClientStats)}
+	dims := make(map[string]*dimensionMap, len(cfg.Dimensions))
+	for dim := range cfg.Dimensions {
+		dims[dim] = &dimensionMap{entries: make(map[string]*ClientStats)}
 	}
 	return &scoringState{
 		cfg:          cfg,
@@ -376,15 +432,17 @@ func (s *scoringState) stop() {
 	s.wg.Wait()
 }
 
-// track records one request against every applicable dimension derived from
+// track records one request against every enabled dimension applicable to
 // c: get-or-create that dimension's entry, set LastSeen=now, increment its
-// pending-tick counter. Nil-safe (no-op on a nil *scoringState) so
-// ServeHTTP can call it unconditionally even if Provision was never run.
+// pending-tick counter. Only dimensions present in s.cfg.Dimensions (i.e.
+// explicitly enabled via `penalty <dim>`) are considered — §4.3, dimensions
+// are opt-in. Nil-safe (no-op on a nil *scoringState) so ServeHTTP can call
+// it unconditionally even if Provision was never run.
 func (s *scoringState) track(c Classification, now time.Time) {
 	if s == nil {
 		return
 	}
-	for _, dim := range scoringDimensions {
+	for dim := range s.cfg.Dimensions {
 		key, ok := dimensionKey(dim, c)
 		if !ok {
 			continue
@@ -402,45 +460,45 @@ func (s *scoringState) track(c Classification, now time.Time) {
 	}
 }
 
-// tick runs one EWMA update pass over every dimension's every tracked
-// entity (§4.3):
+// tick runs one EWMA update pass over every enabled dimension's every
+// tracked entity (§4.3):
 //
 //	requests_in_last_tick := swap-and-reset the entity's pending counter
 //	rate := float64(requests_in_last_tick) / tickInterval.Seconds()
 //	entity.EWMARPS = alpha*rate + (1-alpha)*entity.EWMARPS
 //
-// alpha is that dimension's configured PenaltyConfig.Alpha, not global.
-// Exported as a method taking "now" implicitly unused (the tick doesn't need
-// wall-clock time, only the elapsed-tick-interval assumption) so it can be
-// invoked directly by tests without waiting on the real ticker.
+// alpha is that dimension's configured PenaltyConfig.Alpha, not global. A
+// dimension absent from s.cfg.Dimensions (never enabled) has no entry in
+// s.dims and is simply not iterated. Exported as a method taking "now"
+// implicitly unused (the tick doesn't need wall-clock time, only the
+// elapsed-tick-interval assumption) so it can be invoked directly by tests
+// without waiting on the real ticker.
 func (s *scoringState) tick(_ time.Time) {
 	if s == nil {
 		return
 	}
 	seconds := s.tickInterval.Seconds()
-	for _, dim := range scoringDimensions {
-		alpha := s.cfg.Dimensions[dim].Alpha
+	for dim, pc := range s.cfg.Dimensions {
 		dm := s.dims[dim]
 		dm.mu.Lock()
 		for _, entry := range dm.entries {
 			count := entry.pending
 			entry.pending = 0
 			rate := float64(count) / seconds
-			entry.EWMARPS = alpha*rate + (1-alpha)*entry.EWMARPS
+			entry.EWMARPS = pc.Alpha*rate + (1-pc.Alpha)*entry.EWMARPS
 		}
 		dm.mu.Unlock()
 	}
 }
 
-// gc sweeps every dimension's map and deletes entries idle longer than
-// idleTTL as of now (§3.2). A plain method taking "now" explicitly so tests
-// can drive it with a controlled clock instead of sleeping for real.
+// gc sweeps every enabled dimension's map and deletes entries idle longer
+// than idleTTL as of now (§3.2). A plain method taking "now" explicitly so
+// tests can drive it with a controlled clock instead of sleeping for real.
 func (s *scoringState) gc(now time.Time) {
 	if s == nil {
 		return
 	}
-	for _, dim := range scoringDimensions {
-		dm := s.dims[dim]
+	for _, dm := range s.dims {
 		dm.mu.Lock()
 		for key, entry := range dm.entries {
 			if now.Sub(entry.LastSeen) > s.idleTTL {
@@ -477,26 +535,23 @@ func (s *scoringState) entryEWMARPS(dim, key string) float64 {
 // marshaled to JSON immediately, never mutated).
 func (s *scoringState) resolvedConfig() ScoringConfig {
 	if s == nil {
-		return newDefaultScoringConfig()
+		return resolveScoringConfig(nil)
 	}
 	return s.cfg
 }
 
-// entryCounts returns the number of tracked entities per dimension, for
-// admin introspection (admin.go, §4.10) — a size, not the per-entity
-// EWMARPS values themselves (see entryEWMARPS for that finer-grained read).
-// Safe to call on a nil *scoringState (returns zero counts for every
-// dimension).
+// entryCounts returns the number of tracked entities per enabled dimension,
+// for admin introspection (admin.go, §4.10) — a size, not the per-entity
+// EWMARPS values themselves (see entryEWMARPS for that finer-grained read). A
+// dimension that was never enabled is simply absent from the returned map,
+// not present with a zero count. Safe to call on a nil *scoringState (returns
+// an empty map).
 func (s *scoringState) entryCounts() map[string]int {
-	counts := make(map[string]int, len(scoringDimensions))
-	for _, dim := range scoringDimensions {
-		counts[dim] = 0
-	}
 	if s == nil {
-		return counts
+		return map[string]int{}
 	}
-	for _, dim := range scoringDimensions {
-		dm := s.dims[dim]
+	counts := make(map[string]int, len(s.dims))
+	for dim, dm := range s.dims {
 		dm.mu.Lock()
 		counts[dim] = len(dm.entries)
 		dm.mu.Unlock()
@@ -542,17 +597,13 @@ func (s *scoringState) computeScoreBreakdown(c Classification, exemptCountries m
 	var totalPenalty float64
 	breakdown := map[string]float64{"base": base}
 
-	for _, dim := range scoringDimensions {
+	for dim, pc := range s.cfg.Dimensions {
 		key, ok := dimensionKey(dim, c)
 		if !ok {
 			continue
 		}
 		if dim == "country" && exemptCountries[c.Country] {
 			// Exempt: still tracked (observability) but never penalized.
-			continue
-		}
-		pc, ok := s.cfg.Dimensions[dim]
-		if !ok {
 			continue
 		}
 		rps := s.entryEWMARPS(dim, key)

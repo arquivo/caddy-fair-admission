@@ -111,45 +111,41 @@ func TestPenaltyContribution_Boundaries(t *testing.T) {
 
 func TestResolveScoringConfig_OverrideOnlyAffectsItsOwnDimension(t *testing.T) {
 	overridden := &scoringOverrides{
-		penalties: map[string]PenaltyConfig{
+		EnabledDimensions: map[string]bool{"ip": true},
+		Penalties: map[string]PenaltyConfig{
 			"ip": {Alpha: 0.9, SoftThreshold: 1, SoftPenalty: 2, HardThreshold: 3, HardPenalty: 4},
 		},
 	}
 
 	resolvedA := resolveScoringConfig(overridden)
-	resolvedB := resolveScoringConfig(nil) // separately-resolved, pure defaults
+	resolvedB := resolveScoringConfig(nil) // separately-resolved, no dimensions enabled
 
-	if resolvedA.Dimensions["ip"] == resolvedB.Dimensions["ip"] {
-		t.Fatalf("expected block A's overridden ip dimension to differ from block B's default")
+	if resolvedA.Dimensions["ip"] == newDefaultScoringConfig().Dimensions["ip"] {
+		t.Fatalf("expected block A's overridden ip dimension to differ from the hardcoded default")
 	}
 
-	// Every other dimension on the overriding block must still equal the
-	// hardcoded defaults.
-	defaults := newDefaultScoringConfig()
+	// No other dimension was enabled on this block, so none of them should
+	// even be present in the resolved config.
 	for _, dim := range []string{"net24", "net6", "asn", "country", "user"} {
-		if resolvedA.Dimensions[dim] != defaults.Dimensions[dim] {
-			t.Errorf("dimension %q on overriding block = %+v, want default %+v", dim, resolvedA.Dimensions[dim], defaults.Dimensions[dim])
-		}
-		if resolvedB.Dimensions[dim] != defaults.Dimensions[dim] {
-			t.Errorf("dimension %q on non-overriding block = %+v, want default %+v", dim, resolvedB.Dimensions[dim], defaults.Dimensions[dim])
+		if _, ok := resolvedA.Dimensions[dim]; ok {
+			t.Errorf("dimension %q on overriding block is present (%+v), want absent (never enabled)", dim, resolvedA.Dimensions[dim])
 		}
 	}
-	// And block B's ip dimension (untouched) must equal the hardcoded default.
-	if resolvedB.Dimensions["ip"] != defaults.Dimensions["ip"] {
-		t.Errorf("block B's ip dimension = %+v, want default %+v", resolvedB.Dimensions["ip"], defaults.Dimensions["ip"])
+	// Block B enabled nothing at all: Dimensions must be empty.
+	if len(resolvedB.Dimensions) != 0 {
+		t.Errorf("block B (nil overrides) Dimensions = %+v, want empty", resolvedB.Dimensions)
 	}
 }
 
 func TestResolveScoringConfig_MutationIsolation(t *testing.T) {
 	overridden := &scoringOverrides{
-		penalties: map[string]PenaltyConfig{
+		EnabledDimensions: map[string]bool{"ip": true},
+		Penalties: map[string]PenaltyConfig{
 			"ip": {Alpha: 0.9, SoftThreshold: 1, SoftPenalty: 2, HardThreshold: 3, HardPenalty: 4},
 		},
 	}
 	resolvedA := resolveScoringConfig(overridden)
 	resolvedB := resolveScoringConfig(nil)
-
-	before := resolvedB.Dimensions["ip"]
 
 	// Mutate A's map in place; B must be entirely unaffected (no shared
 	// underlying map storage).
@@ -158,8 +154,8 @@ func TestResolveScoringConfig_MutationIsolation(t *testing.T) {
 	resolvedA.Dimensions["ip"] = mutated
 	resolvedA.BaseScores[UserClassAnonymous] = -999
 
-	if resolvedB.Dimensions["ip"] != before {
-		t.Errorf("mutating resolvedA leaked into resolvedB: got %+v, want unchanged %+v", resolvedB.Dimensions["ip"], before)
+	if _, ok := resolvedB.Dimensions["ip"]; ok {
+		t.Errorf("mutating resolvedA leaked an \"ip\" entry into resolvedB (which enabled nothing): %+v", resolvedB.Dimensions["ip"])
 	}
 	if resolvedB.BaseScores[UserClassAnonymous] == -999 {
 		t.Errorf("mutating resolvedA.BaseScores leaked into resolvedB.BaseScores")
@@ -168,7 +164,7 @@ func TestResolveScoringConfig_MutationIsolation(t *testing.T) {
 
 func TestResolveScoringConfig_BaseScoreOverride(t *testing.T) {
 	overridden := &scoringOverrides{
-		baseScores: map[UserClass]float64{UserClassAnonymous: 42},
+		BaseScores: map[UserClass]float64{UserClassAnonymous: 42},
 	}
 	resolved := resolveScoringConfig(overridden)
 	if resolved.BaseScores[UserClassAnonymous] != 42 {
@@ -179,14 +175,84 @@ func TestResolveScoringConfig_BaseScoreOverride(t *testing.T) {
 	if resolved.BaseScores[UserClassResearcher] != defaults.BaseScores[UserClassResearcher] {
 		t.Errorf("BaseScores[researcher] = %v, want default %v", resolved.BaseScores[UserClassResearcher], defaults.BaseScores[UserClassResearcher])
 	}
+	// base_score is independent of dimension enablement: no penalty line was
+	// given, so no dimension should be active.
+	if len(resolved.Dimensions) != 0 {
+		t.Errorf("Dimensions = %+v, want empty (no penalty lines given)", resolved.Dimensions)
+	}
 }
 
 func TestResolveScoringConfig_MinMaxOverride(t *testing.T) {
 	minV, maxV := 5.0, 90.0
-	overridden := &scoringOverrides{minScore: &minV, maxScore: &maxV}
+	overridden := &scoringOverrides{MinScore: &minV, MaxScore: &maxV}
 	resolved := resolveScoringConfig(overridden)
 	if resolved.MinScore != 5 || resolved.MaxScore != 90 {
 		t.Errorf("MinScore/MaxScore = %v/%v, want 5/90", resolved.MinScore, resolved.MaxScore)
+	}
+	if len(resolved.Dimensions) != 0 {
+		t.Errorf("Dimensions = %+v, want empty (no penalty lines given)", resolved.Dimensions)
+	}
+}
+
+func TestResolveScoringConfig_BarePenaltyUsesDefaultTuning(t *testing.T) {
+	overridden := &scoringOverrides{EnabledDimensions: map[string]bool{"asn": true}}
+	resolved := resolveScoringConfig(overridden)
+	defaults := newDefaultScoringConfig()
+	if resolved.Dimensions["asn"] != defaults.Dimensions["asn"] {
+		t.Errorf("Dimensions[asn] = %+v, want built-in default %+v", resolved.Dimensions["asn"], defaults.Dimensions["asn"])
+	}
+	if len(resolved.Dimensions) != 1 {
+		t.Errorf("Dimensions = %+v, want exactly {asn: ...}", resolved.Dimensions)
+	}
+}
+
+func TestResolveScoringConfig_NoScoringBlockEnablesNoDimensions(t *testing.T) {
+	resolved := resolveScoringConfig(nil)
+	if len(resolved.Dimensions) != 0 {
+		t.Errorf("Dimensions = %+v, want empty (no scoring{} block at all)", resolved.Dimensions)
+	}
+}
+
+func TestComputeScoreBreakdown_NoDimensionsEnabled_AlwaysBaseScoreZeroPenalty(t *testing.T) {
+	cfg := resolveScoringConfig(nil)
+	s := newScoringState(cfg, time.Second, time.Hour)
+
+	c := Classification{UserClass: UserClassAnonymous, IP: "203.0.113.9", ASN: 64500, Country: "US", UserID: "u1"}
+	now := time.Unix(1_700_000_000, 0)
+
+	// Even after tracking/ticking heavily, no dimension exists to accumulate
+	// a penalty against.
+	for i := 0; i < 1000; i++ {
+		s.track(c, now)
+	}
+	s.tick(now.Add(time.Second))
+
+	score, breakdown := s.computeScoreBreakdown(c, nil)
+	base := cfg.BaseScores[UserClassAnonymous]
+	if score != base {
+		t.Errorf("score = %v, want unpenalized base score %v", score, base)
+	}
+	if breakdown["total_penalty"] != 0 {
+		t.Errorf("total_penalty = %v, want 0", breakdown["total_penalty"])
+	}
+}
+
+func TestScoringState_NoDimensionsEnabled_TrackTickGCAreNoops(t *testing.T) {
+	cfg := resolveScoringConfig(nil)
+	s := newScoringState(cfg, time.Second, time.Hour)
+
+	if len(s.dims) != 0 {
+		t.Fatalf("newScoringState with no enabled dimensions built s.dims = %+v, want empty", s.dims)
+	}
+
+	c := Classification{IP: "203.0.113.9"}
+	now := time.Unix(1_700_000_000, 0)
+	s.track(c, now)
+	s.tick(now.Add(time.Second))
+	s.gc(now.Add(time.Hour))
+
+	if counts := s.entryCounts(); len(counts) != 0 {
+		t.Errorf("entryCounts = %+v, want empty", counts)
 	}
 }
 
@@ -443,11 +509,11 @@ func TestUnmarshalCaddyfile_ScoringBlock_RoundTrips(t *testing.T) {
 		t.Fatalf("UnmarshalCaddyfile: %v", err)
 	}
 
-	if h.scoringOverrides == nil {
+	if h.ScoringOverrides == nil {
 		t.Fatal("scoringOverrides is nil, want populated")
 	}
 
-	resolved := resolveScoringConfig(h.scoringOverrides)
+	resolved := resolveScoringConfig(h.ScoringOverrides)
 	if resolved.BaseScores[UserClassResearcher] != 100 {
 		t.Errorf("BaseScores[researcher] = %v, want 100", resolved.BaseScores[UserClassResearcher])
 	}
@@ -465,13 +531,71 @@ func TestUnmarshalCaddyfile_ScoringBlock_RoundTrips(t *testing.T) {
 	if resolved.MinScore != 0 || resolved.MaxScore != 100 {
 		t.Errorf("MinScore/MaxScore = %v/%v, want 0/100", resolved.MinScore, resolved.MaxScore)
 	}
-	// Dimensions not mentioned at all still get hardcoded defaults.
-	defaults := newDefaultScoringConfig()
+	// Dimensions not mentioned at all are never enabled -- opt-in, not
+	// defaulted.
 	for _, dim := range []string{"net6", "asn", "country", "user"} {
-		if resolved.Dimensions[dim] != defaults.Dimensions[dim] {
-			t.Errorf("Dimensions[%s] = %+v, want default %+v", dim, resolved.Dimensions[dim], defaults.Dimensions[dim])
+		if _, ok := resolved.Dimensions[dim]; ok {
+			t.Errorf("Dimensions[%s] = %+v, want absent (never enabled by a penalty line)", dim, resolved.Dimensions[dim])
 		}
 	}
+}
+
+func TestUnmarshalCaddyfile_Penalty_Bare_EnablesDefaultTuning(t *testing.T) {
+	input := `fairness {
+		scoring {
+			penalty country
+		}
+	}`
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+		t.Fatalf("UnmarshalCaddyfile: %v", err)
+	}
+	resolved := resolveScoringConfig(h.ScoringOverrides)
+	defaults := newDefaultScoringConfig()
+	if resolved.Dimensions["country"] != defaults.Dimensions["country"] {
+		t.Errorf("Dimensions[country] = %+v, want built-in default %+v", resolved.Dimensions["country"], defaults.Dimensions["country"])
+	}
+	if len(resolved.Dimensions) != 1 {
+		t.Errorf("Dimensions = %+v, want exactly {country: ...}", resolved.Dimensions)
+	}
+}
+
+func TestUnmarshalCaddyfile_Penalty_RepeatedLine_LastWins(t *testing.T) {
+	t.Run("explicit then bare resets to default", func(t *testing.T) {
+		input := `fairness {
+			scoring {
+				penalty ip alpha=0.9 soft=1:2 hard=3:4
+				penalty ip
+			}
+		}`
+		var h Handler
+		if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+			t.Fatalf("UnmarshalCaddyfile: %v", err)
+		}
+		resolved := resolveScoringConfig(h.ScoringOverrides)
+		defaults := newDefaultScoringConfig()
+		if resolved.Dimensions["ip"] != defaults.Dimensions["ip"] {
+			t.Errorf("Dimensions[ip] = %+v, want built-in default %+v (later bare line should reset the earlier override)", resolved.Dimensions["ip"], defaults.Dimensions["ip"])
+		}
+	})
+
+	t.Run("bare then explicit applies override", func(t *testing.T) {
+		input := `fairness {
+			scoring {
+				penalty ip
+				penalty ip alpha=0.9 soft=1:2 hard=3:4
+			}
+		}`
+		var h Handler
+		if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+			t.Fatalf("UnmarshalCaddyfile: %v", err)
+		}
+		resolved := resolveScoringConfig(h.ScoringOverrides)
+		want := PenaltyConfig{Alpha: 0.9, SoftThreshold: 1, SoftPenalty: 2, HardThreshold: 3, HardPenalty: 4}
+		if resolved.Dimensions["ip"] != want {
+			t.Errorf("Dimensions[ip] = %+v, want %+v (later explicit line should override the earlier bare enable)", resolved.Dimensions["ip"], want)
+		}
+	})
 }
 
 func TestUnmarshalCaddyfile_Penalty_ArgOrderIndependent(t *testing.T) {
@@ -494,8 +618,8 @@ func TestUnmarshalCaddyfile_Penalty_ArgOrderIndependent(t *testing.T) {
 		t.Fatalf("shuffled UnmarshalCaddyfile: %v", err)
 	}
 
-	r1 := resolveScoringConfig(h1.scoringOverrides)
-	r2 := resolveScoringConfig(h2.scoringOverrides)
+	r1 := resolveScoringConfig(h1.ScoringOverrides)
+	r2 := resolveScoringConfig(h2.ScoringOverrides)
 	if r1.Dimensions["ip"] != r2.Dimensions["ip"] {
 		t.Errorf("arg order changed the resolved PenaltyConfig: in-order=%+v shuffled=%+v", r1.Dimensions["ip"], r2.Dimensions["ip"])
 	}
