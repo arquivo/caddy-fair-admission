@@ -27,41 +27,62 @@ across blocks with Caddy's native `import`/named-snippet mechanism. See
 | `ipv6_prefix_length <int>` | 1 | `56` | **Must be exactly `48` or `56`** — any other value is a Caddyfile parse error. |
 | `ewma_tick_interval <duration>` | 1 | `1s` | How often the EWMA updater re-evaluates every tracked entity's rate (see §2). |
 | `idle_entry_ttl <duration>` | 1 | `10m` | Entities with no traffic for longer than this are garbage-collected. Swept by a fixed, non-configurable 1-minute ticker; reclaimed strictly when idle time is `>` the TTL, not `>=`. |
-| `scoring { ... }` | sub-block | absent → pure defaults | See §1.1. |
+| `scoring { ... }` | sub-block | absent, or with no `penalty` lines → no dimensions active | See §1.1. |
 
 Any unrecognized top-level token is a Caddyfile parse error
 (`unrecognized fairness subdirective '%s'`).
 
 ### 1.1 `scoring { }` sub-block
 
+A scoring dimension (§3) is tracked and penalized **only if** a `penalty <dimension>` line names it
+here. There is no baseline set of always-active dimensions: a block with no `scoring { }` at all, or
+one with zero `penalty` lines, gives every request its class's flat `base_score` with
+`total_penalty` always `0`.
+
 ```caddyfile
 scoring {
     base_score <user_class> <float>                          # repeatable, one of 5 classes
-    penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f>   # repeatable, one of 6 dimensions
+    penalty <dimension>                                       # repeatable, one of 6 dimensions — enables it with built-in default tuning
+    penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f>   # repeatable — enables it with explicit tuning instead
     min_score <float>
     max_score <float>
 }
 ```
 
 - `base_score <class> <value>` — sets the starting score for one of the 5 user classes (§4). Both
-  args required; the class name must be one of the 5 valid classes.
-- `penalty <dimension> alpha=.. soft=t:p hard=t:p` — overrides one dimension's EWMA/penalty
-  tuning (§2/§3). `alpha=`, `soft=`, and `hard=` are all required together, in any order.
-  `soft=`/`hard=` are `threshold:penalty` pairs; the penalty's sign is cosmetic (magnitude is
-  normalized internally), so `soft=20:-10` and `soft=20:10` are equivalent.
+  args required; the class name must be one of the 5 valid classes. Independent of which dimensions
+  are enabled — applies even with zero `penalty` lines.
+- `penalty <dimension>` — enables that dimension using its built-in default tuning (§3's table)
+  without needing to restate the numbers.
+- `penalty <dimension> alpha=.. soft=t:p hard=t:p` — enables that dimension with explicit EWMA/
+  penalty tuning (§2/§3) instead of the defaults. `alpha=`, `soft=`, and `hard=` are all required
+  together, in any order. `soft=`/`hard=` are `threshold:penalty` pairs; the penalty's sign is
+  cosmetic (magnitude is normalized internally), so `soft=20:-10` and `soft=20:10` are equivalent.
+- A repeated `penalty <dimension>` line for the same dimension within one block fully overwrites the
+  earlier one — including switching between bare and explicit-tuning form. Last line wins.
 - `min_score <float>` / `max_score <float>` — clamp bounds for the final score (default `0`/`100`).
   Only explicitly-set values override the defaults; unset stays at the default rather than being
-  treated as `0`.
-- Overrides are per-field: a `penalty asn ...` line changes only the `asn` dimension, leaving the
-  other five at their defaults, and a `base_score researcher 100` line doesn't reset the other four
-  classes. There is no cross-field validation — nothing stops you from setting `min_score` above
-  `max_score` or a `soft` threshold above `hard`; both are accepted as-is.
+  treated as `0`. Independent of which dimensions are enabled.
+- Enabling `asn` requires a working `geoip_asn_db`, `country` requires a working `geoip_city_db`,
+  and `user` requires a working `auth_jwks_url` — **Provision fails at config-load time**, not just
+  silently degrading to 0-penalty, if:
+  - the dimension is enabled but the prerequisite field isn't set at all on this block, or
+  - the prerequisite field is set but the resource itself fails to open/initialize (missing GeoIP
+    file, corrupt `.mmdb`, unreachable/malformed JWKS URL) — catching a typo'd path/URL that would
+    otherwise fail open silently and go unnoticed by the operator.
+
+  `ip`/`net24`/`net6` have no such prerequisite — they derive purely from the parsed client IP.
+- There is no cross-field validation beyond the above — nothing stops you from setting `min_score`
+  above `max_score` or a `soft` threshold above `hard`; both are accepted as-is.
+
 
 ## 2. What EWMA is, and why
 
-Each of the 6 scoring dimensions (§3) tracks how fast traffic from a given entity (one IP, one
-`/24`, one ASN, ...) is arriving, so it can apply a penalty once that rate is sustained rather than
-a one-off burst. The mechanism is an **exponentially weighted moving average (EWMA)** of requests
+Each of the up to 6 scoring dimensions (§3) that a `scoring { }` block enables via `penalty
+<dimension>` tracks how fast traffic from a given entity (one IP, one `/24`, one ASN, ...) is
+arriving, so it can apply a penalty once that rate is sustained rather than a one-off burst. A
+dimension never named by a `penalty` line is not tracked at all. The mechanism is an
+**exponentially weighted moving average (EWMA)** of requests
 per second, not a rolling window / sliding count — this is a deliberate departure from a naive
 "count requests in the last N seconds" approach, because a fixed window either forgets a sustained
 abuser the instant they pause for N seconds, or requires storing individual request timestamps
@@ -74,7 +95,7 @@ ewma  = alpha * rate + (1 - alpha) * ewma_previous
 ```
 
 - **`ewma_tick_interval`** (this system's version of a "window" — default `1s`) is how often this
-  update runs, for every tracked entity, across all 6 dimensions. It also sets the denominator
+  update runs, for every tracked entity, across every enabled dimension. It also sets the denominator
   for `rate`: a 2-second tick that saw 10 requests computes `rate = 5`, not `10` — the EWMA always
   operates on a normalized per-second rate regardless of tick length.
 - **`alpha`** (per-dimension, default `0.2`) controls how much weight the *most recent* tick gets
@@ -101,8 +122,10 @@ user's browsing burst vs. a sustained crawler).
 
 ## 3. Soft vs. hard penalties
 
-Each of the 6 dimensions has its own `PenaltyConfig{alpha, soft_threshold, soft_penalty,
-hard_threshold, hard_penalty}`. Given a dimension's current EWMA rate:
+Each of the 6 recognized dimensions has its own `PenaltyConfig{alpha, soft_threshold, soft_penalty,
+hard_threshold, hard_penalty}`, used when that dimension is enabled via `penalty <dimension>` (§1.1)
+— a dimension never named by a `penalty` line contributes nothing at all, not even a `0` entry.
+Given an enabled dimension's current EWMA rate:
 
 ```
 rps > hard_threshold  → hard_penalty
@@ -114,13 +137,16 @@ Boundaries are **strictly exclusive** (`>`, not `>=`): a rate exactly equal to t
 contributes no penalty yet; a rate exactly equal to the hard threshold still only gets the soft
 penalty. Soft and hard are **not additive within a dimension** — only the single highest-qualifying
 tier applies. Across dimensions, though, contributions **do** sum: a request classified into a
-penalized `ip` *and* a penalized `asn` pays both. The final score is:
+penalized `ip` *and* a penalized `asn` pays both, if both are enabled. The final score is:
 
 ```
-final = clamp(base_score[user_class] - sum_of_all_6_dimension_penalties, min_score, max_score)
+final = clamp(base_score[user_class] - sum_of_enabled_dimension_penalties, min_score, max_score)
 ```
 
 ### Default per-dimension tuning
+
+Applied to a dimension when it's enabled via a bare `penalty <dimension>` line (§1.1) with no
+explicit `alpha=`/`soft=`/`hard=` given:
 
 | Dimension | Tracks | Applies to | alpha | soft (threshold:penalty) | hard (threshold:penalty) |
 |---|---|---|---|---|---|
@@ -159,11 +185,13 @@ condition), so it isn't trusted *less* than presenting no token at all.
 ## 5. Exempt countries
 
 `exempt_country <CC>` (repeatable, exact ISO 3166-1 alpha-2 match, no wildcards/case-folding) marks
-a country whose `country`-dimension penalty never contributes to `total_penalty`. The dimension is
-still tracked and counted for observability (visible via `/fairness/status`'s
-`dimension_entry_counts`, see [`monitoring.md`](monitoring.md)) — exemption only suppresses its
-penalty contribution, and has no effect on the other 5 dimensions (`ip`/`net24`/`net6`/`asn`/`user`
-are evaluated independently regardless of country).
+a country whose `country`-dimension penalty never contributes to `total_penalty`. This only has an
+observable effect if `country` is actually enabled via `penalty country` (§1.1) — otherwise there's
+no `country` penalty to exempt from in the first place. When enabled, the dimension is still tracked
+and counted for observability (visible via `/fairness/status`'s `dimension_entry_counts`, see
+[`monitoring.md`](monitoring.md)) even for exempt countries — exemption only suppresses its penalty
+contribution, and has no effect on the other dimensions (`ip`/`net24`/`net6`/`asn`/`user` are
+evaluated independently regardless of country).
 
 ## 6. `adaptive_admission` block
 

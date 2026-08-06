@@ -52,7 +52,9 @@
 		# Override just the ip dimension's soft/hard penalty amounts (the
 		# thresholds 20/100 are left at their defaults here; only the
 		# penalty magnitudes are restated -- the leading "-" is cosmetic,
-		# see docs/configuration.md §1.1).
+		# see docs/configuration.md §1.1). Dimensions are opt-in, so this
+		# is also the only dimension scored at all on this backend --
+		# net24/net6/asn/country/user are never tracked here.
 		penalty ip alpha=0.2 soft=20:-10 hard=100:-40
 	}
 }

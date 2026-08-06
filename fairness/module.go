@@ -72,10 +72,14 @@ type Handler struct {
 	geo  *geoLookup
 	auth *verifier
 
-	// scoringOverrides holds only the fields a `scoring { }` sub-block
+	// ScoringOverrides holds only the fields a `scoring { }` sub-block
 	// explicitly specified (nil if the block was absent entirely); resolved
 	// onto defaults in Provision via resolveScoringConfig (scoring.go).
-	scoringOverrides *scoringOverrides
+	// Exported and JSON-tagged (see scoringOverrides's doc comment) so it
+	// survives Caddy's real Caddyfile-adapter → JSON → caddy.Load round-trip
+	// — an unexported field here would parse fine via UnmarshalCaddyfile but
+	// silently vanish before Provision ever ran in that real pipeline.
+	ScoringOverrides *scoringOverrides `json:"scoring_overrides,omitempty"`
 	// scoring is this instance's isolated EWMA scoring state (§3.2/§7 Q6),
 	// constructed fresh in Provision and torn down in Cleanup.
 	scoring *scoringState
@@ -93,8 +97,15 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // acquires (via its UsagePools) the GeoIP readers and JWKS verifier this
 // block's config asks for. An empty path/URL for any of these means that
 // resource simply isn't configured on this block — no pool interaction, no
-// error. It also registers this instance with the App (app.go) so the admin
-// introspection API (admin.go, §4.10) can report its live state.
+// error. It then resolves this block's `scoring { }` overrides and, for any
+// dimension whose scoring depends on one of those resources (asn/country on
+// GeoIP, user on JWKS), verifies the resource actually opened/initialized —
+// not merely that a path/URL was given — hard-erroring at load time
+// otherwise (a typo'd or broken GeoIP DB path/JWKS URL must never silently
+// degrade to a permanently-0-penalty dimension, see REQUIREMENTS.md §4.3
+// design refinement). It also registers this instance with the App
+// (app.go) so the admin introspection API (admin.go, §4.10) can report its
+// live state.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	appIface, err := ctx.App("fairness")
 	if err != nil {
@@ -135,13 +146,64 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// Handler instance (§7 Q6) — never carried over across a config reload
 	// (§3.3): every Provision call gets brand-new maps and a brand-new pair
 	// of background goroutines.
-	resolved := resolveScoringConfig(h.scoringOverrides)
+	resolved := resolveScoringConfig(h.ScoringOverrides)
+
+	if _, ok := resolved.Dimensions["asn"]; ok {
+		if h.geo.asn == nil || h.geo.asn.reader == nil {
+			h.releaseAcquired()
+			if h.GeoIPASNDB == "" {
+				return fmt.Errorf("fairness: scoring dimension %q is enabled but geoip_asn_db is not configured on this block", "asn")
+			}
+			return fmt.Errorf("fairness: scoring dimension %q is enabled but geoip_asn_db %q failed to open — check the file exists and is a valid MaxMind ASN database", "asn", h.GeoIPASNDB)
+		}
+	}
+	if _, ok := resolved.Dimensions["country"]; ok {
+		if h.geo.city == nil || h.geo.city.reader == nil {
+			h.releaseAcquired()
+			if h.GeoIPCityDB == "" {
+				return fmt.Errorf("fairness: scoring dimension %q is enabled but geoip_city_db is not configured on this block", "country")
+			}
+			return fmt.Errorf("fairness: scoring dimension %q is enabled but geoip_city_db %q failed to open — check the file exists and is a valid MaxMind City/Country database", "country", h.GeoIPCityDB)
+		}
+	}
+	if _, ok := resolved.Dimensions["user"]; ok {
+		if h.auth == nil || h.auth.kf == nil {
+			h.releaseAcquired()
+			if h.AuthJWKSURL == "" {
+				return fmt.Errorf("fairness: scoring dimension %q is enabled but auth_jwks_url is not configured on this block", "user")
+			}
+			return fmt.Errorf("fairness: scoring dimension %q is enabled but auth_jwks_url %q failed to initialize — check the URL is reachable and serves a well-formed JWKS", "user", h.AuthJWKSURL)
+		}
+	}
+
 	h.scoring = newScoringState(resolved, h.Config.ewmaTickInterval(), h.Config.idleEntryTTL())
 	h.scoring.start()
 
 	app.registerHandler(h.Config.backendLabel(), h)
 
 	return nil
+}
+
+// releaseAcquired releases this handler's references to any shared GeoIP
+// readers / JWKS verifier it acquired earlier in Provision, without
+// unregistering it or stopping its scoring state. Shared by Cleanup (the
+// normal teardown path) and by Provision's own validation-failure paths —
+// Caddy does not call Cleanup on a module whose Provision returned an error,
+// so those paths must release acquired pool references themselves or they'd
+// leak.
+func (h *Handler) releaseAcquired() {
+	if h.app == nil {
+		return
+	}
+	if h.GeoIPCityDB != "" {
+		h.app.releaseGeoReader(h.GeoIPCityDB)
+	}
+	if h.GeoIPASNDB != "" {
+		h.app.releaseGeoReader(h.GeoIPASNDB)
+	}
+	if h.AuthJWKSURL != "" {
+		h.app.releaseVerifier(h.AuthJWKSURL)
+	}
 }
 
 // Cleanup implements caddy.CleanerUpper: it releases this handler's
@@ -159,15 +221,7 @@ func (h *Handler) Cleanup() error {
 		return nil
 	}
 	h.app.unregisterHandler(h.Config.backendLabel(), h)
-	if h.GeoIPCityDB != "" {
-		h.app.releaseGeoReader(h.GeoIPCityDB)
-	}
-	if h.GeoIPASNDB != "" {
-		h.app.releaseGeoReader(h.GeoIPASNDB)
-	}
-	if h.AuthJWKSURL != "" {
-		h.app.releaseVerifier(h.AuthJWKSURL)
-	}
+	h.releaseAcquired()
 	return nil
 }
 
@@ -288,7 +342,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if err != nil {
 					return err
 				}
-				h.scoringOverrides = overrides
+				h.ScoringOverrides = overrides
 
 			default:
 				return d.Errf("unrecognized fairness subdirective '%s'", d.Val())
@@ -306,11 +360,14 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 
 // parseScoringBlock parses a `scoring { }` sub-block's tokens (§4.3/§5) into
 // a *scoringOverrides, later overlaid onto newDefaultScoringConfig() by
-// resolveScoringConfig (scoring.go). Grammar:
+// resolveScoringConfig (scoring.go). A dimension is tracked/scored only if
+// named by a `penalty <dimension>` line — there is no "all dimensions active
+// by default" state. Grammar:
 //
 //	scoring {
-//	    base_score <user_class> <float>          # repeatable
-//	    penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f>  # repeatable
+//	    base_score <user_class> <float>                          # repeatable
+//	    penalty <dimension>                                      # repeatable — enables <dimension> with its built-in default tuning
+//	    penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f>   # repeatable — enables <dimension> with explicit tuning
 //	    min_score <float>
 //	    max_score <float>
 //	}
@@ -332,10 +389,10 @@ func parseScoringBlock(d *caddyfile.Dispenser) (*scoringOverrides, error) {
 			if err != nil {
 				return nil, d.Errf("invalid base_score value %q: %v", args[1], err)
 			}
-			if o.baseScores == nil {
-				o.baseScores = make(map[UserClass]float64)
+			if o.BaseScores == nil {
+				o.BaseScores = make(map[UserClass]float64)
 			}
-			o.baseScores[uc] = v
+			o.BaseScores[uc] = v
 
 		case "penalty":
 			args := d.RemainingArgs()
@@ -346,14 +403,27 @@ func parseScoringBlock(d *caddyfile.Dispenser) (*scoringOverrides, error) {
 			if !validScoringDimensions[dim] {
 				return nil, d.Errf("unrecognized scoring dimension %q for penalty", dim)
 			}
+			if o.EnabledDimensions == nil {
+				o.EnabledDimensions = make(map[string]bool)
+			}
+			o.EnabledDimensions[dim] = true
+
+			if len(args) == 1 {
+				// Bare enable: use this dimension's built-in default tuning.
+				// A later bare line for the same dimension always resets any
+				// earlier explicit tuning given in this same block.
+				delete(o.Penalties, dim)
+				continue
+			}
+
 			pc, err := parsePenaltyArgs(args[1:])
 			if err != nil {
 				return nil, d.Errf("invalid penalty config for dimension %q: %v", dim, err)
 			}
-			if o.penalties == nil {
-				o.penalties = make(map[string]PenaltyConfig)
+			if o.Penalties == nil {
+				o.Penalties = make(map[string]PenaltyConfig)
 			}
-			o.penalties[dim] = pc
+			o.Penalties[dim] = pc
 
 		case "min_score":
 			if !d.NextArg() {
@@ -363,7 +433,7 @@ func parseScoringBlock(d *caddyfile.Dispenser) (*scoringOverrides, error) {
 			if err != nil {
 				return nil, d.Errf("invalid min_score %q: %v", d.Val(), err)
 			}
-			o.minScore = &v
+			o.MinScore = &v
 
 		case "max_score":
 			if !d.NextArg() {
@@ -373,7 +443,7 @@ func parseScoringBlock(d *caddyfile.Dispenser) (*scoringOverrides, error) {
 			if err != nil {
 				return nil, d.Errf("invalid max_score %q: %v", d.Val(), err)
 			}
-			o.maxScore = &v
+			o.MaxScore = &v
 
 		default:
 			return nil, d.Errf("unrecognized scoring subdirective '%s'", d.Val())

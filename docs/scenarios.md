@@ -2,7 +2,10 @@
 
 Two worked examples showing how the 6 scoring dimensions (§3 of
 [`configuration.md`](configuration.md)) actually behave against real traffic shapes: a distributed
-crawler designed to stay under per-IP rate limits, and a normal human browsing session. Read
+crawler designed to stay under per-IP rate limits, and a normal human browsing session. Both
+walkthroughs assume every dimension discussed has actually been enabled via a `penalty <dimension>`
+line in a `scoring { }` block (§1.1 of [`configuration.md`](configuration.md)) — dimensions are
+opt-in, not on by default, so if your own config only enables a subset, only those apply. Read
 [`configuration.md`](configuration.md) first if you haven't already — this document assumes you
 know what EWMA, `alpha`, and soft/hard thresholds mean and just walks the numbers.
 
@@ -41,7 +44,7 @@ source IP, resolves to the *same* ASN. Its EWMA converges toward the true aggreg
 
 So the `asn` dimension's EWMA settles around **100 rps** — real, visible, and attributable to one
 entity. But notice: **100 is still well under the default `asn` soft threshold of 500.** With
-defaults alone, this crawler pays *zero* penalty on any of the 6 dimensions. This is the central
+default tuning, this crawler pays *zero* penalty on any enabled dimension. This is the central
 lesson of this scenario: the default aggregate thresholds are tuned to tolerate legitimate
 high-traffic ASNs (large ISPs, campus networks — see [`configuration.md`](configuration.md) §3),
 which means a moderately-sized distributed crawler can sit comfortably below them too. Defaults are
@@ -61,8 +64,14 @@ fairness {
 	geoip_city_db /etc/caddy/GeoLite2-City.mmdb
 
 	scoring {
-		# Tighten only the asn dimension for this backend; every other
-		# dimension (ip/net24/net6/country/user) stays at its default.
+		# Every dimension used in this walkthrough must be explicitly
+		# enabled — dimensions are opt-in. ip/net24/net6/country/user keep
+		# their built-in default tuning (bare form); only asn is tightened.
+		penalty ip
+		penalty net24
+		penalty net6
+		penalty country
+		penalty user
 		# alpha=0.3 reacts faster than the 0.2 default since we now know
 		# this specific pattern is worth catching quickly.
 		# soft=50 means 50+ rps sustained from one ASN gets a mild -10
@@ -109,7 +118,7 @@ every other dimension (`net24`, `net6`, `asn`, `country`, `user` if authenticate
 session contributes at most 3 requests/tick to any of them — several orders of magnitude under
 even the tightest default soft threshold (20, on `ip`/`user`).
 
-**Result:** `total_penalty = 0` across all 6 dimensions for this entire session. The final score is
+**Result:** `total_penalty = 0` across all 6 enabled dimensions for this entire session. The final score is
 just the base score for this visitor's class — 60 if anonymous, 100 if this happens to be an
 authenticated `researcher`/`internal`/`service_account` session — completely untouched by the
 fairness layer. This is the intended baseline: ordinary bursty-then-idle human browsing should

@@ -229,6 +229,17 @@ both.
   and default + per-backend-override per-dimension
   `alpha`, soft/hard threshold, soft/hard penalty, and idle-entry TTL (§3.2 GC) — all expressible as
   nested Caddyfile blocks/JSON per backend.
+- **Design refinement (post-initial-port):** dimensions are **opt-in**, not always-active. A
+  dimension is tracked/scored only if a `penalty <dimension>` line names it inside a block's
+  `scoring { }` sub-block (bare form uses that dimension's built-in default tuning; with
+  `alpha=`/`soft=`/`hard=` args, explicit tuning). A block with no `scoring { }` at all, or one with
+  zero `penalty` lines, tracks nothing and scores every request as its class's flat `base_score`
+  with `total_penalty` always `0` — there is no baseline set of dimensions active by default.
+  Enabling `asn`/`country`/`user` without a working `geoip_asn_db`/`geoip_city_db`/`auth_jwks_url`
+  (missing entirely, or configured but failing to open/initialize — e.g. a typo'd path or
+  unreachable JWKS URL) is a hard Caddy config-load error, distinct from the existing per-request
+  runtime fail-open (a configured, successfully-opened resource that just has no data for one
+  specific IP still fails open for that request, unchanged).
 
 ### 4.4 Capacity control (`app/capacity.py`) — `adaptive_admission`
 
