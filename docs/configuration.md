@@ -287,3 +287,59 @@ variable mechanism:
 - `fairness` also writes a `fairness_log_fields` variable (IP, ASN, country, user class, exemption
   flag, per-dimension score breakdown) that `adaptive_admission` folds into its own structured log
   line — `fairness` never logs a request on its own (see [`monitoring.md`](monitoring.md)).
+
+## 9. Example: Keycloak as the JWT issuer (researcher queue priority)
+
+`auth_issuer`/`auth_jwks_url`/`auth_audience` (§1) work with any standards-compliant OIDC provider —
+this walks through Keycloak specifically, since "give researchers priority" is just "get a verified
+`researcher` `user_class` claim into the JWT" (§4.2's `authClaims` shape) plus the `scoring { }`
+tuning already covered above. See [`examples/fairness-keycloak.Caddyfile`](../examples/fairness-keycloak.Caddyfile)
+for a complete, runnable file.
+
+**Keycloak-side setup** (once per realm/client):
+
+1. Create or pick the realm your researchers authenticate against (e.g. `arquivo`), and the client
+   this API's callers use to obtain tokens (confidential client + client-credentials grant for
+   service-to-service researcher tooling, or a public/confidential client with the auth-code grant
+   for interactive logins — either way, the resulting JWT shape is the same).
+2. Create a realm role (or group) — e.g. `researcher` — and assign it to trusted researcher
+   accounts.
+3. Add a protocol mapper on that client that emits a `user_class` claim of `"researcher"` for
+   members of that role/group (a "Hardcoded claim" mapper scoped to the role, or a group-membership
+   mapper mapping to that literal string — Keycloak's admin console calls this
+   Clients → *your client* → Client scopes → *dedicated scope* → Add mapper). The claim name must be
+   exactly `user_class` and its value one of the 3 claimable classes (`researcher`,
+   `service_account`, `internal` — §4.2's `validClaimedUserClasses`); anything else classifies as
+   `unknown`, not a parse error.
+4. Note the realm's issuer and JWKS URLs, both fixed paths for any realm:
+   - issuer: `https://<keycloak-host>/realms/<realm>`
+   - JWKS: `https://<keycloak-host>/realms/<realm>/protocol/openid-connect/certs`
+5. Confirm the client's tokens carry the `aud` claim you intend to put in `auth_audience` — Keycloak
+   doesn't always include a client's own client ID as `aud` by default; add an audience mapper on the
+   client if needed.
+
+**Caddyfile side** — point `auth_issuer`/`auth_jwks_url`/`auth_audience` (§1) at the values from
+step 4/5, and give `researcher` a higher `base_score` than `anonymous` (§4, already the default —
+100 vs. 60):
+
+```caddyfile
+fairness {
+	auth_issuer   https://idp.example.org/realms/arquivo
+	auth_jwks_url https://idp.example.org/realms/arquivo/protocol/openid-connect/certs
+	auth_audience page-search-api
+
+	scoring {
+		base_score researcher 100
+		base_score anonymous  60
+		penalty user alpha=0.2 soft=20:10 hard=100:40
+	}
+}
+```
+
+No code change and no rejection logic is involved: a researcher's request that carries a valid,
+Keycloak-issued bearer token classifies as `UserClassResearcher` (§4.2), gets `base_score 100`
+instead of `anonymous`'s 60, and — paired with `adaptive_admission` (§6/§7) — is dequeued ahead of
+lower-scored traffic under load. A missing token, an expired one, or a JWKS endpoint that's
+temporarily unreachable all fail open to `anonymous`/`unknown` (§1's `auth_jwks_url` note; §4.2) —
+Keycloak being down never turns into a 401/403 for anyone, only a loss of the researcher-priority
+boost until it recovers.
