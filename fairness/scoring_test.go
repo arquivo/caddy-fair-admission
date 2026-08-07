@@ -696,3 +696,215 @@ func TestUnmarshalCaddyfile_Scoring_UnrecognizedSubdirective(t *testing.T) {
 		t.Fatal("expected error for unrecognized scoring subdirective, got nil")
 	}
 }
+
+// --- 7. Priority divisor (§4.3) ---------------------------------------------
+
+func TestResolveScoringConfig_DivisorOverride(t *testing.T) {
+	overridden := &scoringOverrides{
+		Divisors: map[string]float64{"matchType": 1.25, "timeline": 2},
+	}
+	resolved := resolveScoringConfig(overridden)
+	if resolved.Divisors["matchType"] != 1.25 || resolved.Divisors["timeline"] != 2 {
+		t.Errorf("Divisors = %+v, want {matchType:1.25, timeline:2}", resolved.Divisors)
+	}
+	// Divisors are independent of dimension enablement.
+	if len(resolved.Dimensions) != 0 {
+		t.Errorf("Dimensions = %+v, want empty (no penalty lines given)", resolved.Dimensions)
+	}
+}
+
+func TestResolveScoringConfig_NoScoringBlockHasEmptyDivisors(t *testing.T) {
+	resolved := resolveScoringConfig(nil)
+	if len(resolved.Divisors) != 0 {
+		t.Errorf("Divisors = %+v, want empty (no scoring{} block at all)", resolved.Divisors)
+	}
+}
+
+func TestPriorityDivisor_NoConfiguredDivisors_IsNoOp(t *testing.T) {
+	s := newScoringState(resolveScoringConfig(nil), time.Second, time.Hour)
+	got := s.priorityDivisor(map[string][]string{"matchType": {"prefix"}})
+	if got != 1 {
+		t.Errorf("priorityDivisor = %v, want 1 (no divisors configured)", got)
+	}
+}
+
+func TestPriorityDivisor_AbsentParam_IsNoOp(t *testing.T) {
+	cfg := resolveScoringConfig(&scoringOverrides{Divisors: map[string]float64{"matchType": 1.25}})
+	s := newScoringState(cfg, time.Second, time.Hour)
+	got := s.priorityDivisor(map[string][]string{"other": {"x"}})
+	if got != 1 {
+		t.Errorf("priorityDivisor = %v, want 1 (configured param not present in query)", got)
+	}
+}
+
+func TestPriorityDivisor_PresentParam_AppliesConfiguredValue(t *testing.T) {
+	cfg := resolveScoringConfig(&scoringOverrides{Divisors: map[string]float64{"matchType": 1.25}})
+	s := newScoringState(cfg, time.Second, time.Hour)
+	got := s.priorityDivisor(map[string][]string{"matchType": {"prefix"}})
+	if got != 1.25 {
+		t.Errorf("priorityDivisor = %v, want 1.25", got)
+	}
+}
+
+func TestPriorityDivisor_MultiplePresentParams_StackMultiplicatively(t *testing.T) {
+	cfg := resolveScoringConfig(&scoringOverrides{
+		Divisors: map[string]float64{"matchType": 1.25, "timeline": 2, "yearBalance": 1.5},
+	})
+	s := newScoringState(cfg, time.Second, time.Hour)
+	got := s.priorityDivisor(map[string][]string{
+		"matchType": {"prefix"},
+		"timeline":  {"1"},
+		"unrelated": {"x"},
+	})
+	want := 1.25 * 2.0
+	if math.Abs(got-want) > 1e-9 {
+		t.Errorf("priorityDivisor = %v, want %v (matchType * timeline, yearBalance absent)", got, want)
+	}
+}
+
+// priorityDivisor's presence-based contract: divisors are keyed only on
+// whether a param name is present in query, never on its value — an empty
+// string value must still count as present.
+func TestPriorityDivisor_PresenceOnly_ValueIsIgnored(t *testing.T) {
+	cfg := resolveScoringConfig(&scoringOverrides{Divisors: map[string]float64{"matchType": 1.25}})
+	s := newScoringState(cfg, time.Second, time.Hour)
+	got := s.priorityDivisor(map[string][]string{"matchType": {""}})
+	if got != 1.25 {
+		t.Errorf("priorityDivisor = %v, want 1.25 (presence alone, regardless of value)", got)
+	}
+}
+
+func TestPriorityDivisor_NilScoringState_IsNoOp(t *testing.T) {
+	var s *scoringState
+	got := s.priorityDivisor(map[string][]string{"matchType": {"prefix"}})
+	if got != 1 {
+		t.Errorf("priorityDivisor on nil state = %v, want 1", got)
+	}
+}
+
+func TestUnmarshalCaddyfile_Divisor_RoundTrips(t *testing.T) {
+	input := `fairness {
+		scoring {
+			divisor param matchType 1.25
+			divisor param timeline 2
+		}
+	}`
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+		t.Fatalf("UnmarshalCaddyfile: %v", err)
+	}
+	resolved := resolveScoringConfig(h.ScoringOverrides)
+	if resolved.Divisors["matchType"] != 1.25 || resolved.Divisors["timeline"] != 2 {
+		t.Errorf("Divisors = %+v, want {matchType:1.25, timeline:2}", resolved.Divisors)
+	}
+}
+
+func TestUnmarshalCaddyfile_Divisor_MissingParamKeyword(t *testing.T) {
+	input := `fairness {
+		scoring {
+			divisor matchType 1.25
+		}
+	}`
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {
+		t.Fatal("expected error for divisor line missing 'param' keyword, got nil")
+	}
+}
+
+func TestUnmarshalCaddyfile_Divisor_WrongArgCount(t *testing.T) {
+	input := `fairness {
+		scoring {
+			divisor param matchType
+		}
+	}`
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {
+		t.Fatal("expected error for divisor line with too few args, got nil")
+	}
+}
+
+func TestUnmarshalCaddyfile_Divisor_NonNumericValue(t *testing.T) {
+	input := `fairness {
+		scoring {
+			divisor param matchType notanumber
+		}
+	}`
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {
+		t.Fatal("expected error for non-numeric divisor value, got nil")
+	}
+}
+
+func TestUnmarshalCaddyfile_Divisor_NonPositiveValueRejected(t *testing.T) {
+	for _, v := range []string{"0", "-1.5"} {
+		input := `fairness {
+			scoring {
+				divisor param matchType ` + v + `
+			}
+		}`
+		var h Handler
+		if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {
+			t.Fatalf("divisor value %q: expected error (must be > 0), got nil", v)
+		}
+	}
+}
+
+func TestHandler_ServeHTTP_AppliesDivisorWhenQueryParamPresent(t *testing.T) {
+	h := Handler{
+		ScoringOverrides: &scoringOverrides{
+			Divisors: map[string]float64{"matchType": 2},
+		},
+	}
+	h.scoring = newScoringState(resolveScoringConfig(h.ScoringOverrides), time.Second, time.Hour)
+
+	req := httptest.NewRequest(http.MethodGet, "/?matchType=prefix", nil)
+	req.RemoteAddr = "203.0.113.5:1234"
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, map[string]any{})
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error { return nil })
+
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+
+	v := caddyhttp.GetVar(req.Context(), fairnessScoreVarKey)
+	score, ok := v.(float64)
+	if !ok {
+		t.Fatalf("fairness_score var = %#v, want float64", v)
+	}
+	base := newDefaultScoringConfig().BaseScores[UserClassAnonymous]
+	want := base / 2
+	if score != want {
+		t.Errorf("fairness_score = %v, want %v (base %v / divisor 2)", score, want, base)
+	}
+}
+
+func TestHandler_ServeHTTP_NoDivisorWhenQueryParamAbsent(t *testing.T) {
+	h := Handler{
+		ScoringOverrides: &scoringOverrides{
+			Divisors: map[string]float64{"matchType": 2},
+		},
+	}
+	h.scoring = newScoringState(resolveScoringConfig(h.ScoringOverrides), time.Second, time.Hour)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "203.0.113.5:1234"
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, map[string]any{})
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error { return nil })
+
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+
+	v := caddyhttp.GetVar(req.Context(), fairnessScoreVarKey)
+	score := v.(float64)
+	base := newDefaultScoringConfig().BaseScores[UserClassAnonymous]
+	if score != base {
+		t.Errorf("fairness_score = %v, want unpenalized/undivided base score %v", score, base)
+	}
+}

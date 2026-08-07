@@ -113,14 +113,21 @@ type PenaltyConfig struct {
 }
 
 // ScoringConfig is a fairness handler's fully-resolved scoring configuration
-// (§4.3): base scores per user class, the score clamp range, and per-
-// dimension penalty tuning. §5's config surface is explicitly "illustrative
-// only" — see newDefaultScoringConfig for the chosen illustrative defaults.
+// (§4.3): base scores per user class, the score clamp range, per-
+// dimension penalty tuning, and per-query-param priority divisors (§4.3's
+// presence-based priority divisor). §5's config surface is explicitly
+// "illustrative only" — see newDefaultScoringConfig for the chosen
+// illustrative defaults.
 type ScoringConfig struct {
 	BaseScores map[UserClass]float64
 	MinScore   float64
 	MaxScore   float64
 	Dimensions map[string]PenaltyConfig
+	// Divisors maps a query-param name to the divisor applied when that
+	// param is present on a request, regardless of its value (§4.3). Empty
+	// by default — opt-in via `divisor param <name> <value>` lines, same
+	// pattern as Dimensions.
+	Divisors map[string]float64
 }
 
 // newDefaultScoringConfig returns a brand-new ScoringConfig with fresh maps
@@ -206,6 +213,11 @@ type scoringOverrides struct {
 	Penalties         map[string]PenaltyConfig `json:"penalties,omitempty"`
 	MinScore          *float64                 `json:"min_score,omitempty"`
 	MaxScore          *float64                 `json:"max_score,omitempty"`
+	// Divisors holds every `divisor param <name> <value>` line given in this
+	// block (§4.3), keyed by query-param name. Nil if none were given —
+	// resolveScoringConfig then leaves the resolved config's Divisors empty,
+	// same opt-in convention as EnabledDimensions.
+	Divisors map[string]float64 `json:"divisors,omitempty"`
 }
 
 // resolveScoringConfig starts from a fresh newDefaultScoringConfig() for
@@ -227,6 +239,7 @@ func resolveScoringConfig(o *scoringOverrides) ScoringConfig {
 		MinScore:   defaults.MinScore,
 		MaxScore:   defaults.MaxScore,
 		Dimensions: map[string]PenaltyConfig{},
+		Divisors:   map[string]float64{},
 	}
 	if o == nil {
 		return cfg
@@ -246,6 +259,9 @@ func resolveScoringConfig(o *scoringOverrides) ScoringConfig {
 	}
 	if o.MaxScore != nil {
 		cfg.MaxScore = *o.MaxScore
+	}
+	for name, v := range o.Divisors {
+		cfg.Divisors[name] = v
 	}
 	return cfg
 }
@@ -618,6 +634,32 @@ func (s *scoringState) computeScoreBreakdown(c Classification, exemptCountries m
 	breakdown["total_penalty"] = totalPenalty
 	breakdown["final"] = final
 	return final, breakdown
+}
+
+// priorityDivisor returns the combined priority divisor for a request
+// (§4.3's presence-based priority divisor): the product of every configured
+// `divisor param <name> <value>`'s value, for each name actually present as
+// a key in query — keyed only by the param's presence, never by its value.
+// Multiple present params multiply (e.g. two configured params both present
+// on the request combine their divisors). Returns 1 (a no-op) if no
+// divisors are configured, none of their names are present in query, or the
+// product would be non-positive (a defensive floor — configured divisor
+// values are already validated as > 0 at parse time, so this should never
+// actually trigger). Nil-safe, matching every other *scoringState method.
+func (s *scoringState) priorityDivisor(query map[string][]string) float64 {
+	if s == nil {
+		return 1
+	}
+	d := 1.0
+	for name, v := range s.cfg.Divisors {
+		if _, present := query[name]; present {
+			d *= v
+		}
+	}
+	if d <= 0 {
+		return 1
+	}
+	return d
 }
 
 // parsePenaltyArgs parses the space-separated key=value tokens following
