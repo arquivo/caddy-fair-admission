@@ -198,7 +198,7 @@ both.
 
 - A `final = clamp(base_score[user_class] - penalty, min_score, max_score)` per request, where
   `penalty` sums step-function penalties (soft/hard thresholds → soft/hard penalty amounts),
-  independently per dimension: `ip, net24, net6, asn, country, user`.
+  independently per dimension: `ip, ipv4_subnet, ipv6_subnet, asn, country, user`.
 - **Design refinement vs. the Python source:** the Python system's per-dimension counters are plain
   rolling-window request counts (`window_seconds`). This port instead drives thresholds off an
   **EWMA (exponentially weighted moving average) of requests/sec**, per dimension — a technique

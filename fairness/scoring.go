@@ -23,12 +23,12 @@ import (
 // (scoringOverrides.EnabledDimensions). A dimension absent from every
 // `penalty` line is never tracked, ticked, or scored, regardless of its
 // presence in this list.
-var scoringDimensions = [...]string{"ip", "net24", "net6", "asn", "country", "user"}
+var scoringDimensions = [...]string{"ip", "ipv4_subnet", "ipv6_subnet", "asn", "country", "user"}
 
 // validScoringDimensions is scoringDimensions as a lookup set, for Caddyfile
 // validation.
 var validScoringDimensions = map[string]bool{
-	"ip": true, "net24": true, "net6": true, "asn": true, "country": true, "user": true,
+	"ip": true, "ipv4_subnet": true, "ipv6_subnet": true, "asn": true, "country": true, "user": true,
 }
 
 // validUserClasses are the 5 user classes base_score may legitimately be
@@ -146,10 +146,10 @@ type ScoringConfig struct {
 //   - MinScore/MaxScore: 0/100.
 //   - Per-dimension alpha/soft/hard, roughly scaled by how many distinct
 //     requesters typically share that bucket: ip/user (single entity) use
-//     the §5 example's exact ip values; net24/net6 (subnet aggregate) and
-//     asn/country (progressively larger aggregates) get proportionally
-//     higher thresholds so legitimate aggregated traffic isn't penalized as
-//     eagerly as a single misbehaving IP.
+//     the §5 example's exact ip values; ipv4_subnet/ipv6_subnet (subnet
+//     aggregate) and asn/country (progressively larger aggregates) get
+//     proportionally higher thresholds so legitimate aggregated traffic
+//     isn't penalized as eagerly as a single misbehaving IP.
 func newDefaultScoringConfig() ScoringConfig {
 	return ScoringConfig{
 		BaseScores: map[UserClass]float64{
@@ -162,12 +162,12 @@ func newDefaultScoringConfig() ScoringConfig {
 		MinScore: 0,
 		MaxScore: 100,
 		Dimensions: map[string]PenaltyConfig{
-			"ip":      {Alpha: 0.2, SoftThreshold: 20, SoftPenalty: 10, HardThreshold: 100, HardPenalty: 40},
-			"user":    {Alpha: 0.2, SoftThreshold: 20, SoftPenalty: 10, HardThreshold: 100, HardPenalty: 40},
-			"net24":   {Alpha: 0.2, SoftThreshold: 100, SoftPenalty: 10, HardThreshold: 500, HardPenalty: 40},
-			"net6":    {Alpha: 0.2, SoftThreshold: 100, SoftPenalty: 10, HardThreshold: 500, HardPenalty: 40},
-			"asn":     {Alpha: 0.2, SoftThreshold: 500, SoftPenalty: 10, HardThreshold: 2000, HardPenalty: 40},
-			"country": {Alpha: 0.2, SoftThreshold: 2000, SoftPenalty: 10, HardThreshold: 10000, HardPenalty: 40},
+			"ip":          {Alpha: 0.2, SoftThreshold: 20, SoftPenalty: 10, HardThreshold: 100, HardPenalty: 40},
+			"user":        {Alpha: 0.2, SoftThreshold: 20, SoftPenalty: 10, HardThreshold: 100, HardPenalty: 40},
+			"ipv4_subnet": {Alpha: 0.2, SoftThreshold: 100, SoftPenalty: 10, HardThreshold: 500, HardPenalty: 40},
+			"ipv6_subnet": {Alpha: 0.2, SoftThreshold: 100, SoftPenalty: 10, HardThreshold: 500, HardPenalty: 40},
+			"asn":         {Alpha: 0.2, SoftThreshold: 500, SoftPenalty: 10, HardThreshold: 2000, HardPenalty: 40},
+			"country":     {Alpha: 0.2, SoftThreshold: 2000, SoftPenalty: 10, HardThreshold: 10000, HardPenalty: 40},
 		},
 	}
 }
@@ -279,7 +279,7 @@ func clamp(v, min, max float64) float64 {
 
 // dimensionKey derives the tracked-entity key for dim from a Classification,
 // or ok=false if that dimension doesn't apply to this request (§1 of the
-// task spec: e.g. net24 for an IPv6 request, asn/country/user when
+// task spec: e.g. ipv4_subnet for an IPv6 request, asn/country/user when
 // unavailable/anonymous).
 func dimensionKey(dim string, c Classification) (key string, ok bool) {
 	switch dim {
@@ -288,12 +288,12 @@ func dimensionKey(dim string, c Classification) (key string, ok bool) {
 			return "", false
 		}
 		return c.IP, true
-	case "net24":
+	case "ipv4_subnet":
 		if c.Net24 == "" {
 			return "", false
 		}
 		return c.Net24, true
-	case "net6":
+	case "ipv6_subnet":
 		if c.NetV6 == "" {
 			return "", false
 		}

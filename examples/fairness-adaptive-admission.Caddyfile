@@ -31,8 +31,8 @@
 	# PT traffic is never penalized on the country dimension (still tracked
 	# for observability -- see docs/configuration.md §5).
 	exempt_country PT
-	# IPv6 client addresses are aggregated at a /56 for the net6 dimension
-	# (the only other valid value is 48 -- docs/configuration.md §1).
+	# IPv6 client addresses are aggregated at a /56 for the ipv6_subnet
+	# dimension (the only other valid value is 48 -- docs/configuration.md §1).
 	ipv6_prefix_length 56
 	# Re-evaluate every tracked entity's EWMA once a second (the default --
 	# see docs/configuration.md §2 for what this "tick" controls).
@@ -54,7 +54,7 @@
 		# penalty magnitudes are restated -- the leading "-" is cosmetic,
 		# see docs/configuration.md §1.1). Dimensions are opt-in, so this
 		# is also the only dimension scored at all on this backend --
-		# net24/net6/asn/country/user are never tracked here.
+		# ipv4_subnet/ipv6_subnet/asn/country/user are never tracked here.
 		penalty ip alpha=0.2 soft=20:-10 hard=100:-40
 	}
 }

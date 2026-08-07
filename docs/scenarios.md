@@ -26,7 +26,7 @@ request every 720 seconds. Even a tick interval of `1s` means almost every tick 
 the soft threshold of 20 rps. **This dimension is structurally blind to this attack — that is the
 entire point of spreading across so many IPs.**
 
-**`net24` / `net6` (default: alpha=0.2, soft=100:10, hard=500:40).** If the crawler's IP pool is
+**`ipv4_subnet` / `ipv6_subnet` (default: alpha=0.2, soft=100:10, hard=500:40).** If the crawler's IP pool is
 itself spread across many different `/24` (or `/48`/`/56` for IPv6) subnets — plausible for a big
 enough hosting provider or mobile carrier — then even the subnet-level aggregation dilutes the
 rate. 100 req/s spread over, say, 300 different `/24`s is about 0.33 req/s per subnet: still well
@@ -65,11 +65,11 @@ fairness {
 
 	scoring {
 		# Every dimension used in this walkthrough must be explicitly
-		# enabled — dimensions are opt-in. ip/net24/net6/country/user keep
-		# their built-in default tuning (bare form); only asn is tightened.
+		# enabled — dimensions are opt-in. ip/ipv4_subnet/ipv6_subnet/country/user
+		# keep their built-in default tuning (bare form); only asn is tightened.
 		penalty ip
-		penalty net24
-		penalty net6
+		penalty ipv4_subnet
+		penalty ipv6_subnet
 		penalty country
 		penalty user
 		# alpha=0.3 reacts faster than the 0.2 default since we now know
@@ -114,7 +114,7 @@ initial page load, where 3 requests might land in the same 1-second tick.
 
 The `ip` EWMA never gets close to its soft threshold of **20** — it peaks at 0.60 for a single tick
 and spends the overwhelming majority of the session decaying toward zero. The same math applies at
-every other dimension (`net24`, `net6`, `asn`, `country`, `user` if authenticated) since this
+every other dimension (`ipv4_subnet`, `ipv6_subnet`, `asn`, `country`, `user` if authenticated) since this
 session contributes at most 3 requests/tick to any of them — several orders of magnitude under
 even the tightest default soft threshold (20, on `ip`/`user`).
 
