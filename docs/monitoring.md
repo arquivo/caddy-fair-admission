@@ -203,12 +203,14 @@ Fields present **only when `admitted: false`**: `reject_reason` (string, `queue_
 Fields folded in from `fairness` **when a `fairness` handler ran earlier in the chain** (absent
 entirely if `fairness` wasn't configured for this route): `ip` (string), `asn` (uint64, the numeric
 AS number, only present when GeoIP ASN lookup resolved), `country` (string, ISO alpha-2, only
-present when GeoIP city lookup resolved), `user_class` (string), `exempt` (bool, whether `country`
-was on the `exempt_country` list for this request), `score_breakdown` (object — always has `base`
-and `final`; always has `total_penalty` after fairness has computed a score, present as `0` if no
-dimension contributed a penalty; and one `penalty_<dimension>` key per dimension that actually
-contributed a non-zero penalty this request, e.g. `penalty_asn` — dimensions contributing `0` are
-omitted entirely rather than listed with a `0` value).
+present when GeoIP city lookup resolved), `user_class` (string), `exempt` (bool, whether this
+request's country was on the `exempt_country` list of at least one *enabled* scoring dimension —
+`exempt_country` is configured per-dimension, see §5 of [`configuration.md`](configuration.md), so
+this field summarizes across all of them rather than naming which one), `score_breakdown` (object —
+always has `base` and `final`; always has `total_penalty` after fairness has computed a score,
+present as `0` if no dimension contributed a penalty; and one `penalty_<dimension>` key per dimension
+that actually contributed a non-zero penalty this request, e.g. `penalty_asn` — dimensions
+contributing `0` are omitted entirely rather than listed with a `0` value).
 
 **Example — admitted request:**
 

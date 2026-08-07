@@ -5,6 +5,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -120,7 +121,7 @@ func TestResolveScoringConfig_OverrideOnlyAffectsItsOwnDimension(t *testing.T) {
 	resolvedA := resolveScoringConfig(overridden)
 	resolvedB := resolveScoringConfig(nil) // separately-resolved, no dimensions enabled
 
-	if resolvedA.Dimensions["ip"] == newDefaultScoringConfig().Dimensions["ip"] {
+	if reflect.DeepEqual(resolvedA.Dimensions["ip"], newDefaultScoringConfig().Dimensions["ip"]) {
 		t.Fatalf("expected block A's overridden ip dimension to differ from the hardcoded default")
 	}
 
@@ -198,7 +199,7 @@ func TestResolveScoringConfig_BarePenaltyUsesDefaultTuning(t *testing.T) {
 	overridden := &scoringOverrides{EnabledDimensions: map[string]bool{"asn": true}}
 	resolved := resolveScoringConfig(overridden)
 	defaults := newDefaultScoringConfig()
-	if resolved.Dimensions["asn"] != defaults.Dimensions["asn"] {
+	if !reflect.DeepEqual(resolved.Dimensions["asn"], defaults.Dimensions["asn"]) {
 		t.Errorf("Dimensions[asn] = %+v, want built-in default %+v", resolved.Dimensions["asn"], defaults.Dimensions["asn"])
 	}
 	if len(resolved.Dimensions) != 1 {
@@ -227,7 +228,7 @@ func TestComputeScoreBreakdown_NoDimensionsEnabled_AlwaysBaseScoreZeroPenalty(t 
 	}
 	s.tick(now.Add(time.Second))
 
-	score, breakdown := s.computeScoreBreakdown(c, nil)
+	score, breakdown := s.computeScoreBreakdown(c)
 	base := cfg.BaseScores[UserClassAnonymous]
 	if score != base {
 		t.Errorf("score = %v, want unpenalized base score %v", score, base)
@@ -318,8 +319,14 @@ func TestScoringState_GC_ExactlyAtTTLIsNotReclaimed(t *testing.T) {
 // --- 5. Exempt-country behavior ---------------------------------------------
 
 func TestComputeScore_ExemptCountry_TracksButNoPenalty(t *testing.T) {
-	cfg := newDefaultScoringConfig()
-	s := newScoringState(cfg, time.Second, time.Hour)
+	cfgExempt := newDefaultScoringConfig()
+	pcExempt := cfgExempt.Dimensions["country"]
+	pcExempt.ExemptCountries = map[string]bool{"PT": true}
+	cfgExempt.Dimensions["country"] = pcExempt
+	sExempt := newScoringState(cfgExempt, time.Second, time.Hour)
+
+	cfgNotExempt := newDefaultScoringConfig()
+	sNotExempt := newScoringState(cfgNotExempt, time.Second, time.Hour)
 
 	c := Classification{UserClass: UserClassAnonymous, Country: "PT"}
 	now := time.Unix(1_700_000_000, 0)
@@ -327,35 +334,80 @@ func TestComputeScore_ExemptCountry_TracksButNoPenalty(t *testing.T) {
 	// Directly push the country entity's EWMARPS far above its hard
 	// threshold (10000) to simulate sustained heavy load, without waiting
 	// through thousands of real ticks.
-	dm := s.dims["country"]
-	dm.mu.Lock()
-	dm.entries["PT"] = &ClientStats{LastSeen: now, EWMARPS: 20000}
-	dm.mu.Unlock()
+	for _, s := range []*scoringState{sExempt, sNotExempt} {
+		dm := s.dims["country"]
+		dm.mu.Lock()
+		dm.entries["PT"] = &ClientStats{LastSeen: now, EWMARPS: 20000}
+		dm.mu.Unlock()
+	}
 
-	exempt := map[string]bool{"PT": true}
-	notExempt := map[string]bool{}
+	scoreExempt := sExempt.computeScore(c)
+	scoreNotExempt := sNotExempt.computeScore(c)
 
-	scoreExempt := s.computeScore(c, exempt)
-	scoreNotExempt := s.computeScore(c, notExempt)
-
-	base := cfg.BaseScores[UserClassAnonymous]
+	base := cfgExempt.BaseScores[UserClassAnonymous]
 	if scoreExempt != base {
 		t.Errorf("exempt-country score = %v, want unpenalized base score %v", scoreExempt, base)
 	}
-	wantPenalized := clamp(base-cfg.Dimensions["country"].HardPenalty, cfg.MinScore, cfg.MaxScore)
+	wantPenalized := clamp(base-cfgNotExempt.Dimensions["country"].HardPenalty, cfgNotExempt.MinScore, cfgNotExempt.MaxScore)
 	if scoreNotExempt != wantPenalized {
 		t.Errorf("non-exempt score = %v, want %v (hard-penalized)", scoreNotExempt, wantPenalized)
 	}
 
 	// Observability: track() + tick() must still update EWMARPS normally
 	// for an exempt country, even though it's never penalized.
-	before := s.entryEWMARPS("country", "PT")
-	s.track(c, now)
-	s.tick(now.Add(time.Second))
-	after := s.entryEWMARPS("country", "PT")
+	before := sExempt.entryEWMARPS("country", "PT")
+	sExempt.track(c, now)
+	sExempt.tick(now.Add(time.Second))
+	after := sExempt.entryEWMARPS("country", "PT")
 	if after == before {
 		t.Errorf("exempt country's EWMARPS did not update on tick: before=%v after=%v", before, after)
 	}
+}
+
+// TestComputeScoreBreakdown_ExemptCountry_IsPerDimension verifies exemption
+// is scoped to the dimension that configures it, not global: a country
+// exempt from one dimension's penalty (e.g. "country") still gets penalized
+// on a dimension that didn't list it (e.g. "ip") — the Arquivo.pt use case of
+// exempting a high-traffic country from subnet/ASN/country penalties while
+// still rate-limiting individual abusive IPs from that same country.
+func TestComputeScoreBreakdown_ExemptCountry_IsPerDimension(t *testing.T) {
+	cfg := ScoringConfig{
+		BaseScores: map[UserClass]float64{UserClassAnonymous: 100},
+		MinScore:   0,
+		MaxScore:   100,
+		Dimensions: map[string]PenaltyConfig{
+			"ip":      {Alpha: 0.2, SoftThreshold: 20, SoftPenalty: 10, HardThreshold: 100, HardPenalty: 40},
+			"country": {Alpha: 0.2, SoftThreshold: 20, SoftPenalty: 10, HardThreshold: 100, HardPenalty: 40, ExemptCountries: map[string]bool{"PT": true}},
+		},
+	}
+	s := newScoringState(cfg, time.Second, time.Hour)
+
+	c := Classification{UserClass: UserClassAnonymous, IP: "203.0.113.9", Country: "PT"}
+	now := time.Unix(1_700_000_000, 0)
+
+	for _, dim := range []string{"ip", "country"} {
+		dm := s.dims[dim]
+		dm.mu.Lock()
+		dm.entries[dimensionKeyOrFatal(t, dim, c)] = &ClientStats{LastSeen: now, EWMARPS: 20000}
+		dm.mu.Unlock()
+	}
+
+	_, breakdown := s.computeScoreBreakdown(c)
+	if _, ok := breakdown["penalty_country"]; ok {
+		t.Errorf("breakdown = %+v, want no penalty_country (PT is exempt on that dimension)", breakdown)
+	}
+	if breakdown["penalty_ip"] != cfg.Dimensions["ip"].HardPenalty {
+		t.Errorf("penalty_ip = %v, want %v (ip dimension has no exemption for PT)", breakdown["penalty_ip"], cfg.Dimensions["ip"].HardPenalty)
+	}
+}
+
+func dimensionKeyOrFatal(t *testing.T, dim string, c Classification) string {
+	t.Helper()
+	key, ok := dimensionKey(dim, c)
+	if !ok {
+		t.Fatalf("dimensionKey(%q, %+v) ok=false, want a key", dim, c)
+	}
+	return key
 }
 
 // --- 6. Fail-open on uninitialized state ------------------------------------
@@ -372,7 +424,7 @@ func TestComputeScore_NilScoringState_FailsOpen(t *testing.T) {
 				t.Fatalf("computeScore panicked on nil scoringState: %v", r)
 			}
 		}()
-		got = s.computeScore(c, nil)
+		got = s.computeScore(c)
 	}()
 
 	defaults := newDefaultScoringConfig()
@@ -521,11 +573,11 @@ func TestUnmarshalCaddyfile_ScoringBlock_RoundTrips(t *testing.T) {
 		t.Errorf("BaseScores[anonymous] = %v, want 60", resolved.BaseScores[UserClassAnonymous])
 	}
 	wantIP := PenaltyConfig{Alpha: 0.2, SoftThreshold: 20, SoftPenalty: 10, HardThreshold: 100, HardPenalty: 40}
-	if resolved.Dimensions["ip"] != wantIP {
+	if !reflect.DeepEqual(resolved.Dimensions["ip"], wantIP) {
 		t.Errorf("Dimensions[ip] = %+v, want %+v", resolved.Dimensions["ip"], wantIP)
 	}
 	wantIPv4Subnet := PenaltyConfig{Alpha: 0.3, SoftThreshold: 150, SoftPenalty: 15, HardThreshold: 600, HardPenalty: 45}
-	if resolved.Dimensions["ipv4_subnet"] != wantIPv4Subnet {
+	if !reflect.DeepEqual(resolved.Dimensions["ipv4_subnet"], wantIPv4Subnet) {
 		t.Errorf("Dimensions[ipv4_subnet] = %+v, want %+v", resolved.Dimensions["ipv4_subnet"], wantIPv4Subnet)
 	}
 	if resolved.MinScore != 0 || resolved.MaxScore != 100 {
@@ -552,7 +604,7 @@ func TestUnmarshalCaddyfile_Penalty_Bare_EnablesDefaultTuning(t *testing.T) {
 	}
 	resolved := resolveScoringConfig(h.ScoringOverrides)
 	defaults := newDefaultScoringConfig()
-	if resolved.Dimensions["country"] != defaults.Dimensions["country"] {
+	if !reflect.DeepEqual(resolved.Dimensions["country"], defaults.Dimensions["country"]) {
 		t.Errorf("Dimensions[country] = %+v, want built-in default %+v", resolved.Dimensions["country"], defaults.Dimensions["country"])
 	}
 	if len(resolved.Dimensions) != 1 {
@@ -574,7 +626,7 @@ func TestUnmarshalCaddyfile_Penalty_RepeatedLine_LastWins(t *testing.T) {
 		}
 		resolved := resolveScoringConfig(h.ScoringOverrides)
 		defaults := newDefaultScoringConfig()
-		if resolved.Dimensions["ip"] != defaults.Dimensions["ip"] {
+		if !reflect.DeepEqual(resolved.Dimensions["ip"], defaults.Dimensions["ip"]) {
 			t.Errorf("Dimensions[ip] = %+v, want built-in default %+v (later bare line should reset the earlier override)", resolved.Dimensions["ip"], defaults.Dimensions["ip"])
 		}
 	})
@@ -592,7 +644,7 @@ func TestUnmarshalCaddyfile_Penalty_RepeatedLine_LastWins(t *testing.T) {
 		}
 		resolved := resolveScoringConfig(h.ScoringOverrides)
 		want := PenaltyConfig{Alpha: 0.9, SoftThreshold: 1, SoftPenalty: 2, HardThreshold: 3, HardPenalty: 4}
-		if resolved.Dimensions["ip"] != want {
+		if !reflect.DeepEqual(resolved.Dimensions["ip"], want) {
 			t.Errorf("Dimensions[ip] = %+v, want %+v (later explicit line should override the earlier bare enable)", resolved.Dimensions["ip"], want)
 		}
 	})
@@ -620,8 +672,101 @@ func TestUnmarshalCaddyfile_Penalty_ArgOrderIndependent(t *testing.T) {
 
 	r1 := resolveScoringConfig(h1.ScoringOverrides)
 	r2 := resolveScoringConfig(h2.ScoringOverrides)
-	if r1.Dimensions["ip"] != r2.Dimensions["ip"] {
+	if !reflect.DeepEqual(r1.Dimensions["ip"], r2.Dimensions["ip"]) {
 		t.Errorf("arg order changed the resolved PenaltyConfig: in-order=%+v shuffled=%+v", r1.Dimensions["ip"], r2.Dimensions["ip"])
+	}
+}
+
+func TestUnmarshalCaddyfile_Penalty_ExemptCountry_Parses(t *testing.T) {
+	input := `fairness {
+		scoring {
+			penalty country alpha=0.2 soft=2000:10 hard=10000:40 exempt_country=PT,ES
+		}
+	}`
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+		t.Fatalf("UnmarshalCaddyfile: %v", err)
+	}
+	resolved := resolveScoringConfig(h.ScoringOverrides)
+	want := map[string]bool{"PT": true, "ES": true}
+	if !reflect.DeepEqual(resolved.Dimensions["country"].ExemptCountries, want) {
+		t.Errorf("ExemptCountries = %#v, want %#v", resolved.Dimensions["country"].ExemptCountries, want)
+	}
+}
+
+func TestUnmarshalCaddyfile_Penalty_ExemptCountry_SingleCode(t *testing.T) {
+	input := `fairness {
+		scoring {
+			penalty asn alpha=0.2 soft=500:10 hard=2000:40 exempt_country=PT
+		}
+	}`
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+		t.Fatalf("UnmarshalCaddyfile: %v", err)
+	}
+	resolved := resolveScoringConfig(h.ScoringOverrides)
+	want := map[string]bool{"PT": true}
+	if !reflect.DeepEqual(resolved.Dimensions["asn"].ExemptCountries, want) {
+		t.Errorf("ExemptCountries = %#v, want %#v", resolved.Dimensions["asn"].ExemptCountries, want)
+	}
+}
+
+func TestUnmarshalCaddyfile_Penalty_ExemptCountry_IsPerDimension(t *testing.T) {
+	input := `fairness {
+		scoring {
+			penalty ip      alpha=0.2 soft=20:10   hard=100:40
+			penalty country alpha=0.2 soft=2000:10 hard=10000:40 exempt_country=PT
+		}
+	}`
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+		t.Fatalf("UnmarshalCaddyfile: %v", err)
+	}
+	resolved := resolveScoringConfig(h.ScoringOverrides)
+	if len(resolved.Dimensions["ip"].ExemptCountries) != 0 {
+		t.Errorf("ip dimension ExemptCountries = %#v, want empty — exempt_country was only configured on country", resolved.Dimensions["ip"].ExemptCountries)
+	}
+	if !resolved.Dimensions["country"].ExemptCountries["PT"] {
+		t.Errorf("country dimension ExemptCountries = %#v, want PT present", resolved.Dimensions["country"].ExemptCountries)
+	}
+}
+
+func TestUnmarshalCaddyfile_Penalty_ExemptCountry_EmptyCodeRejected(t *testing.T) {
+	input := `fairness {
+		scoring {
+			penalty country alpha=0.2 soft=2000:10 hard=10000:40 exempt_country=PT,,ES
+		}
+	}`
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {
+		t.Fatal("expected error for exempt_country with an empty country code, got nil")
+	}
+}
+
+func TestUnmarshalCaddyfile_Penalty_ExemptCountry_ArgOrderIndependent(t *testing.T) {
+	inputInOrder := `fairness {
+		scoring {
+			penalty country alpha=0.2 soft=2000:10 hard=10000:40 exempt_country=PT,ES
+		}
+	}`
+	inputShuffled := `fairness {
+		scoring {
+			penalty country exempt_country=PT,ES hard=10000:40 soft=2000:10 alpha=0.2
+		}
+	}`
+
+	var h1, h2 Handler
+	if err := h1.UnmarshalCaddyfile(caddyfile.NewTestDispenser(inputInOrder)); err != nil {
+		t.Fatalf("in-order UnmarshalCaddyfile: %v", err)
+	}
+	if err := h2.UnmarshalCaddyfile(caddyfile.NewTestDispenser(inputShuffled)); err != nil {
+		t.Fatalf("shuffled UnmarshalCaddyfile: %v", err)
+	}
+
+	r1 := resolveScoringConfig(h1.ScoringOverrides)
+	r2 := resolveScoringConfig(h2.ScoringOverrides)
+	if !reflect.DeepEqual(r1.Dimensions["country"], r2.Dimensions["country"]) {
+		t.Errorf("arg order changed the resolved PenaltyConfig: in-order=%+v shuffled=%+v", r1.Dimensions["country"], r2.Dimensions["country"])
 	}
 }
 

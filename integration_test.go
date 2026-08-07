@@ -616,6 +616,45 @@ func TestIntegration_ConfigError_UserEnabled_FailedToInitialize(t *testing.T) {
 	}
 }
 
+// TestIntegration_ConfigError_ExemptCountryEnabled_NotConfigured proves the
+// geoip_city_db requirement for exempt_country applies per-dimension even
+// when the dimension configuring it isn't `country` itself -- ipv4_subnet
+// here never triggers the country-dimension checks above, so this is the
+// only thing that would catch a broken/missing geoip_city_db in this case.
+func TestIntegration_ConfigError_ExemptCountryEnabled_NotConfigured(t *testing.T) {
+	input := `
+:19094 {
+	fairness {
+		scoring {
+			penalty ipv4_subnet alpha=0.2 soft=100:10 hard=500:40 exempt_country=PT
+		}
+	}
+}
+`
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), `geoip_city_db is not configured`) {
+		t.Errorf("error = %v, want it to mention geoip_city_db is not configured", err)
+	}
+}
+
+func TestIntegration_ConfigError_ExemptCountryEnabled_FailedToOpen(t *testing.T) {
+	badPath := filepath.Join(t.TempDir(), "does-not-exist.mmdb")
+	input := fmt.Sprintf(`
+:19095 {
+	fairness {
+		geoip_city_db %s
+		scoring {
+			penalty ipv4_subnet alpha=0.2 soft=100:10 hard=500:40 exempt_country=PT
+		}
+	}
+}
+`, badPath)
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), "failed to open") {
+		t.Errorf("error = %v, want it to mention the DB failed to open", err)
+	}
+}
+
 // Positive control: enabling `user` against a genuinely working JWKS
 // endpoint must load cleanly -- the three tests above only prove the error
 // paths fire; this proves they don't false-positive on a valid setup.

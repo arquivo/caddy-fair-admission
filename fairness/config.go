@@ -42,11 +42,6 @@ type Config struct {
 	// audience isn't checked.
 	AuthAudience string `json:"auth_audience,omitempty"`
 
-	// ExemptCountries lists ISO 3166-1 alpha-2 country codes that are
-	// exempt from scoring penalties (§4.3) — still tracked/counted
-	// (observability) but never penalized. Repeatable in the Caddyfile.
-	ExemptCountries []string `json:"exempt_countries,omitempty"`
-
 	// IPv6PrefixLength is the IPv6 subnet-bucketing prefix length, 48 or
 	// 56. Zero means "use the default" (56, matching the §5 example).
 	IPv6PrefixLength int `json:"ipv6_prefix_length,omitempty"`
@@ -76,18 +71,4 @@ func (c *Config) ipv6PrefixLength() int {
 		return defaultIPv6PrefixLength
 	}
 	return c.IPv6PrefixLength
-}
-
-// exemptCountrySet returns ExemptCountries as a lookup set. Safe to call on
-// a nil *Config. Retained here (rather than only in scoring, Phase 5) since
-// it's derived purely from this phase's config surface.
-func (c *Config) exemptCountrySet() map[string]bool {
-	if c == nil || len(c.ExemptCountries) == 0 {
-		return nil
-	}
-	set := make(map[string]bool, len(c.ExemptCountries))
-	for _, cc := range c.ExemptCountries {
-		set[cc] = true
-	}
-	return set
 }

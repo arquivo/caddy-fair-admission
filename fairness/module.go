@@ -99,13 +99,13 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // resource simply isn't configured on this block — no pool interaction, no
 // error. It then resolves this block's `scoring { }` overrides and, for any
 // dimension whose scoring depends on one of those resources (asn/country on
-// GeoIP, user on JWKS), verifies the resource actually opened/initialized —
-// not merely that a path/URL was given — hard-erroring at load time
-// otherwise (a typo'd or broken GeoIP DB path/JWKS URL must never silently
-// degrade to a permanently-0-penalty dimension, see REQUIREMENTS.md §4.3
-// design refinement). It also registers this instance with the App
-// (app.go) so the admin introspection API (admin.go, §4.10) can report its
-// live state.
+// GeoIP, user on JWKS, or any dimension configuring exempt_country on the
+// GeoIP city DB), verifies the resource actually opened/initialized — not
+// merely that a path/URL was given — hard-erroring at load time otherwise (a
+// typo'd or broken GeoIP DB path/JWKS URL must never silently degrade to a
+// permanently-0-penalty dimension, see REQUIREMENTS.md §4.3 design
+// refinement). It also registers this instance with the App (app.go) so the
+// admin introspection API (admin.go, §4.10) can report its live state.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	appIface, err := ctx.App("fairness")
 	if err != nil {
@@ -175,6 +175,18 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("fairness: scoring dimension %q is enabled but auth_jwks_url %q failed to initialize — check the URL is reachable and serves a well-formed JWKS", "user", h.AuthJWKSURL)
 		}
 	}
+	for dim, pc := range resolved.Dimensions {
+		if len(pc.ExemptCountries) == 0 {
+			continue
+		}
+		if h.geo.city == nil || h.geo.city.reader == nil {
+			h.releaseAcquired()
+			if h.GeoIPCityDB == "" {
+				return fmt.Errorf("fairness: scoring dimension %q configures exempt_country but geoip_city_db is not configured on this block", dim)
+			}
+			return fmt.Errorf("fairness: scoring dimension %q configures exempt_country but geoip_city_db %q failed to open — check the file exists and is a valid MaxMind City/Country database", dim, h.GeoIPCityDB)
+		}
+	}
 
 	h.scoring = newScoringState(resolved, h.Config.ewmaTickInterval(), h.Config.idleEntryTTL())
 	h.scoring.start()
@@ -236,8 +248,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	now := time.Now()
 	h.scoring.track(classification, now)
-	exempt := h.Config.exemptCountrySet()
-	score, breakdown := h.scoring.computeScoreBreakdown(classification, exempt)
+	score, breakdown := h.scoring.computeScoreBreakdown(classification)
 
 	// Apply the presence-based priority divisor (§4.3) after the identity-
 	// based base/penalty computation above — it's a distinct, stateless
@@ -256,7 +267,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		"asn":             uint64(classification.ASN),
 		"country":         classification.Country,
 		"user_class":      string(classification.UserClass),
-		"exempt":          exempt[classification.Country],
+		"exempt":          h.scoring.countryExempt(classification.Country),
 		"score_breakdown": breakdown,
 	})
 
@@ -305,12 +316,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				h.AuthAudience = d.Val()
-
-			case "exempt_country":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				h.ExemptCountries = append(h.ExemptCountries, d.Val())
 
 			case "ipv6_prefix_length":
 				if !d.NextArg() {
@@ -375,7 +380,8 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	scoring {
 //	    base_score <user_class> <float>                          # repeatable
 //	    penalty <dimension>                                      # repeatable — enables <dimension> with its built-in default tuning
-//	    penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f>   # repeatable — enables <dimension> with explicit tuning
+//	    penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f> [exempt_country=<cc>[,<cc>...]]
+//	                                                              # repeatable — enables <dimension> with explicit tuning; exempt_country is optional
 //	    divisor param <name> <value>                             # repeatable — presence-based priority divisor (§4.3), stacks multiplicatively
 //	    min_score <float>
 //	    max_score <float>
