@@ -44,6 +44,7 @@ scoring {
     base_score <user_class> <float>                          # repeatable, one of 5 classes
     penalty <dimension>                                       # repeatable, one of 6 dimensions — enables it with built-in default tuning
     penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f>   # repeatable — enables it with explicit tuning instead
+    divisor param <name> <value>                              # repeatable — presence-based priority divisor, see below
     min_score <float>
     max_score <float>
 }
@@ -74,6 +75,31 @@ scoring {
   `ip`/`ipv4_subnet`/`ipv6_subnet` have no such prerequisite — they derive purely from the parsed client IP.
 - There is no cross-field validation beyond the above — nothing stops you from setting `min_score`
   above `max_score` or a `soft` threshold above `hard`; both are accepted as-is.
+
+#### Priority divisor: `divisor param <name> <value>`
+
+Separate from the identity-based dimensions above, `divisor param <name> <value>` (repeatable) lets
+a request's *query parameters* — not who's asking, but what they're asking for — adjust its final
+score. It's opt-in like everything else in `scoring { }`: no `divisor param` lines at all means every
+request gets a divisor of `1` (a no-op), same as the "no `penalty` lines → no dimensions active"
+default.
+
+- Presence-based, not value-based: a configured `<name>` contributes its `<value>` as soon as that
+  query parameter is present at all, regardless of what it's set to — `?matchType=prefix` and
+  `?matchType=` divide the score identically. This deliberately avoids parsing/validating the
+  parameter's actual value; presence alone is the signal.
+- Multiple present parameters **multiply**, they don't add: `divisor param matchType 1.25` and
+  `divisor param timeline 2` both present on the same request combine into a divisor of `2.5`, not
+  `3.25`.
+- `<value>` must be `> 0` — a Caddyfile parse-time error otherwise. A divisor `> 1` deprioritizes the
+  request (an expensive parameter, like CDXJ's `matchType` or Page Search's `timeline`); a divisor
+  `< 1` boosts it — symmetric around `1.0`, whichever direction the parameter's actual cost warrants.
+- Applied strictly after the identity-based `base_score`/`penalty` computation above: `final_score =
+  clamp(base_score[user_class] - total_penalty, min_score, max_score) / divisor`. It never touches
+  `adaptive_admission`'s concurrency/capacity accounting (§6/§7) — every ticket still costs exactly
+  `1` unit of capacity; the divisor only reorders the priority queue.
+- A repeated `divisor param` line for the same `<name>` within one block fully overwrites the earlier
+  one, same last-line-wins rule as `penalty`.
 
 
 ## 2. What EWMA is, and why

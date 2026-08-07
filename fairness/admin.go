@@ -87,6 +87,7 @@ type backendScoringStatus struct {
 	MinScore             float64                  `json:"min_score"`
 	MaxScore             float64                  `json:"max_score"`
 	Dimensions           map[string]PenaltyConfig `json:"dimensions"`
+	Divisors             map[string]float64       `json:"divisors"`
 	DimensionEntryCounts map[string]int           `json:"dimension_entry_counts"`
 }
 
@@ -125,6 +126,7 @@ func (a *AdminAPI) handleStatus(w http.ResponseWriter, r *http.Request) error {
 			MinScore:             cfg.MinScore,
 			MaxScore:             cfg.MaxScore,
 			Dimensions:           cfg.Dimensions,
+			Divisors:             cfg.Divisors,
 			DimensionEntryCounts: h.scoring.entryCounts(),
 		})
 	}

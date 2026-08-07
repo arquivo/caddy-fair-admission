@@ -70,6 +70,16 @@
 			penalty country     alpha=0.2 soft=2000:10 hard=10000:40
 			penalty user        alpha=0.2 soft=20:10   hard=100:40
 
+			# Presence-based priority divisor (docs/configuration.md §1.1's
+			# "Priority divisor" subsection): a request's own query params,
+			# not its identity, adjust its score. Opt-in and multiplicative --
+			# a request with both matchType and timeline present divides by
+			# 1.25*2 = 2.5. These are illustrative placeholders, not measured
+			# cost ratios -- see the subsection for how to derive real values.
+			divisor param matchType   1.25
+			divisor param timeline    2
+			divisor param yearBalance 1.5
+
 			# Clamp bounds for the final score after all penalties are
 			# summed and subtracted from the base score.
 			min_score 0

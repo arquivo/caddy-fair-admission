@@ -238,6 +238,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	h.scoring.track(classification, now)
 	exempt := h.Config.exemptCountrySet()
 	score, breakdown := h.scoring.computeScoreBreakdown(classification, exempt)
+
+	// Apply the presence-based priority divisor (§4.3) after the identity-
+	// based base/penalty computation above — it's a distinct, stateless
+	// per-request adjustment, not part of the EWMA penalty math.
+	if divisor := h.scoring.priorityDivisor(r.URL.Query()); divisor != 1 {
+		score /= divisor
+		breakdown["final"] = score
+	}
 	caddyhttp.SetVar(r.Context(), fairnessScoreVarKey, score)
 
 	backend := h.Config.backendLabel()
@@ -368,6 +376,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    base_score <user_class> <float>                          # repeatable
 //	    penalty <dimension>                                      # repeatable — enables <dimension> with its built-in default tuning
 //	    penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f>   # repeatable — enables <dimension> with explicit tuning
+//	    divisor param <name> <value>                             # repeatable — presence-based priority divisor (§4.3), stacks multiplicatively
 //	    min_score <float>
 //	    max_score <float>
 //	}
@@ -434,6 +443,24 @@ func parseScoringBlock(d *caddyfile.Dispenser) (*scoringOverrides, error) {
 				return nil, d.Errf("invalid min_score %q: %v", d.Val(), err)
 			}
 			o.MinScore = &v
+
+		case "divisor":
+			args := d.RemainingArgs()
+			if len(args) != 3 || args[0] != "param" {
+				return nil, d.Errf("expected 'divisor param <name> <value>'")
+			}
+			name := args[1]
+			v, err := strconv.ParseFloat(args[2], 64)
+			if err != nil {
+				return nil, d.Errf("invalid divisor value %q for param %q: %v", args[2], name, err)
+			}
+			if v <= 0 {
+				return nil, d.Errf("divisor for param %q must be > 0, got %v", name, v)
+			}
+			if o.Divisors == nil {
+				o.Divisors = make(map[string]float64)
+			}
+			o.Divisors[name] = v
 
 		case "max_score":
 			if !d.NextArg() {

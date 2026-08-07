@@ -56,6 +56,15 @@
 		# is also the only dimension scored at all on this backend --
 		# ipv4_subnet/ipv6_subnet/asn/country/user are never tracked here.
 		penalty ip alpha=0.2 soft=20:-10 hard=100:-40
+
+		# Presence-based priority divisor (docs/configuration.md §1.1's
+		# "Priority divisor" subsection): matchType/timeline/yearBalance are
+		# more expensive query params for this API, so a request naming any
+		# of them is deprioritized in the queue -- capacity accounting is
+		# untouched, only ordering. Illustrative values, not measured ones.
+		divisor param matchType   1.25
+		divisor param timeline    2
+		divisor param yearBalance 1.5
 	}
 }
 

@@ -240,6 +240,43 @@ both.
   unreachable JWKS URL) is a hard Caddy config-load error, distinct from the existing per-request
   runtime fail-open (a configured, successfully-opened resource that just has no data for one
   specific IP still fails open for that request, unchanged).
+- **Request-shape priority divisor, new in this addendum (2026-08-07) — distinct from the
+  identity-based dimension penalties above.** Motivated by request shapes that predictably cost the
+  backend more, or less, than a default request: CDXJ's `matchType` (default `exact` is a bounded
+  point lookup; `prefix`/`host`/`domain` are unbounded range scans) and Page Search `/textsearch`'s
+  `timeline`/`yearBalance` params, each of which triggers materially more backend work than a
+  default query. Unlike the dimension penalties, this is **presence-based and stateless** — driven
+  purely by whether a configured query parameter is present on *this* request, never its value and
+  never any accumulated EWMA history: nobody bothers explicitly passing `matchType=exact` (the
+  default), so the key's mere presence already signals "this request chose a pricier mode." An
+  earlier draft modeled this as variable capacity cost (`Controller.Acquire(cost)` in
+  `adaptive_admission`); that was abandoned as more complexity than the benefit was worth (it forced
+  reconciling variable per-ticket cost with §4.5's "acquire capacity before popping the queue head"
+  invariant) in favor of this — a pure adjustment to the score itself, computed here, alongside the
+  rest of scoring, rather than a second mechanism living in a different module.
+  - Config surface: `divisor param <name> <value>` lines inside the same `scoring { }` block as the
+    dimension `penalty` lines (§5) — opt-in, same as the dimension penalties: a block with no
+    `divisor param` lines configured defaults every request's divisor to `1`, a no-op.
+  - `final_score = (base_score[user_class] - penalty) / divisor`, where `divisor = product(value for
+    every configured "param <name>" present in the query string)`. Multiple present params
+    **multiply**, not add — e.g. `matchType divisor=1.25` and `timeline divisor=2` both present on
+    one request → total divisor `2.5`. `divisor > 1` deprioritizes (expensive param present);
+    `divisor < 1` boosts (cheap param present) — symmetric around `1.0` (a no-op). Must be `> 0`.
+  - Computed in the same place and at the same time as the rest of the score, before `fairness` ever
+    hands the final number to `adaptive_admission` via `caddyhttp.SetVar` (§3.1) —
+    `adaptive_admission` sees one opaque score exactly as it always has; it has no idea a divisor was
+    ever applied, and nothing about capacity control (§4.4) or the dispatch loop (§4.5) changes.
+    Folding "who is asking" (identity, accumulated over time) and "what they're asking for" (request
+    shape, this request only) into the same number is deliberate: both are really just contributors
+    to one thing, this request's admission priority. Under contention, a cheap request from a
+    low-trust class can now outrank an expensive request from a high-trust class — intended, not a
+    bug.
+  - **This document does not set real divisor values** (§5's example values are illustrative only).
+    Real divisors should come from measuring actual latency ratios per parameter — via the existing
+    `/loadtest` harness and the adaptive controller's per-backend p95/mean tracking (§4.4, §8) —
+    against a baseline request with none of the configured params present, not from guessing
+    plausible-looking numbers. The resulting score (§4.9's "full score breakdown") already covers
+    logging this — no separate log field needed.
 
 ### 4.4 Capacity control (`app/capacity.py`) — `adaptive_admission`
 
@@ -257,8 +294,10 @@ both.
   `notify(cost)` not `notify_all()` — must be designed in correctly from the start in Go, i.e. use
   `sync.Cond.Signal()` in a loop bounded by freed cost, or an equivalent bounded-wake primitive, not
   `Broadcast()` on every release).
-- `cost` is uniform (`1`) for v1, matching the Python system's decision log — do not build
-  per-request variable cost unless explicitly requested later.
+- `cost` is uniform (`1`), matching the Python system's decision log — this remains true even after
+  §4.3's request-shape priority divisor addition, which is folded into the score `fairness` computes
+  and hands off (§3.1) and never touches the value passed to `Acquire`/`Release`. Per-request
+  variable *capacity* cost is still explicitly out of scope (§6).
 
 ### 4.5 Scheduling / priority queue (`app/scheduler.py`, `app/errors.py`) — `adaptive_admission`
 
@@ -270,7 +309,10 @@ both.
   (`queue_full` vs `queue_wait_exceeded`).
 - Worker acquires capacity **before** popping the queue head, so admission always reflects current
   priority order, not queue-time snapshot order (only correct because cost is uniformly 1 — call
-  this out as a load-bearing assumption in code comments, same as the Python source does).
+  this out as a load-bearing assumption in code comments, same as the Python source does). This
+  remains intact under §4.3's request-shape priority divisor, since that mechanism only changes the
+  score value `fairness` computes before `adaptive_admission` ever sees it — it never changes what
+  `Acquire`/`Release` are called with, so there is no conflict between the two to resolve.
 
 ### 4.6 Load balancing (`app/load_balancer.py`) — `adaptive_admission`
 
@@ -394,6 +436,10 @@ handle_path /textsearch* {
                 base_score anonymous  60
                 penalty ip alpha=0.2 soft=20:-10 hard=100:-40
                 # ... per-dimension overrides
+
+                divisor param matchType    1.25
+                divisor param timeline     2
+                divisor param yearBalance  1.5
             }
         }
 
@@ -456,7 +502,10 @@ Caddyfile global-options block of its own.
 ## 6. Non-goals for v1 (carried forward from the Python system's documented scope cuts)
 
 - No dry-run/observe-only mode (unless requested later).
-- No per-request variable cost — cost is uniformly 1.
+- No per-request variable *capacity* cost — `cost` passed to `Acquire`/`Release` is uniformly `1`
+  (§4.4). §4.3 adds a separate, presence-based *priority* divisor that adjusts `fairness`'s score
+  only and never touches capacity accounting — that mechanism is in scope, this non-goal is not
+  affected by it.
 - No cross-instance shared state — single Caddy process per host is the target deployment;
   multi-instance clustering (and whatever external store it would require) is out of scope, same as
   it was cut from the Python system.
@@ -504,6 +553,20 @@ Caddyfile global-options block of its own.
    (§3.1/§5)~~ — **decided:** enforced via `httpcaddyfile.RegisterOrder` (`fairness` immediately
    before `adaptive_admission`); explicit `route { ... }` wrapping remains valid but is no longer
    required.
+8. **Open — flagged for future discussion, not decided here (2026-08-07):** should an already-queued
+   ticket be actively evicted with `RejectQueueWaitExceeded`/429 (the same reason and status code as
+   the existing join-time rejection, §4.5) once its own wait has exceeded `queue_timeout`, rather
+   than only checking a *projected* wait for new arrivals at `Enqueue` time? Today there is no
+   deadline enforcement on a ticket once it's queued: `Scheduler.Enqueue` (queue.go) only rejects
+   requests *joining* the queue, via a Little's-law projection; nothing re-checks a ticket that's
+   already sitting in the heap, and `module.go`'s `<-ticket.Granted()` is an unconditional blocking
+   receive with no `select` on `r.Context().Done()` or any deadline. In principle a burst of
+   higher-score arrivals could keep pushing a lower-score ticket back indefinitely. Rough idea, not
+   designed here: give each ticket a deadline (`enqueue time + queue_timeout`) and have the dispatch
+   loop, or a lightweight periodic sweep, reject tickets past that deadline the same way join-time
+   rejection already works. Needs its own design pass (data structure for efficiently finding expired
+   tickets in a score-ordered heap, interaction with §4.3's priority divisor, whether this is even
+   worth the added complexity) before it's decided one way or the other.
 
 ## 8. Performance requirements and lessons from the Python implementation
 
