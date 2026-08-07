@@ -1,0 +1,74 @@
+# Keycloak as the JWT issuer feeding the `user` scoring dimension and
+# researcher queue priority (docs/configuration.md §9 has the full
+# walkthrough, including the Keycloak-side realm/client/mapper setup).
+#
+# Any bearer token Keycloak issues is verified against its JWKS endpoint
+# (RS256, signature + issuer + audience) -- this never rejects a request on
+# its own (docs/configuration.md §1, §4): no token or a failed verification
+# just falls back to the anonymous/unknown base score. A verified researcher
+# token gets the maximum base score, which is exactly what
+# adaptive_admission's priority queue orders on (docs/configuration.md §7) --
+# so under load, researchers are served ahead of anonymous traffic without
+# ever being rejected outright.
+#
+# Validate with:
+#   caddy validate --config examples/fairness-keycloak.Caddyfile --adapter caddyfile
+
+:8080 {
+	fairness {
+		backend page-search-api
+
+		# Keycloak's realm issuer and JWKS endpoint -- the standard
+		# well-known paths for any realm, here for a realm named
+		# "arquivo" on an idp.example.org Keycloak instance.
+		auth_issuer   https://idp.example.org/realms/arquivo
+		auth_jwks_url https://idp.example.org/realms/arquivo/protocol/openid-connect/certs
+		# Must match the `aud` claim Keycloak puts in tokens for the
+		# client this API expects to see -- add an audience mapper on
+		# that client in Keycloak if it doesn't already send one.
+		auth_audience page-search-api
+
+		scoring {
+			# Keycloak-verified researchers (via a `user_class`
+			# claim of "researcher" -- see docs/configuration.md §9
+			# for the protocol-mapper config that sets this) start
+			# at the maximum base score.
+			base_score researcher      100
+			base_score service_account 100
+			base_score anonymous       60
+			base_score unknown         60
+
+			# Track per-user request rate so even an authenticated
+			# researcher's own runaway script gets deprioritized
+			# rather than left unchecked -- soft-only in spirit
+			# here (the hard tier still exists but sits well above
+			# normal researcher usage).
+			penalty user alpha=0.2 soft=20:10 hard=100:40
+			# Anonymous/unauthenticated traffic is still tracked
+			# per-IP at the built-in defaults.
+			penalty ip
+		}
+	}
+
+	adaptive_admission {
+		backend page-search-api
+
+		controller adaptive {
+			min_concurrency        10
+			initial_concurrency    40
+			max_concurrency        200
+			target_p95             800ms
+			timeout_rate_threshold 0.05
+			error_rate_threshold   0.05
+			adjust_interval        30s
+		}
+
+		# Under load, a queued researcher request (score 100, minus
+		# any per-user penalty) is always dequeued ahead of queued
+		# anonymous traffic (score 60) -- docs/configuration.md §7.
+		queue_max_size 500
+		queue_timeout  10s
+	}
+
+	reverse_proxy page-search-api-1:8080 page-search-api-2:8080
+}
