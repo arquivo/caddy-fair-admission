@@ -18,8 +18,6 @@ func TestUnmarshalCaddyfile_BasicDirectives(t *testing.T) {
 		auth_issuer   https://sso.example.org/realms/arquivo
 		auth_jwks_url https://sso.example.org/realms/arquivo/protocol/openid-connect/certs
 		auth_audience arquivo-api
-		exempt_country PT
-		exempt_country ES
 		ipv6_prefix_length 48
 		ewma_tick_interval 1s
 		idle_entry_ttl 10m
@@ -45,9 +43,6 @@ func TestUnmarshalCaddyfile_BasicDirectives(t *testing.T) {
 	}
 	if h.AuthAudience != "arquivo-api" {
 		t.Errorf("AuthAudience = %q", h.AuthAudience)
-	}
-	if len(h.ExemptCountries) != 2 || h.ExemptCountries[0] != "PT" || h.ExemptCountries[1] != "ES" {
-		t.Errorf("ExemptCountries = %v", h.ExemptCountries)
 	}
 	if h.IPv6PrefixLength != 48 {
 		t.Errorf("IPv6PrefixLength = %d", h.IPv6PrefixLength)

@@ -28,9 +28,6 @@
 # of the classification/scoring block itself so it can be `import`ed twice
 # without repeating every field).
 (shared_fairness_defaults) {
-	# PT traffic is never penalized on the country dimension (still tracked
-	# for observability -- see docs/configuration.md §5).
-	exempt_country PT
 	# IPv6 client addresses are aggregated at a /56 for the ipv6_subnet
 	# dimension (the only other valid value is 48 -- docs/configuration.md §1).
 	ipv6_prefix_length 56

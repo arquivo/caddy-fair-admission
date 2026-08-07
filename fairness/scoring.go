@@ -110,6 +110,14 @@ type PenaltyConfig struct {
 	SoftPenalty   float64
 	HardThreshold float64
 	HardPenalty   float64
+	// ExemptCountries lists ISO 3166-1 alpha-2 country codes exempt from
+	// *this* dimension's penalty (§4.3) — still tracked/counted
+	// (observability) but never penalized. Per-dimension rather than
+	// global: which countries warrant exemption differs by dimension (e.g.
+	// a country expected to legitimately dominate ipv4_subnet/asn/country
+	// traffic still needs its individual abusers rate-limited via `ip`).
+	// Nil means no exemption for this dimension.
+	ExemptCountries map[string]bool
 }
 
 // ScoringConfig is a fairness handler's fully-resolved scoring configuration
@@ -579,8 +587,8 @@ func (s *scoringState) entryCounts() map[string]int {
 // (§4.3). It's a thin wrapper around computeScoreBreakdown that discards the
 // per-dimension detail — see that method for the full contract (fail-open
 // behavior, exempt-country handling, etc.).
-func (s *scoringState) computeScore(c Classification, exemptCountries map[string]bool) float64 {
-	score, _ := s.computeScoreBreakdown(c, exemptCountries)
+func (s *scoringState) computeScore(c Classification) float64 {
+	score, _ := s.computeScoreBreakdown(c)
 	return score
 }
 
@@ -589,9 +597,12 @@ func (s *scoringState) computeScore(c Classification, exemptCountries map[string
 // max). Each dimension contributes independently based on its *current*
 // EWMARPS (as of the last completed tick — this does not compute a "live"
 // EWMA mid-tick, per the task spec). A dimension the request doesn't apply to
-// (dimensionKey ok=false) contributes 0. The country dimension is still
-// tracked/read normally when exempt, but its penalty is always excluded from
-// the sum regardless of its EWMARPS (§4.3 exempt-country behavior).
+// (dimensionKey ok=false) contributes 0. A dimension is still tracked/read
+// normally when its own PenaltyConfig.ExemptCountries lists c.Country, but
+// its penalty is then always excluded from the sum regardless of its EWMARPS
+// (§4.3 exempt-country behavior) — the exemption is per-dimension, not
+// global, so the same request can be exempt on one dimension and penalized
+// on another.
 //
 // The returned map (for §4.9's structured logging, via module.go) carries
 // "base", "penalty_<dimension>" (only for dimensions that actually
@@ -602,7 +613,7 @@ func (s *scoringState) computeScore(c Classification, exemptCountries map[string
 // Fail-open (§4.3): a nil *scoringState (e.g. a Handler used without
 // Provision, as in some unit tests) returns the class's base score from
 // hardcoded defaults with zero penalty, never panics.
-func (s *scoringState) computeScoreBreakdown(c Classification, exemptCountries map[string]bool) (float64, map[string]float64) {
+func (s *scoringState) computeScoreBreakdown(c Classification) (float64, map[string]float64) {
 	if s == nil {
 		defaults := newDefaultScoringConfig()
 		base := baseScoreFor(defaults.BaseScores, c.UserClass)
@@ -618,8 +629,9 @@ func (s *scoringState) computeScoreBreakdown(c Classification, exemptCountries m
 		if !ok {
 			continue
 		}
-		if dim == "country" && exemptCountries[c.Country] {
-			// Exempt: still tracked (observability) but never penalized.
+		if pc.ExemptCountries[c.Country] {
+			// Exempt on this dimension: still tracked (observability) but
+			// never penalized.
 			continue
 		}
 		rps := s.entryEWMARPS(dim, key)
@@ -634,6 +646,24 @@ func (s *scoringState) computeScoreBreakdown(c Classification, exemptCountries m
 	breakdown["total_penalty"] = totalPenalty
 	breakdown["final"] = final
 	return final, breakdown
+}
+
+// countryExempt reports whether country is exempt from at least one enabled
+// dimension's penalty (§4.3) — a summary used only for the "exempt" field in
+// module.go's structured-log hand-off. The authoritative per-dimension
+// suppression happens in computeScoreBreakdown via each dimension's own
+// PenaltyConfig.ExemptCountries; this just answers "was this request's
+// country on any exempt list at all" for observability. Nil-safe.
+func (s *scoringState) countryExempt(country string) bool {
+	if s == nil || country == "" {
+		return false
+	}
+	for _, pc := range s.cfg.Dimensions {
+		if pc.ExemptCountries[country] {
+			return true
+		}
+	}
+	return false
 }
 
 // priorityDivisor returns the combined priority divisor for a request
@@ -664,8 +694,9 @@ func (s *scoringState) priorityDivisor(query map[string][]string) float64 {
 
 // parsePenaltyArgs parses the space-separated key=value tokens following
 // `penalty <dimension>` (alpha=<float>, soft=<float>:<float>,
-// hard=<float>:<float>), in any order — all three required. See
-// PenaltyConfig's doc comment for the soft/hard penalty sign convention.
+// hard=<float>:<float>, and the optional exempt_country=<CC>[,<CC>...]), in
+// any order — alpha/soft/hard are all required, exempt_country is optional.
+// See PenaltyConfig's doc comment for the soft/hard penalty sign convention.
 func parsePenaltyArgs(args []string) (PenaltyConfig, error) {
 	var pc PenaltyConfig
 	var haveAlpha, haveSoft, haveHard bool
@@ -700,6 +731,13 @@ func parsePenaltyArgs(args []string) (PenaltyConfig, error) {
 			pc.HardThreshold, pc.HardPenalty = thr, pen
 			haveHard = true
 
+		case "exempt_country":
+			codes, err := parseExemptCountry(val)
+			if err != nil {
+				return pc, err
+			}
+			pc.ExemptCountries = codes
+
 		default:
 			return pc, fmt.Errorf("unrecognized penalty key %q", key)
 		}
@@ -709,6 +747,22 @@ func parsePenaltyArgs(args []string) (PenaltyConfig, error) {
 		return pc, fmt.Errorf("penalty requires alpha=, soft=, and hard= (all three required), got %q", strings.Join(args, " "))
 	}
 	return pc, nil
+}
+
+// parseExemptCountry parses exempt_country=<CC>[,<CC>...]'s comma-separated
+// value into a lookup set of ISO 3166-1 alpha-2 codes. Exact string match, no
+// wildcards/case-folding — matching Classification.Country's raw GeoIP
+// output.
+func parseExemptCountry(val string) (map[string]bool, error) {
+	parts := strings.Split(val, ",")
+	codes := make(map[string]bool, len(parts))
+	for _, cc := range parts {
+		if cc == "" {
+			return nil, fmt.Errorf("exempt_country contains an empty country code in %q", val)
+		}
+		codes[cc] = true
+	}
+	return codes, nil
 }
 
 // parseThresholdPenalty parses a "threshold:penalty" token (e.g. "20:-10")

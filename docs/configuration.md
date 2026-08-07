@@ -23,7 +23,6 @@ across blocks with Caddy's native `import`/named-snippet mechanism. See
 | `auth_issuer <string>` | 1 | `""` | Expected JWT `iss` claim; not itself validated at parse time. |
 | `auth_jwks_url <url>` | 1 | `""` (auth disabled) | JWKS endpoint for verifying bearer tokens (RS256), refreshed on a background loop. |
 | `auth_audience <string>` | 1 | `""` | Expected JWT `aud` claim; not itself validated at parse time. |
-| `exempt_country <ISO-3166-1 alpha-2>` | 1, repeatable | none | Marks a country as exempt from `country`-dimension penalties (see §5). Exact string match. |
 | `ipv6_prefix_length <int>` | 1 | `56` | **Must be exactly `48` or `56`** — any other value is a Caddyfile parse error. |
 | `ewma_tick_interval <duration>` | 1 | `1s` | How often the EWMA updater re-evaluates every tracked entity's rate (see §2). |
 | `idle_entry_ttl <duration>` | 1 | `10m` | Entities with no traffic for longer than this are garbage-collected. Swept by a fixed, non-configurable 1-minute ticker; reclaimed strictly when idle time is `>` the TTL, not `>=`. |
@@ -43,7 +42,8 @@ one with zero `penalty` lines, gives every request its class's flat `base_score`
 scoring {
     base_score <user_class> <float>                          # repeatable, one of 5 classes
     penalty <dimension>                                       # repeatable, one of 6 dimensions — enables it with built-in default tuning
-    penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f>   # repeatable — enables it with explicit tuning instead
+    penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f> [exempt_country=<cc>[,<cc>...]]
+                                                               # repeatable — enables it with explicit tuning; exempt_country is optional
     divisor param <name> <value>                              # repeatable — presence-based priority divisor, see below
     min_score <float>
     max_score <float>
@@ -55,10 +55,12 @@ scoring {
   are enabled — applies even with zero `penalty` lines.
 - `penalty <dimension>` — enables that dimension using its built-in default tuning (§3's table)
   without needing to restate the numbers.
-- `penalty <dimension> alpha=.. soft=t:p hard=t:p` — enables that dimension with explicit EWMA/
-  penalty tuning (§2/§3) instead of the defaults. `alpha=`, `soft=`, and `hard=` are all required
-  together, in any order. `soft=`/`hard=` are `threshold:penalty` pairs; the penalty's sign is
-  cosmetic (magnitude is normalized internally), so `soft=20:-10` and `soft=20:10` are equivalent.
+- `penalty <dimension> alpha=.. soft=t:p hard=t:p [exempt_country=<cc>[,<cc>...]]` — enables that
+  dimension with explicit EWMA/penalty tuning (§2/§3) instead of the defaults. `alpha=`, `soft=`,
+  and `hard=` are all required together, in any order. `soft=`/`hard=` are `threshold:penalty`
+  pairs; the penalty's sign is cosmetic (magnitude is normalized internally), so `soft=20:-10` and
+  `soft=20:10` are equivalent. `exempt_country=` is optional and independent of the other three —
+  see §5.
 - A repeated `penalty <dimension>` line for the same dimension within one block fully overwrites the
   earlier one — including switching between bare and explicit-tuning form. Last line wins.
 - `min_score <float>` / `max_score <float>` — clamp bounds for the final score (default `0`/`100`).
@@ -73,6 +75,9 @@ scoring {
     otherwise fail open silently and go unnoticed by the operator.
 
   `ip`/`ipv4_subnet`/`ipv6_subnet` have no such prerequisite — they derive purely from the parsed client IP.
+  A dimension configuring `exempt_country=` has the same requirement against `geoip_city_db`
+  regardless of which dimension it's attached to (see §5) — e.g. `penalty asn ... exempt_country=PT`
+  requires a working `geoip_city_db` even though `asn` itself only depends on `geoip_asn_db`.
 - There is no cross-field validation beyond the above — nothing stops you from setting `min_score`
   above `max_score` or a `soft` threshold above `hard`; both are accepted as-is.
 
@@ -210,14 +215,39 @@ condition), so it isn't trusted *less* than presenting no token at all.
 
 ## 5. Exempt countries
 
-`exempt_country <CC>` (repeatable, exact ISO 3166-1 alpha-2 match, no wildcards/case-folding) marks
-a country whose `country`-dimension penalty never contributes to `total_penalty`. This only has an
-observable effect if `country` is actually enabled via `penalty country` (§1.1) — otherwise there's
-no `country` penalty to exempt from in the first place. When enabled, the dimension is still tracked
-and counted for observability (visible via `/fairness/status`'s `dimension_entry_counts`, see
-[`monitoring.md`](monitoring.md)) even for exempt countries — exemption only suppresses its penalty
-contribution, and has no effect on the other dimensions (`ip`/`ipv4_subnet`/`ipv6_subnet`/`asn`/`user` are
-evaluated independently regardless of country).
+`exempt_country=<CC>[,<CC>...]` (§1.1, exact ISO 3166-1 alpha-2 match, no wildcards/case-folding) is
+an optional arg on any `penalty <dimension>` line, marking one or more countries whose penalty on
+*that specific dimension* never contributes to `total_penalty`. It is per-dimension, not global —
+attaching it to one dimension has no effect on any other dimension's penalty for the same request.
+
+This matters because the dimensions this system tracks fall into two different shapes:
+
+- **Aggregate dimensions** (`ipv4_subnet`, `ipv6_subnet`, `asn`, `country`) are shared by many
+  distinct real users at once — a whole subnet, ASN, or country's traffic. A country that
+  legitimately dominates a backend's aggregate traffic (e.g. the operator's home country) will
+  routinely exceed these dimensions' thresholds on ordinary, non-abusive load, and penalizing it
+  there punishes innocent traffic sharing that address space.
+- **`ip`** identifies a single client. Individual-IP abuse from that same "home" country is exactly
+  the kind of behavior these dimensions exist to catch, and must **not** be exempted just because
+  the country is exempted elsewhere.
+
+Configuring `exempt_country=PT` on `ipv4_subnet`/`ipv6_subnet`/`asn`/`country` but leaving it off
+`ip` gets both properties at once: aggregate traffic from that country is never penalized, while a
+single abusive IP within it still is.
+
+```caddyfile
+penalty ip          alpha=0.2 soft=20:10   hard=100:40
+penalty ipv4_subnet alpha=0.2 soft=100:10  hard=500:40  exempt_country=PT
+penalty asn         alpha=0.2 soft=500:10  hard=2000:40 exempt_country=PT
+penalty country     alpha=0.2 soft=2000:10 hard=10000:40 exempt_country=PT,ES,FR
+```
+
+Any dimension configuring `exempt_country=` requires a working `geoip_city_db` (§1.1) — this applies
+even to a dimension whose own scoring doesn't otherwise depend on GeoIP, e.g. `asn` normally only
+needs `geoip_asn_db`, but `penalty asn ... exempt_country=PT` also requires `geoip_city_db` to
+resolve the country to check against. The dimension is still tracked and counted for observability
+(visible via `/fairness/status`'s `dimension_entry_counts`, see [`monitoring.md`](monitoring.md))
+even for exempt countries — exemption only suppresses that dimension's penalty contribution.
 
 ## 6. `adaptive_admission` block
 
