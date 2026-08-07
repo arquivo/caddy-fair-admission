@@ -126,7 +126,7 @@ func TestResolveScoringConfig_OverrideOnlyAffectsItsOwnDimension(t *testing.T) {
 
 	// No other dimension was enabled on this block, so none of them should
 	// even be present in the resolved config.
-	for _, dim := range []string{"net24", "net6", "asn", "country", "user"} {
+	for _, dim := range []string{"ipv4_subnet", "ipv6_subnet", "asn", "country", "user"} {
 		if _, ok := resolvedA.Dimensions[dim]; ok {
 			t.Errorf("dimension %q on overriding block is present (%+v), want absent (never enabled)", dim, resolvedA.Dimensions[dim])
 		}
@@ -456,10 +456,10 @@ func TestDimensionKey(t *testing.T) {
 	}{
 		{"ip present", "ip", Classification{IP: "203.0.113.5"}, "203.0.113.5", true},
 		{"ip absent", "ip", Classification{}, "", false},
-		{"net24 present", "net24", Classification{Net24: "203.0.113.0/24"}, "203.0.113.0/24", true},
-		{"net24 absent (ipv6 request)", "net24", Classification{NetV6: "2001:db8::/56"}, "", false},
-		{"net6 present", "net6", Classification{NetV6: "2001:db8::/56"}, "2001:db8::/56", true},
-		{"net6 absent (ipv4 request)", "net6", Classification{Net24: "203.0.113.0/24"}, "", false},
+		{"ipv4_subnet present", "ipv4_subnet", Classification{Net24: "203.0.113.0/24"}, "203.0.113.0/24", true},
+		{"ipv4_subnet absent (ipv6 request)", "ipv4_subnet", Classification{NetV6: "2001:db8::/56"}, "", false},
+		{"ipv6_subnet present", "ipv6_subnet", Classification{NetV6: "2001:db8::/56"}, "2001:db8::/56", true},
+		{"ipv6_subnet absent (ipv4 request)", "ipv6_subnet", Classification{Net24: "203.0.113.0/24"}, "", false},
 		{"asn present", "asn", Classification{ASN: 64500}, "64500", true},
 		{"asn zero (unavailable)", "asn", Classification{ASN: 0}, "", false},
 		{"country present", "country", Classification{Country: "PT"}, "PT", true},
@@ -497,7 +497,7 @@ func TestUnmarshalCaddyfile_ScoringBlock_RoundTrips(t *testing.T) {
 			base_score researcher 100
 			base_score anonymous  60
 			penalty ip alpha=0.2 soft=20:-10 hard=100:-40
-			penalty net24 alpha=0.3 soft=150:-15 hard=600:-45
+			penalty ipv4_subnet alpha=0.3 soft=150:-15 hard=600:-45
 			min_score 0
 			max_score 100
 		}
@@ -524,16 +524,16 @@ func TestUnmarshalCaddyfile_ScoringBlock_RoundTrips(t *testing.T) {
 	if resolved.Dimensions["ip"] != wantIP {
 		t.Errorf("Dimensions[ip] = %+v, want %+v", resolved.Dimensions["ip"], wantIP)
 	}
-	wantNet24 := PenaltyConfig{Alpha: 0.3, SoftThreshold: 150, SoftPenalty: 15, HardThreshold: 600, HardPenalty: 45}
-	if resolved.Dimensions["net24"] != wantNet24 {
-		t.Errorf("Dimensions[net24] = %+v, want %+v", resolved.Dimensions["net24"], wantNet24)
+	wantIPv4Subnet := PenaltyConfig{Alpha: 0.3, SoftThreshold: 150, SoftPenalty: 15, HardThreshold: 600, HardPenalty: 45}
+	if resolved.Dimensions["ipv4_subnet"] != wantIPv4Subnet {
+		t.Errorf("Dimensions[ipv4_subnet] = %+v, want %+v", resolved.Dimensions["ipv4_subnet"], wantIPv4Subnet)
 	}
 	if resolved.MinScore != 0 || resolved.MaxScore != 100 {
 		t.Errorf("MinScore/MaxScore = %v/%v, want 0/100", resolved.MinScore, resolved.MaxScore)
 	}
 	// Dimensions not mentioned at all are never enabled -- opt-in, not
 	// defaulted.
-	for _, dim := range []string{"net6", "asn", "country", "user"} {
+	for _, dim := range []string{"ipv6_subnet", "asn", "country", "user"} {
 		if _, ok := resolved.Dimensions[dim]; ok {
 			t.Errorf("Dimensions[%s] = %+v, want absent (never enabled by a penalty line)", dim, resolved.Dimensions[dim])
 		}

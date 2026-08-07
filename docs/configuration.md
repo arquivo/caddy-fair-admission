@@ -71,7 +71,7 @@ scoring {
     file, corrupt `.mmdb`, unreachable/malformed JWKS URL) — catching a typo'd path/URL that would
     otherwise fail open silently and go unnoticed by the operator.
 
-  `ip`/`net24`/`net6` have no such prerequisite — they derive purely from the parsed client IP.
+  `ip`/`ipv4_subnet`/`ipv6_subnet` have no such prerequisite — they derive purely from the parsed client IP.
 - There is no cross-field validation beyond the above — nothing stops you from setting `min_score`
   above `max_score` or a `soft` threshold above `hard`; both are accepted as-is.
 
@@ -151,8 +151,8 @@ explicit `alpha=`/`soft=`/`hard=` given:
 | Dimension | Tracks | Applies to | alpha | soft (threshold:penalty) | hard (threshold:penalty) |
 |---|---|---|---|---|---|
 | `ip` | single client IP | any resolved IP | 0.2 | 20 : 10 | 100 : 40 |
-| `net24` | IPv4 `/24` subnet | IPv4 only | 0.2 | 100 : 10 | 500 : 40 |
-| `net6` | IPv6 `/48` or `/56` (per `ipv6_prefix_length`) | IPv6 only | 0.2 | 100 : 10 | 500 : 40 |
+| `ipv4_subnet` | IPv4 `/24` subnet | IPv4 only | 0.2 | 100 : 10 | 500 : 40 |
+| `ipv6_subnet` | IPv6 `/48` or `/56` (per `ipv6_prefix_length`) | IPv6 only | 0.2 | 100 : 10 | 500 : 40 |
 | `asn` | autonomous system | GeoIP ASN DB configured & resolves | 0.2 | 500 : 10 | 2000 : 40 |
 | `country` | country | GeoIP city DB configured & resolves | 0.2 | 2000 : 10 | 10000 : 40 |
 | `user` | JWT subject | authenticated requests only | 0.2 | 20 : 10 | 100 : 40 |
@@ -190,7 +190,7 @@ observable effect if `country` is actually enabled via `penalty country` (§1.1)
 no `country` penalty to exempt from in the first place. When enabled, the dimension is still tracked
 and counted for observability (visible via `/fairness/status`'s `dimension_entry_counts`, see
 [`monitoring.md`](monitoring.md)) even for exempt countries — exemption only suppresses its penalty
-contribution, and has no effect on the other dimensions (`ip`/`net24`/`net6`/`asn`/`user` are
+contribution, and has no effect on the other dimensions (`ip`/`ipv4_subnet`/`ipv6_subnet`/`asn`/`user` are
 evaluated independently regardless of country).
 
 ## 6. `adaptive_admission` block
