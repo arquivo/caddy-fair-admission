@@ -35,3 +35,36 @@ concurrency  requests   errors   throughput(req/s) p50        p95        p99
 ```
 
 No throughput inversion detected: peak 15363.7 req/s at concurrency 800, and throughput does not drop >=15% below that peak at any higher concurrency level swept.
+
+## Memory usage per concurrency level
+
+`/usr/bin/time -v`/`docker stats` only give one peak-RSS figure for a whole
+process's lifetime, not a per-level breakdown. To get per-level numbers,
+`loadtest.Sweep` was temporarily instrumented to log elapsed time at each
+level's start/end, then the compiled test binary was run standalone with
+`/proc/<pid>/status`'s `VmRSS` polled every 300ms in a concurrent shell loop,
+matching samples back to each level's time window (instrumentation reverted
+afterward -- it is not part of the committed test).
+
+Client and server run in the same OS process in this test (in-process Caddy
+load, in-process `httptest` upstream, in-process load-generating goroutines),
+so this RSS covers all three roles together, not just the server.
+
+```
+concurrency  requests   throughput(req/s) p50    p95    p99    peak RSS
+50           9145       3048.3            16ms   18ms   21ms   60.7 MB
+100          17643      5881.0            16ms   21ms   25ms   70.9 MB
+150          23946      7982.0            17ms   28ms   35ms   82.8 MB
+200          31763      10587.7           17ms   30ms   38ms   93.1 MB
+250          35006      11668.7           19ms   33ms   39ms   102.5 MB
+400          45231      15077.0           25ms   40ms   48ms   125.5 MB
+600          43723      14574.3           40ms   56ms   64ms   146.9 MB
+800          45564      15188.0           52ms   66ms   73ms   166.8 MB
+1000         45078      15026.0           66ms   82ms   88ms   191.8 MB
+```
+
+Memory scales roughly linearly with offered concurrency (~0.14 MB per
+additional concurrent connection) -- each worker goroutine holds its own
+stack plus a live HTTP connection/buffer, on both the client and server side.
+No spike or leak-like jump at any level; peak RSS at the highest concurrency
+tested (1000) is ~192 MB, trivial against typical host RAM.
