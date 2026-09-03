@@ -33,8 +33,14 @@
 		# ipv6_subnet dimension. Must be exactly 48 or 56.
 		ipv6_prefix_length 48
 
+		# Extracts the archived domain a replay request targets, for the
+		# archived_domain dimension. Capture group 1 must be the domain.
+		# Required (Provision hard-errors otherwise) if that dimension is
+		# enabled below -- there is no built-in default pattern.
+		archived_domain_regex ^/(?:wayback|noFrame/replay)/\d+[A-Za-z_]*/https?:/+([^/?#]+)
+
 		# How often every tracked entity's EWMA rate is recomputed, across
-		# all 6 dimensions (docs/configuration.md §2). Tighter than the 1s
+		# all 7 dimensions (docs/configuration.md §2). Tighter than the 1s
 		# default, reacting faster at the cost of noisier per-tick rates.
 		ewma_tick_interval 500ms
 		# Entities idle longer than this are garbage-collected (swept by a
@@ -52,7 +58,7 @@
 			base_score anonymous        60
 			base_score unknown          60
 
-			# Enabling all 6 dimensions (each is opt-in -- see
+			# Enabling all 7 dimensions (each is opt-in -- see
 			# docs/configuration.md §1.1 -- so a real config would normally
 			# only enable the ones it actually needs), each restating this
 			# project's own defaults from docs/configuration.md §3 for
@@ -61,12 +67,13 @@
 			# tracked -- docs/configuration.md §5), but individual-IP abuse
 			# from those countries is still penalized via the ip dimension,
 			# which has no exempt_country configured.
-			penalty ip          alpha=0.2 soft=20:10   hard=100:40
-			penalty ipv4_subnet alpha=0.2 soft=100:10  hard=500:40  exempt_country=PT,ES
-			penalty ipv6_subnet alpha=0.2 soft=100:10  hard=500:40  exempt_country=PT,ES
-			penalty asn         alpha=0.2 soft=500:10  hard=2000:40 exempt_country=PT,ES
-			penalty country     alpha=0.2 soft=2000:10 hard=10000:40 exempt_country=PT,ES
-			penalty user        alpha=0.2 soft=20:10   hard=100:40
+			penalty ip              alpha=0.2 soft=20:10   hard=100:40
+			penalty ipv4_subnet     alpha=0.2 soft=100:10  hard=500:40  exempt_country=PT,ES
+			penalty ipv6_subnet     alpha=0.2 soft=100:10  hard=500:40  exempt_country=PT,ES
+			penalty asn             alpha=0.2 soft=500:10  hard=2000:40 exempt_country=PT,ES
+			penalty country         alpha=0.2 soft=2000:10 hard=10000:40 exempt_country=PT,ES
+			penalty user            alpha=0.2 soft=20:10   hard=100:40
+			penalty archived_domain alpha=0.2 soft=500:10  hard=2000:40
 
 			# Presence-based priority divisor (docs/configuration.md §1.1's
 			# "Priority divisor" subsection): a request's own query params,

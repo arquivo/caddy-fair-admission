@@ -1,8 +1,9 @@
 # Scenarios
 
-Two worked examples showing how the 6 scoring dimensions (§3 of
+Three worked examples showing how the 7 scoring dimensions (§3 of
 [`configuration.md`](configuration.md)) actually behave against real traffic shapes: a distributed
-crawler designed to stay under per-IP rate limits, and a normal human browsing session. Both
+crawler designed to stay under per-IP rate limits, a normal human browsing session, and an operator
+rotating identities to hammer replay of a single archived site. Both
 walkthroughs assume every dimension discussed has actually been enabled via a `penalty <dimension>`
 line in a `scoring { }` block (§1.1 of [`configuration.md`](configuration.md)) — dimensions are
 opt-in, not on by default, so if your own config only enables a subset, only those apply. Read
@@ -118,7 +119,7 @@ every other dimension (`ipv4_subnet`, `ipv6_subnet`, `asn`, `country`, `user` if
 session contributes at most 3 requests/tick to any of them — several orders of magnitude under
 even the tightest default soft threshold (20, on `ip`/`user`).
 
-**Result:** `total_penalty = 0` across all 6 enabled dimensions for this entire session. The final score is
+**Result:** `total_penalty = 0` across all 7 enabled dimensions for this entire session. The final score is
 just the base score for this visitor's class — 60 if anonymous, 100 if this happens to be an
 authenticated `researcher`/`internal`/`service_account` session — completely untouched by the
 fairness layer. This is the intended baseline: ordinary bursty-then-idle human browsing should
@@ -126,3 +127,68 @@ never accumulate enough sustained rate on any dimension to cross a soft threshol
 low `alpha` or how short `ewma_tick_interval` is set. Contrast this against Scenario A's `asn`
 dimension, which converges toward a real, sustained, non-decaying rate precisely because that
 traffic never stops arriving.
+
+## Scenario C — hot archived domain, many operators
+
+**The traffic:** an operator/indexer decides to hammer replay of a single archived site —
+`cienciahoje.pt` — as hard as possible, at an aggregate rate of about 600 requests/second. They've
+learned from Scenario A's lesson: rather than one IP or one ASN, requests come from hundreds of
+distinct source IPs spread across dozens of distinct ASNs (multiple ISPs, rotated deliberately),
+each individually sending only a couple of requests/second. Every request is one of the two replay
+URL shapes fairness recognizes: `/wayback/<timestamp>/http://cienciahoje.pt/<page>` or
+`/noFrame/replay/<timestamp>/https://www.cienciahoje.pt/<page>`.
+
+### Walking the dimensions
+
+**`ip` (default: alpha=0.2, soft=20:10, hard=100:40).** With 600 rps spread across, say, 600
+distinct source IPs, each individual IP's EWMA converges toward roughly **1 rps** — nowhere near
+the soft threshold of 20. **Structurally blind, same as Scenario A.**
+
+**`asn` (default: alpha=0.2, soft=500:10, hard=2000:40).** Spread across dozens of ASNs instead of
+one, each ASN's share of the 600 rps might converge toward something like 15-30 rps depending on
+how evenly the operator distributes traffic — still well under the soft threshold of 500. **Also
+structurally blind**, precisely because the operator learned to avoid concentrating on one ASN this
+time (contrast Scenario A, where a single ASN was the giveaway).
+
+**`archived_domain` (default: alpha=0.2, soft=500:10, hard=2000:40).** This dimension doesn't care
+who's asking at all — it keys purely on the domain extracted from the request path via
+`archived_domain_regex` (§1 of [`configuration.md`](configuration.md)), after lowercasing and
+`www.`-stripping (so the `/noFrame/replay/...www.cienciahoje.pt/...` and `/wayback/...cienciahoje.pt/...`
+requests above both aggregate under the same key, `cienciahoje.pt`). No matter how many distinct
+IPs or ASNs the operator rotates across, every one of those 600 requests/second still contributes to
+this one entity's EWMA:
+
+| Tick | requests this tick | rate | `ewma = 0.2*rate + 0.8*ewma_prev` |
+|---|---|---|---|
+| ... | (steady state reached after ~15-20 ticks at `alpha=0.2`) | | |
+| steady-state | ~600/tick | 600 | **≈ 600** |
+
+600 crosses the default soft threshold of 500, so every request replaying `cienciahoje.pt` now
+carries a **-10 penalty** — regardless of which IP or ASN it came from. `ip` and `asn` both stay
+completely quiet (no single identity individually crosses its own threshold), yet the abuse is
+caught anyway, because `archived_domain` is the one dimension keyed on *what* is being asked for
+rather than *who* is asking (see the note in §3 of [`configuration.md`](configuration.md)).
+
+### Why this matters as a soft signal, not a smoking gun
+
+A `-10` penalty here is deliberately mild relative to `base_score`: a spike of entirely legitimate
+interest in one archived page (a news story about `cienciahoje.pt` going viral, a researcher's
+batch export job, a class assignment sending a few hundred students to the same archived URL in one
+sitting) would trip this same dimension, and none of those are abuse. `archived_domain` only
+lowers priority — it never rejects on its own — precisely so a legitimate traffic spike against one
+domain gets deprioritized under contention rather than blocked outright, while a sustained,
+deliberate pattern like this scenario's rotating-identity operator accumulates real, visible
+penalty that other dimensions structurally cannot see.
+
+```caddyfile
+fairness {
+	archived_domain_regex ^/(?:wayback|noFrame/replay)/\d+[A-Za-z_]*/https?:/+([^/?#]+)
+
+	scoring {
+		penalty ip
+		penalty asn
+		penalty archived_domain
+	}
+}
+```
+

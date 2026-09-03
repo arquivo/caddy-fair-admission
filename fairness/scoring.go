@@ -23,12 +23,13 @@ import (
 // (scoringOverrides.EnabledDimensions). A dimension absent from every
 // `penalty` line is never tracked, ticked, or scored, regardless of its
 // presence in this list.
-var scoringDimensions = [...]string{"ip", "ipv4_subnet", "ipv6_subnet", "asn", "country", "user"}
+var scoringDimensions = [...]string{"ip", "ipv4_subnet", "ipv6_subnet", "asn", "country", "user", "archived_domain"}
 
 // validScoringDimensions is scoringDimensions as a lookup set, for Caddyfile
 // validation.
 var validScoringDimensions = map[string]bool{
 	"ip": true, "ipv4_subnet": true, "ipv6_subnet": true, "asn": true, "country": true, "user": true,
+	"archived_domain": true,
 }
 
 // validUserClasses are the 5 user classes base_score may legitimately be
@@ -183,6 +184,13 @@ func newDefaultScoringConfig() ScoringConfig {
 			"ipv6_subnet": {Alpha: 0.2, SoftThreshold: 100, SoftPenalty: 10, HardThreshold: 500, HardPenalty: 40},
 			"asn":         {Alpha: 0.2, SoftThreshold: 500, SoftPenalty: 10, HardThreshold: 2000, HardPenalty: 40},
 			"country":     {Alpha: 0.2, SoftThreshold: 2000, SoftPenalty: 10, HardThreshold: 10000, HardPenalty: 40},
+			// archived_domain is content-keyed (what's being requested), not
+			// requester-keyed — tuned at asn's order of magnitude since a
+			// single archived domain can plausibly carry as much legitimate
+			// spike traffic (e.g. a viral article) as one mid-size ASN.
+			// Illustrative only, like every other aggregate default here —
+			// needs real-traffic tuning.
+			"archived_domain": {Alpha: 0.2, SoftThreshold: 500, SoftPenalty: 10, HardThreshold: 2000, HardPenalty: 40},
 		},
 	}
 }
@@ -337,6 +345,11 @@ func dimensionKey(dim string, c Classification) (key string, ok bool) {
 			return "", false
 		}
 		return c.UserID, true
+	case "archived_domain":
+		if c.ArchivedDomain == "" {
+			return "", false
+		}
+		return c.ArchivedDomain, true
 	default:
 		return "", false
 	}

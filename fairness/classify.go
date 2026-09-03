@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"regexp"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -68,6 +69,12 @@ type Classification struct {
 	// UserID is the verified subject (JWT `sub`), empty if
 	// anonymous/unavailable.
 	UserID string
+	// ArchivedDomain is the archived domain this request's replay path
+	// targets (normalized: lowercased, leading "www." stripped), extracted
+	// via the configured archived_domain_regex. Empty if unset/unmatched.
+	// This identifies the *target* of the request, not the requester — it
+	// is still identity/context, not a behavior signal.
+	ArchivedDomain string
 }
 
 // bucketIPv4 returns the IPv4 /24 CIDR bucket string for ip, or "" if ip is
@@ -133,11 +140,28 @@ func resolveClientIP(r *http.Request) net.IP {
 	return net.ParseIP(host)
 }
 
+// extractArchivedDomain extracts and normalizes the archived domain a replay
+// path targets, using re's first capture group. Returns "" if re is nil (the
+// archived_domain_regex directive isn't configured on this block — fail
+// open) or the path doesn't match.
+func extractArchivedDomain(re *regexp.Regexp, path string) string {
+	if re == nil {
+		return ""
+	}
+	m := re.FindStringSubmatch(path)
+	if m == nil {
+		return ""
+	}
+	domain := strings.ToLower(m[1])
+	return strings.TrimPrefix(domain, "www.")
+}
+
 // classify computes a request's Classification from explicit dependencies
 // (no hidden globals), so it's testable without spinning up a full Caddy
 // instance. geo and auth may be nil (GeoIP/auth not configured on this
-// block); both fail open per REQUIREMENTS.md §4.2.
-func classify(cfg *Config, geo *geoLookup, auth *verifier, ip net.IP, r *http.Request) Classification {
+// block); both fail open per REQUIREMENTS.md §4.2. archivedDomainRe may be
+// nil (archived_domain_regex not configured on this block); also fail open.
+func classify(cfg *Config, geo *geoLookup, auth *verifier, archivedDomainRe *regexp.Regexp, ip net.IP, r *http.Request) Classification {
 	var c Classification
 
 	if ip != nil {
@@ -151,6 +175,7 @@ func classify(cfg *Config, geo *geoLookup, auth *verifier, ip net.IP, r *http.Re
 
 	c.ASN, c.Country = geo.lookup(ip)
 	c.UserClass, c.UserID = authenticate(auth, r)
+	c.ArchivedDomain = extractArchivedDomain(archivedDomainRe, r.URL.Path)
 
 	return c
 }

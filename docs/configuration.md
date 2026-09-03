@@ -24,6 +24,7 @@ across blocks with Caddy's native `import`/named-snippet mechanism. See
 | `auth_jwks_url <url>` | 1 | `""` (auth disabled) | JWKS endpoint for verifying bearer tokens (RS256), refreshed on a background loop. |
 | `auth_audience <string>` | 1 | `""` | Expected JWT `aud` claim; not itself validated at parse time. |
 | `ipv6_prefix_length <int>` | 1 | `56` | **Must be exactly `48` or `56`** — any other value is a Caddyfile parse error. |
+| `archived_domain_regex <regex>` | 1 | unset | Extracts the archived domain a replay request targets, for the `archived_domain` scoring dimension (§3). Capture group 1 must be the domain. Not validated at parse time — **required** if the `archived_domain` dimension is enabled: `Provision` hard-errors if it's unset, fails to compile, or has no capturing group, exactly like `geoip_asn_db` being required for `asn`. There is no built-in default pattern; a starting point matching both known replay URL shapes and tolerating a Wayback-style timestamp modifier suffix (`im_`/`if_`/...): `^/(?:wayback\|noFrame/replay)/\d+[A-Za-z_]*/https?:/+([^/?#]+)`. Whatever group 1 captures is always lowercased and has a leading `www.` stripped before being tracked. |
 | `ewma_tick_interval <duration>` | 1 | `1s` | How often the EWMA updater re-evaluates every tracked entity's rate (see §2). |
 | `idle_entry_ttl <duration>` | 1 | `10m` | Entities with no traffic for longer than this are garbage-collected. Swept by a fixed, non-configurable 1-minute ticker; reclaimed strictly when idle time is `>` the TTL, not `>=`. |
 | `scoring { ... }` | sub-block | absent, or with no `penalty` lines → no dimensions active | See §1.1. |
@@ -41,7 +42,7 @@ one with zero `penalty` lines, gives every request its class's flat `base_score`
 ```caddyfile
 scoring {
     base_score <user_class> <float>                          # repeatable, one of 5 classes
-    penalty <dimension>                                       # repeatable, one of 6 dimensions — enables it with built-in default tuning
+    penalty <dimension>                                       # repeatable, one of 7 dimensions — enables it with built-in default tuning
     penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f> [exempt_country=<cc>[,<cc>...]]
                                                                # repeatable — enables it with explicit tuning; exempt_country is optional
     divisor param <name> <value>                              # repeatable — presence-based priority divisor, see below
@@ -67,8 +68,9 @@ scoring {
   Only explicitly-set values override the defaults; unset stays at the default rather than being
   treated as `0`. Independent of which dimensions are enabled.
 - Enabling `asn` requires a working `geoip_asn_db`, `country` requires a working `geoip_city_db`,
-  and `user` requires a working `auth_jwks_url` — **Provision fails at config-load time**, not just
-  silently degrading to 0-penalty, if:
+  `user` requires a working `auth_jwks_url`, and `archived_domain` requires `archived_domain_regex`
+  to be set to a valid regex with a capturing group — **Provision fails at config-load time**, not
+  just silently degrading to 0-penalty, if:
   - the dimension is enabled but the prerequisite field isn't set at all on this block, or
   - the prerequisite field is set but the resource itself fails to open/initialize (missing GeoIP
     file, corrupt `.mmdb`, unreachable/malformed JWKS URL) — catching a typo'd path/URL that would
@@ -109,7 +111,7 @@ default.
 
 ## 2. What EWMA is, and why
 
-Each of the up to 6 scoring dimensions (§3) that a `scoring { }` block enables via `penalty
+Each of the up to 7 scoring dimensions (§3) that a `scoring { }` block enables via `penalty
 <dimension>` tracks how fast traffic from a given entity (one IP, one `/24`, one ASN, ...) is
 arriving, so it can apply a penalty once that rate is sustained rather than a one-off burst. A
 dimension never named by a `penalty` line is not tracked at all. The mechanism is an
@@ -153,7 +155,7 @@ user's browsing burst vs. a sustained crawler).
 
 ## 3. Soft vs. hard penalties
 
-Each of the 6 recognized dimensions has its own `PenaltyConfig{alpha, soft_threshold, soft_penalty,
+Each of the 7 recognized dimensions has its own `PenaltyConfig{alpha, soft_threshold, soft_penalty,
 hard_threshold, hard_penalty}`, used when that dimension is enabled via `penalty <dimension>` (§1.1)
 — a dimension never named by a `penalty` line contributes nothing at all, not even a `0` entry.
 Given an enabled dimension's current EWMA rate:
@@ -187,6 +189,14 @@ explicit `alpha=`/`soft=`/`hard=` given:
 | `asn` | autonomous system | GeoIP ASN DB configured & resolves | 0.2 | 500 : 10 | 2000 : 40 |
 | `country` | country | GeoIP city DB configured & resolves | 0.2 | 2000 : 10 | 10000 : 40 |
 | `user` | JWT subject | authenticated requests only | 0.2 | 20 : 10 | 100 : 40 |
+| `archived_domain` | archived domain targeted by the request | requests whose path matches `archived_domain_regex` — requires that directive to be configured | 0.2 | 500 : 10 | 2000 : 40 |
+
+`archived_domain` is the one **content-keyed** dimension in this table — every other dimension
+tracks *who* is asking (an IP, a subnet, an ASN, a country, an authenticated user); this one tracks
+*what archived content* is being requested, regardless of who's asking. It exists to catch an
+operator/indexer that hammers replay of a single archived site while rotating across enough
+distinct IPs/ASNs to stay under every requester-keyed dimension's threshold — see
+[`scenarios.md`](scenarios.md) for a worked example.
 
 **Why aggregate dimensions get much higher thresholds than `ip`/`user`:** a single IP or user
 sustaining 20+ rps is unusual behavior worth penalizing lightly, but a `/24` subnet, an ASN, or a
@@ -208,7 +218,7 @@ under-react to a genuinely abusive ASN and need a backend-level override.
 | `unknown` | token presented but unverifiable (e.g. JWKS unreachable, bad signature) | 60 |
 
 Classification is identity-only — behavior (request rate, penalties) is never folded back into the
-class itself, only into the score via the 6 dimensions above. `unknown` deliberately shares
+class itself, only into the score via the 7 dimensions above. `unknown` deliberately shares
 `anonymous`'s base score rather than being penalized further: an unverifiable token is not evidence
 of bad intent (it may just mean the JWKS endpoint is temporarily unreachable — a fail-open
 condition), so it isn't trusted *less* than presenting no token at all.

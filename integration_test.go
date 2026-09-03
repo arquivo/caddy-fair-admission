@@ -616,6 +616,80 @@ func TestIntegration_ConfigError_UserEnabled_FailedToInitialize(t *testing.T) {
 	}
 }
 
+// The tests below cover the archived_domain dimension's own Provision-time
+// requirement: archived_domain_regex has no built-in default (unlike
+// geoip_asn_db/geoip_city_db/auth_jwks_url, which are opt-in resources with
+// no fallback pattern either, but this field carries no default value at
+// all) -- enabling `penalty archived_domain` without it, or with an invalid
+// value, must hard-fail config load.
+
+func TestIntegration_ConfigError_ArchivedDomainEnabled_NotConfigured(t *testing.T) {
+	input := `
+:19096 {
+	fairness {
+		scoring {
+			penalty archived_domain
+		}
+	}
+}
+`
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), `archived_domain_regex is not configured`) {
+		t.Errorf("error = %v, want it to mention archived_domain_regex is not configured", err)
+	}
+}
+
+func TestIntegration_ConfigError_ArchivedDomainRegex_Invalid(t *testing.T) {
+	input := `
+:19097 {
+	fairness {
+		archived_domain_regex (unterminated
+		scoring {
+			penalty archived_domain
+		}
+	}
+}
+`
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), "invalid archived_domain_regex") {
+		t.Errorf("error = %v, want it to mention the regex is invalid", err)
+	}
+}
+
+func TestIntegration_ConfigError_ArchivedDomainRegex_NoCapturingGroup(t *testing.T) {
+	input := `
+:19098 {
+	fairness {
+		archived_domain_regex ^/wayback/
+		scoring {
+			penalty archived_domain
+		}
+	}
+}
+`
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), "must contain a capturing group") {
+		t.Errorf("error = %v, want it to mention the missing capturing group", err)
+	}
+}
+
+// Positive control: a valid archived_domain_regex with a capturing group
+// must load cleanly -- the three tests above only prove the error paths
+// fire; this proves they don't false-positive on a valid setup.
+func TestIntegration_ConfigError_ArchivedDomainEnabled_ValidRegex_LoadsCleanly(t *testing.T) {
+	input := `
+:19099 {
+	fairness {
+		archived_domain_regex ^/(?:wayback|noFrame/replay)/\d+[A-Za-z_]*/https?:/+([^/?#]+)
+		scoring {
+			penalty archived_domain
+		}
+	}
+}
+`
+	loadCaddy(t, input)
+}
+
 // TestIntegration_ConfigError_ExemptCountryEnabled_NotConfigured proves the
 // geoip_city_db requirement for exempt_country applies per-dimension even
 // when the dimension configuring it isn't `country` itself -- ipv4_subnet

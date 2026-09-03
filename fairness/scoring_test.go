@@ -518,6 +518,8 @@ func TestDimensionKey(t *testing.T) {
 		{"country absent", "country", Classification{}, "", false},
 		{"user present", "user", Classification{UserID: "u123"}, "u123", true},
 		{"user absent (anonymous)", "user", Classification{}, "", false},
+		{"archived_domain present", "archived_domain", Classification{ArchivedDomain: "cienciahoje.pt"}, "cienciahoje.pt", true},
+		{"archived_domain absent (unmatched path)", "archived_domain", Classification{}, "", false},
 		{"unrecognized dimension", "bogus", Classification{IP: "1.2.3.4"}, "", false},
 	}
 	for _, tc := range cases {
@@ -527,6 +529,25 @@ func TestDimensionKey(t *testing.T) {
 				t.Errorf("dimensionKey(%q, %+v) = (%q, %v), want (%q, %v)", tc.dim, tc.c, key, ok, tc.key, tc.ok)
 			}
 		})
+	}
+}
+
+func TestArchivedDomainDimension_Registered(t *testing.T) {
+	if !validScoringDimensions["archived_domain"] {
+		t.Error(`validScoringDimensions["archived_domain"] = false, want true`)
+	}
+	found := false
+	for _, dim := range scoringDimensions {
+		if dim == "archived_domain" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error(`"archived_domain" not present in scoringDimensions`)
+	}
+	pc := defaultPenaltyFor("archived_domain")
+	if pc.Alpha == 0 && pc.SoftThreshold == 0 && pc.HardThreshold == 0 {
+		t.Error("defaultPenaltyFor(\"archived_domain\") returned the zero PenaltyConfig, want non-zero default tuning")
 	}
 }
 
