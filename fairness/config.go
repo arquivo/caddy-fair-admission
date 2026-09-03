@@ -53,6 +53,17 @@ type Config struct {
 	// traffic for longer than this is swept from its dimension map. Zero/
 	// unset uses defaultIdleEntryTTL (scoring.go).
 	IdleEntryTTL time.Duration `json:"idle_entry_ttl,omitempty"`
+
+	// ArchivedDomainRegex extracts the archived domain a replay request
+	// targets (e.g. from /wayback/<ts>/<proto>://<domain>/<page> or
+	// /noFrame/replay/<ts>/<proto>://<domain>/<page>) for the
+	// archived_domain scoring dimension. Capture group 1 must be the
+	// domain. There is no built-in default pattern — this field is the
+	// sole source of the regex, and Provision hard-errors if the
+	// archived_domain dimension is enabled while this is unset (or the
+	// value is invalid, or lacks a capturing group), exactly like
+	// geoip_asn_db being required for the asn dimension.
+	ArchivedDomainRegex string `json:"archived_domain_regex,omitempty"`
 }
 
 // backendLabel returns the configured Backend label, or "default" if unset.

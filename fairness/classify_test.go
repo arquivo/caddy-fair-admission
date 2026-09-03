@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -136,7 +137,7 @@ func TestClassify_IPv4(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	ip := net.ParseIP("203.0.113.5")
 
-	c := classify(&Config{}, nil, nil, ip, req)
+	c := classify(&Config{}, nil, nil, nil, ip, req)
 
 	if c.IP != "203.0.113.5" {
 		t.Errorf("IP = %q, want 203.0.113.5", c.IP)
@@ -160,7 +161,7 @@ func TestClassify_IPv6DefaultPrefix(t *testing.T) {
 	ip := net.ParseIP("2001:db8:1:2300::1")
 
 	// Zero-value Config: default IPv6 prefix length (56) applies.
-	c := classify(&Config{}, nil, nil, ip, req)
+	c := classify(&Config{}, nil, nil, nil, ip, req)
 
 	if c.Net24 != "" {
 		t.Errorf("Net24 = %q, want \"\"", c.Net24)
@@ -175,7 +176,7 @@ func TestClassify_IPv6ConfiguredPrefix48(t *testing.T) {
 	ip := net.ParseIP("2001:db8:1234:5678::1")
 
 	cfg := &Config{IPv6PrefixLength: 48}
-	c := classify(cfg, nil, nil, ip, req)
+	c := classify(cfg, nil, nil, nil, ip, req)
 
 	if c.NetV6 != "2001:db8:1234::/48" {
 		t.Errorf("NetV6 = %q, want 2001:db8:1234::/48", c.NetV6)
@@ -184,7 +185,7 @@ func TestClassify_IPv6ConfiguredPrefix48(t *testing.T) {
 
 func TestClassify_NilIP(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	c := classify(&Config{}, nil, nil, nil, req)
+	c := classify(&Config{}, nil, nil, nil, nil, req)
 
 	if c.IP != "" || c.Net24 != "" || c.NetV6 != "" {
 		t.Errorf("expected empty IP fields for nil ip, got %+v", c)
@@ -201,7 +202,7 @@ func TestClassify_NilGeoAndAuthFailOpen(t *testing.T) {
 
 	// nil geo and nil auth (no verifier configured) must not panic and
 	// must fail open to anonymous/no ASN/no country.
-	c := classify(&Config{}, nil, nil, ip, req)
+	c := classify(&Config{}, nil, nil, nil, ip, req)
 
 	if c.ASN != 0 {
 		t.Errorf("ASN = %d, want 0", c.ASN)
@@ -211,5 +212,60 @@ func TestClassify_NilGeoAndAuthFailOpen(t *testing.T) {
 	}
 	if c.UserClass != UserClassAnonymous {
 		t.Errorf("UserClass = %q, want anonymous (no verifier configured)", c.UserClass)
+	}
+}
+
+// testArchivedDomainRegex mirrors the illustrative pattern in
+// docs/configuration.md, matching both replay URL shapes and tolerating a
+// Wayback-Machine-style timestamp modifier suffix (im_/if_/id_/cs_/...).
+var testArchivedDomainRegex = regexp.MustCompile(`^/(?:wayback|noFrame/replay)/\d+[A-Za-z_]*/https?:/+([^/?#]+)`)
+
+func TestExtractArchivedDomain(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"wayback shape", "/wayback/20230101120000/http://cienciahoje.pt/artigo", "cienciahoje.pt"},
+		{"noFrame/replay shape", "/noFrame/replay/20230101120000/https://cienciahoje.pt/artigo", "cienciahoje.pt"},
+		{"timestamp with modifier suffix", "/wayback/20230101120000im_/http://cienciahoje.pt/img.png", "cienciahoje.pt"},
+		{"strips www. prefix", "/wayback/20230101120000/http://www.cienciahoje.pt/artigo", "cienciahoje.pt"},
+		{"lowercases domain", "/wayback/20230101120000/http://WWW.CienciaHoje.PT/artigo", "cienciahoje.pt"},
+		{"root path does not match", "/", ""},
+		{"unrelated path does not match", "/fairness/status", ""},
+		{"truncated wayback path has no domain", "/wayback/", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractArchivedDomain(testArchivedDomainRegex, tc.path)
+			if got != tc.want {
+				t.Errorf("extractArchivedDomain(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExtractArchivedDomain_NilRegexFailsOpen(t *testing.T) {
+	got := extractArchivedDomain(nil, "/wayback/20230101120000/http://cienciahoje.pt/artigo")
+	if got != "" {
+		t.Errorf("extractArchivedDomain(nil, ...) = %q, want \"\"", got)
+	}
+}
+
+func TestClassify_ArchivedDomain(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/wayback/20230101120000/http://www.CienciaHoje.pt/artigo", nil)
+	c := classify(&Config{}, nil, nil, testArchivedDomainRegex, nil, req)
+
+	if c.ArchivedDomain != "cienciahoje.pt" {
+		t.Errorf("ArchivedDomain = %q, want cienciahoje.pt", c.ArchivedDomain)
+	}
+}
+
+func TestClassify_ArchivedDomain_NilRegex(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/wayback/20230101120000/http://cienciahoje.pt/artigo", nil)
+	c := classify(&Config{}, nil, nil, nil, nil, req)
+
+	if c.ArchivedDomain != "" {
+		t.Errorf("ArchivedDomain = %q, want \"\" (regex not configured)", c.ArchivedDomain)
 	}
 }

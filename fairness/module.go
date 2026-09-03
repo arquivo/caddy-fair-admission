@@ -5,6 +5,7 @@ package fairness
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -83,6 +84,11 @@ type Handler struct {
 	// scoring is this instance's isolated EWMA scoring state (§3.2/§7 Q6),
 	// constructed fresh in Provision and torn down in Cleanup.
 	scoring *scoringState
+	// archivedDomainRe is ArchivedDomainRegex compiled in Provision, or nil
+	// if ArchivedDomainRegex is unset. Derived runtime state, not part of
+	// Config, for the same reason h.geo/h.auth aren't (see Config's
+	// ArchivedDomainRegex doc comment).
+	archivedDomainRe *regexp.Regexp
 }
 
 // CaddyModule returns the Caddy module information.
@@ -142,6 +148,19 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		h.auth = v
 	}
 
+	if h.ArchivedDomainRegex != "" {
+		compiled, err := regexp.Compile(h.ArchivedDomainRegex)
+		if err != nil {
+			h.releaseAcquired()
+			return fmt.Errorf("fairness: invalid archived_domain_regex %q: %v", h.ArchivedDomainRegex, err)
+		}
+		if compiled.NumSubexp() < 1 {
+			h.releaseAcquired()
+			return fmt.Errorf("fairness: archived_domain_regex %q must contain a capturing group for the domain", h.ArchivedDomainRegex)
+		}
+		h.archivedDomainRe = compiled
+	}
+
 	// Scoring state (§3.2/§4.3) is constructed fresh here, isolated per
 	// Handler instance (§7 Q6) — never carried over across a config reload
 	// (§3.3): every Provision call gets brand-new maps and a brand-new pair
@@ -173,6 +192,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 				return fmt.Errorf("fairness: scoring dimension %q is enabled but auth_jwks_url is not configured on this block", "user")
 			}
 			return fmt.Errorf("fairness: scoring dimension %q is enabled but auth_jwks_url %q failed to initialize — check the URL is reachable and serves a well-formed JWKS", "user", h.AuthJWKSURL)
+		}
+	}
+	if _, ok := resolved.Dimensions["archived_domain"]; ok {
+		if h.archivedDomainRe == nil {
+			h.releaseAcquired()
+			return fmt.Errorf("fairness: scoring dimension %q is enabled but archived_domain_regex is not configured on this block", "archived_domain")
 		}
 	}
 	for dim, pc := range resolved.Dimensions {
@@ -243,7 +268,7 @@ func (h *Handler) Cleanup() error {
 // handler never rejects a request itself.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ip := resolveClientIP(r)
-	classification := classify(&h.Config, h.geo, h.auth, ip, r)
+	classification := classify(&h.Config, h.geo, h.auth, h.archivedDomainRe, ip, r)
 	caddyhttp.SetVar(r.Context(), classificationVarKey, classification)
 
 	now := time.Now()
@@ -267,6 +292,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		"asn":             uint64(classification.ASN),
 		"country":         classification.Country,
 		"user_class":      string(classification.UserClass),
+		"archived_domain": classification.ArchivedDomain,
 		"exempt":          h.scoring.countryExempt(classification.Country),
 		"score_breakdown": breakdown,
 	})
@@ -349,6 +375,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid idle_entry_ttl %q: %v", d.Val(), err)
 				}
 				h.IdleEntryTTL = dur
+
+			case "archived_domain_regex":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.ArchivedDomainRegex = d.Val()
 
 			case "scoring":
 				overrides, err := parseScoringBlock(d)

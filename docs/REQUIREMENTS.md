@@ -198,7 +198,7 @@ both.
 
 - A `final = clamp(base_score[user_class] - penalty, min_score, max_score)` per request, where
   `penalty` sums step-function penalties (soft/hard thresholds → soft/hard penalty amounts),
-  independently per dimension: `ip, ipv4_subnet, ipv6_subnet, asn, country, user`.
+  independently per dimension: `ip, ipv4_subnet, ipv6_subnet, asn, country, user, archived_domain`.
 - **Design refinement vs. the Python source:** the Python system's per-dimension counters are plain
   rolling-window request counts (`window_seconds`). This port instead drives thresholds off an
   **EWMA (exponentially weighted moving average) of requests/sec**, per dimension — a technique
@@ -602,7 +602,7 @@ forward as requirements for this port:
   per-request scoring did six *sequential* Redis round-trips (not concurrent), serialized on the
   admission-decision critical path. The in-memory EWMA maps (§3.2/§4.3) must not recreate an
   equivalent serialization point: prefer per-dimension sharded mutexes or `sync.Map` over one
-  mutex guarding all six dimensions' maps, and update independent dimensions concurrently
+  mutex guarding all seven dimensions' maps, and update independent dimensions concurrently
   (goroutines/`errgroup`) rather than sequentially, if profiling later shows this matters — do not
   add this complexity speculatively before measuring, but do not reach for "one big mutex" as the
   default either, given it was directly implicated as a design smell (even though not the root
