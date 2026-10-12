@@ -11,9 +11,11 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -811,5 +813,136 @@ func TestIntegration_EndToEnd_NoScoringBlock_ZeroDimensionsTracked(t *testing.T)
 	// refinement: base_score is independent of dimension enablement).
 	if len(fBody.Backends[0].BaseScores) == 0 {
 		t.Errorf("base_scores = %+v, want the hardcoded defaults to still be present", fBody.Backends[0].BaseScores)
+	}
+}
+
+// TestIntegration_EndToEnd_SessionCookie_IssueThenCheck drives the signed
+// session cookie (arquivo/pwa-technologies#1664) through the real Caddyfile
+// adapter → JSON → caddy.Load pipeline: one listener issues the cookie (the
+// "behind Anubis" internal route), another checks it, and adaptive_admission's
+// structured log/score hand-off sees the human_verified class. The `user`
+// dimension is enabled with no auth_jwks_url, which must load because the
+// checking session_cookie provides the user key.
+func TestIntegration_EndToEnd_SessionCookie_IssueThenCheck(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "aac-session.key")
+	if err := os.WriteFile(keyFile, []byte("0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+
+	input := fmt.Sprintf(`
+:19096 {
+	fairness {
+		backend session-issue
+		session_cookie {
+			mode issue
+			key  k1 %[1]s
+		}
+	}
+	respond "issued" 200
+}
+
+:19097 {
+	fairness {
+		backend session-check
+		session_cookie {
+			mode check
+			key  k1 %[1]s
+		}
+		scoring {
+			base_score human_verified 85
+			penalty user
+		}
+	}
+	respond "{vars.fairness_score}" 200
+}
+`, keyFile)
+	loadCaddy(t, input)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:19096/")
+	if err != nil {
+		t.Fatalf("issuing request: %v", err)
+	}
+	resp.Body.Close()
+	var cookie *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "aac_session" {
+			cookie = c
+		}
+	}
+	if cookie == nil || !cookie.HttpOnly || !cookie.Secure || cookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("issuing route cookie = %+v, want an HttpOnly; Secure; SameSite=Lax aac_session", cookie)
+	}
+
+	score := func(c *http.Cookie) string {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:19097/", nil)
+		if c != nil {
+			req.AddCookie(c)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("checking request: %v", err)
+		}
+		defer resp.Body.Close()
+		if v := resp.Header.Values("Set-Cookie"); len(v) != 0 {
+			t.Errorf("checking route sent Set-Cookie %v", v)
+		}
+		var b strings.Builder
+		if _, err := io.Copy(&b, resp.Body); err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return b.String()
+	}
+
+	if got := score(nil); got != "60" {
+		t.Errorf("score without cookie = %q, want anonymous 60", got)
+	}
+	if got := score(cookie); got != "85" {
+		t.Errorf("score with cookie = %q, want human_verified 85", got)
+	}
+	forged := &http.Cookie{Name: "aac_session", Value: cookie.Value + "x"}
+	if got := score(forged); got != "60" {
+		t.Errorf("score with forged cookie = %q, want unknown 60", got)
+	}
+}
+
+func TestIntegration_ConfigError_SessionCookie_KeyFileMissing(t *testing.T) {
+	input := `
+:19098 {
+	fairness {
+		session_cookie {
+			key k1 /nonexistent/aac-session.key
+		}
+	}
+}
+`
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), `session_cookie key "k1"`) {
+		t.Errorf("error = %v, want it to name the failing session_cookie key", err)
+	}
+}
+
+func TestIntegration_ConfigError_UserEnabled_IssueOnlySessionCookieIsNotEnough(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "aac-session.key")
+	if err := os.WriteFile(keyFile, []byte("0123456789abcdef0123456789abcdef"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	input := fmt.Sprintf(`
+:19099 {
+	fairness {
+		session_cookie {
+			mode issue
+			key  k1 %s
+		}
+		scoring {
+			penalty user
+		}
+	}
+}
+`, keyFile)
+	err := expectCaddyLoadError(t, input)
+	if !strings.Contains(err.Error(), `auth_jwks_url is not configured`) {
+		t.Errorf("error = %v, want the user-dimension prerequisite error", err)
 	}
 }

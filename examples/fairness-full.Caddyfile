@@ -29,6 +29,20 @@
 		# Expected JWT audience claim. Not itself validated at parse time.
 		auth_audience page-search-api
 
+		# Signed human-session cookie (docs/configuration.md §10). "both"
+		# sets it on responses and classifies requests carrying a valid
+		# one as human_verified. See
+		# examples/fairness-session-cookie.Caddyfile for a realistic split
+		# into an issuing route behind Anubis and a checking route.
+		session_cookie {
+			mode both
+			# First key signs, every key verifies (rotation).
+			key  k2 /etc/caddy/aac-session-k2.key
+			key  k1 /etc/caddy/aac-session-k1.key
+			name aac_session
+			ttl  30m
+		}
+
 		# IPv6 client addresses are aggregated at this prefix length for the
 		# ipv6_subnet dimension. Must be exactly 48 or 56.
 		ipv6_prefix_length 48
@@ -42,15 +56,17 @@
 		idle_entry_ttl 15m
 
 		scoring {
-			# Base score for every one of the 5 user classes
-			# (docs/configuration.md §4) -- all five restated here even
-			# though only anonymous/unknown differ from the trusted three
-			# in the defaults, to show every valid class name.
+			# Base score for every one of the 6 user classes
+			# (docs/configuration.md §4) -- all six restated here even
+			# though they match the defaults, to show every valid class
+			# name. human_verified only applies with a checking
+			# session_cookie block (above).
 			base_score researcher       100
 			base_score service_account  100
 			base_score internal         100
 			base_score anonymous        60
 			base_score unknown          60
+			base_score human_verified   80
 
 			# Enabling all 6 dimensions (each is opt-in -- see
 			# docs/configuration.md §1.1 -- so a real config would normally

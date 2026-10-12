@@ -29,8 +29,14 @@ const (
 	UserClassInternal UserClass = "internal"
 	// UserClassUnknown is a bearer token that was present but could not be
 	// verified (bad signature, expired, JWKS unreachable, wrong
-	// issuer/audience, ...) or whose user_class claim wasn't recognized.
+	// issuer/audience, ...) or whose user_class claim wasn't recognized, or
+	// a session cookie that was present but forged/expired (session.go).
 	UserClassUnknown UserClass = "unknown"
+	// UserClassHumanVerified is a request carrying a valid session cookie
+	// issued by a fairness block in `issue` mode (session.go) — i.e. a
+	// browser that recently went through a human-facing route. Never
+	// claimable via JWT.
+	UserClassHumanVerified UserClass = "human_verified"
 )
 
 // validClaimedUserClasses are the classes a verified JWT's user_class claim
@@ -65,7 +71,8 @@ type Classification struct {
 	// UserClass is the identity-only classification (never a behavior
 	// signal, see UserClass docs).
 	UserClass UserClass
-	// UserID is the verified subject (JWT `sub`), empty if
+	// UserID is the verified subject (JWT `sub`), or "session:<random-id>"
+	// for a valid session cookie (session.go); empty if
 	// anonymous/unavailable.
 	UserID string
 }

@@ -27,6 +27,7 @@ across blocks with Caddy's native `import`/named-snippet mechanism. See
 | `ewma_tick_interval <duration>` | 1 | `1s` | How often the EWMA updater re-evaluates every tracked entity's rate (see §2). |
 | `idle_entry_ttl <duration>` | 1 | `10m` | Entities with no traffic for longer than this are garbage-collected. Swept by a fixed, non-configurable 1-minute ticker; reclaimed strictly when idle time is `>` the TTL, not `>=`. |
 | `scoring { ... }` | sub-block | absent, or with no `penalty` lines → no dimensions active | See §1.1. |
+| `session_cookie { ... }` | sub-block | absent (cookie neither issued nor checked) | Signed human-session cookie, see §10. |
 
 Any unrecognized top-level token is a Caddyfile parse error
 (`unrecognized fairness subdirective '%s'`).
@@ -40,7 +41,7 @@ one with zero `penalty` lines, gives every request its class's flat `base_score`
 
 ```caddyfile
 scoring {
-    base_score <user_class> <float>                          # repeatable, one of 5 classes
+    base_score <user_class> <float>                          # repeatable, one of 6 classes
     penalty <dimension>                                       # repeatable, one of 6 dimensions — enables it with built-in default tuning
     penalty <dimension> alpha=<f> soft=<f>:<f> hard=<f>:<f> [exempt_country=<cc>[,<cc>...]]
                                                                # repeatable — enables it with explicit tuning; exempt_country is optional
@@ -50,8 +51,8 @@ scoring {
 }
 ```
 
-- `base_score <class> <value>` — sets the starting score for one of the 5 user classes (§4). Both
-  args required; the class name must be one of the 5 valid classes. Independent of which dimensions
+- `base_score <class> <value>` — sets the starting score for one of the 6 user classes (§4). Both
+  args required; the class name must be one of the 6 valid classes. Independent of which dimensions
   are enabled — applies even with zero `penalty` lines.
 - `penalty <dimension>` — enables that dimension using its built-in default tuning (§3's table)
   without needing to restate the numbers.
@@ -67,7 +68,8 @@ scoring {
   Only explicitly-set values override the defaults; unset stays at the default rather than being
   treated as `0`. Independent of which dimensions are enabled.
 - Enabling `asn` requires a working `geoip_asn_db`, `country` requires a working `geoip_city_db`,
-  and `user` requires a working `auth_jwks_url` — **Provision fails at config-load time**, not just
+  and `user` requires a working `auth_jwks_url` *or* a `session_cookie` in `check`/`both` mode (§10)
+  — **Provision fails at config-load time**, not just
   silently degrading to 0-penalty, if:
   - the dimension is enabled but the prerequisite field isn't set at all on this block, or
   - the prerequisite field is set but the resource itself fails to open/initialize (missing GeoIP
@@ -186,7 +188,7 @@ explicit `alpha=`/`soft=`/`hard=` given:
 | `ipv6_subnet` | IPv6 `/48` or `/56` (per `ipv6_prefix_length`) | IPv6 only | 0.2 | 100 : 10 | 500 : 40 |
 | `asn` | autonomous system | GeoIP ASN DB configured & resolves | 0.2 | 500 : 10 | 2000 : 40 |
 | `country` | country | GeoIP city DB configured & resolves | 0.2 | 2000 : 10 | 10000 : 40 |
-| `user` | JWT subject | authenticated requests only | 0.2 | 20 : 10 | 100 : 40 |
+| `user` | JWT subject, or session-cookie random-id (§10) | authenticated or `human_verified` requests only | 0.2 | 20 : 10 | 100 : 40 |
 
 **Why aggregate dimensions get much higher thresholds than `ip`/`user`:** a single IP or user
 sustaining 20+ rps is unusual behavior worth penalizing lightly, but a `/24` subnet, an ASN, or a
@@ -205,13 +207,18 @@ under-react to a genuinely abusive ASN and need a backend-level override.
 | `service_account` | JWT-verified, trusted | 100 |
 | `internal` | JWT-verified, trusted | 100 |
 | `anonymous` | no bearer token presented | 60 |
-| `unknown` | token presented but unverifiable (e.g. JWKS unreachable, bad signature) | 60 |
+| `unknown` | token presented but unverifiable (e.g. JWKS unreachable, bad signature), or a forged/expired session cookie (§10) | 60 |
+| `human_verified` | valid session cookie on a checking block (§10) — a browser that recently went through a human-facing route | 80 |
 
 Classification is identity-only — behavior (request rate, penalties) is never folded back into the
 class itself, only into the score via the 6 dimensions above. `unknown` deliberately shares
 `anonymous`'s base score rather than being penalized further: an unverifiable token is not evidence
 of bad intent (it may just mean the JWKS endpoint is temporarily unreachable — a fail-open
 condition), so it isn't trusted *less* than presenting no token at all.
+
+Precedence when both signals are present: a JWT-verified trusted class (`researcher`,
+`service_account`, `internal`) always wins over the session cookie; otherwise a valid cookie gives
+`human_verified`, and a forged/expired cookie gives `unknown`.
 
 ## 5. Exempt countries
 
@@ -399,3 +406,70 @@ lower-scored traffic under load. A missing token, an expired one, or a JWKS endp
 temporarily unreachable all fail open to `anonymous`/`unknown` (§1's `auth_jwks_url` note; §4.2) —
 Keycloak being down never turns into a 401/403 for anyone, only a loss of the researcher-priority
 boost until it recovers.
+
+## 10. Session cookie: `session_cookie { }` (human-session priority)
+
+Gives browsers that recently went through a human-facing page a better baseline priority, without
+putting a challenge in front of Wayback or the APIs
+([arquivo/pwa-technologies#1664](https://github.com/arquivo/pwa-technologies/issues/1664)). A
+fairness block either **issues** a short-lived HMAC-signed cookie, **checks** it, or both:
+
+```caddyfile
+session_cookie {
+    mode check|issue|both     # default check
+    key  <kid> <file>         # repeatable, at least one — the FIRST key signs, every key verifies
+    name <cookie-name>        # default aac_session
+    ttl  <duration>           # default 30m
+}
+```
+
+| Directive | Default | Notes |
+|---|---|---|
+| `mode` | `check` | `issue`: set the cookie on responses, don't classify by it. `check`: classify by it, never set it. `both`: do both. |
+| `key <kid> <file>` | — (at least one required) | `<kid>` is letters/digits/`-`/`_`. The file holds the raw secret (surrounding whitespace trimmed); **at least 32 bytes**, e.g. `openssl rand -base64 48 > aac-session-k1.key`. A missing, unreadable, or short file fails Provision. Every instance that issues or checks must load the same file(s). |
+| `name` | `aac_session` | Cookie name. |
+| `ttl` | `30m` | Lifetime of an issued cookie (`Max-Age`). Must be `> 0`. |
+
+**Cookie value** — a plain signed string, no JWT, carrying no IP, query, or identity:
+
+```
+v1.<kid>.<expiry-unix>.<random-id>.<mac>
+mac = base64url(HMAC-SHA256(secret[kid], "v1.<kid>.<expiry-unix>.<random-id>"))
+```
+
+`random-id` is 128 random bits. Checking splits the value, looks up `<kid>`, recomputes the MAC,
+compares in constant time, then rejects it if expired.
+
+**Cookie attributes** (fixed, not configurable): `Secure`, `HttpOnly` (archived JavaScript runs on
+the same origin during replay and must not read it), `SameSite=Lax`, `Path=/`, no `Domain`
+(host-only).
+
+**Issuing and renewal.** On an issuing block, a request with no cookie, or a forged/expired one,
+gets a fresh session. A valid cookie is re-sent only once it is past half its `ttl`, or was signed
+with a key that is no longer the signing key; the renewal keeps the same `random-id`. A valid cookie
+is never re-sent on every request.
+
+**Checking.** On a checking block, a valid cookie classifies the request as `human_verified`
+(§4, default `base_score` 80) with the cookie's `random-id` as its `user` dimension key. A
+forged/expired cookie gives `unknown`, which has the same score as `anonymous` by default, so it
+brings no gain and no penalty. Nothing is ever rejected because of the cookie.
+
+**The cookie never bypasses limits.** It only raises the starting score. Enable `penalty user` on
+checking blocks so each browser session gets its own EWMA counter: a session that floods requests
+is penalized like any other, and users sharing a NAT/campus IP don't penalize each other on this
+dimension. Keep `penalty ip` as well. One Anubis pass can mint many sessions, so the `ip` dimension
+is what bounds a client spreading load over many cookies.
+
+**Key rotation.** List the new key first and keep the old one after it:
+`key k2 /etc/caddy/k2.key` then `key k1 /etc/caddy/k1.key`. New and renewed cookies are signed with
+`k2`, and `k1` cookies stay valid until they expire. Drop `k1` after one `ttl` has passed.
+
+**Deployment.** The issuing block must only be reachable by traffic that passed the human check
+(e.g. on an internal Caddy listener behind Anubis). If it sat in front of the challenge, a bot would
+get the cookie from the challenge page itself. This module doesn't know about Anubis; the ordering
+is purely a Caddyfile concern. See
+[`examples/fairness-session-cookie.Caddyfile`](../examples/fairness-session-cookie.Caddyfile).
+
+**Rollout.** Start in observation mode with `base_score human_verified 60` (equal to `anonymous`).
+Compare `fairness_session_cookies_total` and the per-class `fairness_score_distribution` /
+admission log lines (see [`monitoring.md`](monitoring.md)), then raise the score.

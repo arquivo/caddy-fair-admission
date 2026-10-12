@@ -28,6 +28,7 @@ curl -s http://localhost:2019/fairness/status | jq .
       "backend": "default",
       "base_scores": {
         "anonymous": 60,
+        "human_verified": 80,
         "internal": 100,
         "researcher": 100,
         "service_account": 100,
@@ -42,6 +43,14 @@ curl -s http://localhost:2019/fairness/status | jq .
       "dimension_entry_counts": {
         "ip": 8912,
         "country": 37
+      },
+      "session_cookie": {
+        "name": "aac_session",
+        "issue": false,
+        "check": true,
+        "ttl_seconds": 1800,
+        "signing_kid": "k2",
+        "kids": ["k1", "k2"]
       }
     }
   ],
@@ -61,7 +70,7 @@ curl -s http://localhost:2019/fairness/status | jq .
 
 - `backends[]` is sorted by `backend` label. One entry per distinct `fairness` handler block in
   the running config (i.e. one per `backend <label>` value actually in use).
-- `base_scores` keys are always the 5 `UserClass` string values, regardless of scoring config.
+- `base_scores` keys are always the 6 `UserClass` string values, regardless of scoring config.
   `dimensions` (and `dimension_entry_counts`) keys, by contrast, are **only the dimensions this
   backend's `scoring { }` block actually enabled** via a `penalty <dimension>` line (see
   [`configuration.md`](configuration.md) §1.1) — a dimension that was never enabled is simply
@@ -72,6 +81,9 @@ curl -s http://localhost:2019/fairness/status | jq .
   has no `json` struct tags. Everything else in this response is snake_case. This is a genuine
   inconsistency in the current response shape, not a documentation error — plan your JSON parsing
   accordingly.
+- `session_cookie` is present only on backends with a `session_cookie { }` block
+  ([`configuration.md`](configuration.md) §10). It reports key IDs only, never secrets or key file
+  paths. `kids` is sorted; `signing_kid` is the first-listed key.
 - `dimension_entry_counts` is the number of distinct tracked entities per dimension (e.g. distinct
   source IPs seen recently for `ip`), not an EWMA value — this is the discoverability signal used
   in [`scenarios.md`](scenarios.md)'s crawler example (an ASN with a disproportionately large `ip`
@@ -121,7 +133,7 @@ curl -s http://localhost:2019/adaptive_admission/status | jq .
 ## Prometheus metrics
 
 Registered on Caddy's own metrics registry — exposed via Caddy's built-in `metrics` directive (no
-separate `/metrics` server to run). **12 series total: 1 from `fairness`, 11 from
+separate `/metrics` server to run). **13 series total: 2 from `fairness`, 11 from
 `adaptive_admission`** (this corrects an earlier "14" figure that appeared in this project's own
 README before this documentation pass).
 
@@ -129,11 +141,12 @@ README before this documentation pass).
 curl -s http://localhost:2019/metrics | grep -E '^(fairness|adaptive_admission)_'
 ```
 
-### `fairness` (1 metric)
+### `fairness` (2 metrics)
 
 | Metric | Type | Labels | Help |
 |---|---|---|---|
 | `fairness_score_distribution` | Histogram | `backend`, `user_class` | Distribution of computed fairness scores. Linear buckets, width 10, from 0 to 100 (11 buckets: `0,10,20,...,100`, plus `+Inf`). |
+| `fairness_session_cookies_total` | Counter | `backend`, `result` | Session cookies ([`configuration.md`](configuration.md) §10). `result` is `valid`, `invalid` (malformed, unknown key, bad MAC), or `expired` on checking blocks — requests without the cookie aren't counted — and `issued` or `renewed` on issuing blocks. Never carries the cookie value. |
 
 Example scrape output:
 
