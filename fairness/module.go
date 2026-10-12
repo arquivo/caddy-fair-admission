@@ -83,6 +83,9 @@ type Handler struct {
 	// scoring is this instance's isolated EWMA scoring state (§3.2/§7 Q6),
 	// constructed fresh in Provision and torn down in Cleanup.
 	scoring *scoringState
+	// session is this block's signed session cookie state (session.go), nil
+	// if no `session_cookie { }` sub-block was configured.
+	session *sessionCookies
 }
 
 // CaddyModule returns the Caddy module information.
@@ -166,11 +169,22 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("fairness: scoring dimension %q is enabled but geoip_city_db %q failed to open — check the file exists and is a valid MaxMind City/Country database", "country", h.GeoIPCityDB)
 		}
 	}
-	if _, ok := resolved.Dimensions["user"]; ok {
+	if h.SessionCookie != nil {
+		sc, err := newSessionCookies(h.SessionCookie)
+		if err != nil {
+			h.releaseAcquired()
+			return err
+		}
+		h.session = sc
+	}
+
+	// `user` keys on a JWT `sub` or a session cookie's random-id, so a
+	// checking session_cookie is an alternative prerequisite to JWKS.
+	if _, ok := resolved.Dimensions["user"]; ok && (h.session == nil || !h.session.check) {
 		if h.auth == nil || h.auth.kf == nil {
 			h.releaseAcquired()
 			if h.AuthJWKSURL == "" {
-				return fmt.Errorf("fairness: scoring dimension %q is enabled but auth_jwks_url is not configured on this block", "user")
+				return fmt.Errorf("fairness: scoring dimension %q is enabled but auth_jwks_url is not configured on this block (nor a session_cookie in check/both mode)", "user")
 			}
 			return fmt.Errorf("fairness: scoring dimension %q is enabled but auth_jwks_url %q failed to initialize — check the URL is reachable and serves a well-formed JWKS", "user", h.AuthJWKSURL)
 		}
@@ -244,6 +258,18 @@ func (h *Handler) Cleanup() error {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ip := resolveClientIP(r)
 	classification := classify(&h.Config, h.geo, h.auth, ip, r)
+
+	backend := h.Config.backendLabel()
+	sess := h.session.read(r)
+	if h.session != nil && h.session.check {
+		applySession(&classification, sess)
+		if sess.result != sessionAbsent {
+			fairnessMetrics.sessionCookies.WithLabelValues(backend, string(sess.result)).Inc()
+		}
+	}
+	if action := h.session.maybeIssue(w, sess); action != "" {
+		fairnessMetrics.sessionCookies.WithLabelValues(backend, string(action)).Inc()
+	}
 	caddyhttp.SetVar(r.Context(), classificationVarKey, classification)
 
 	now := time.Now()
@@ -259,7 +285,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	caddyhttp.SetVar(r.Context(), fairnessScoreVarKey, score)
 
-	backend := h.Config.backendLabel()
 	fairnessMetrics.scoreDistribution.WithLabelValues(backend, string(classification.UserClass)).Observe(score)
 
 	caddyhttp.SetVar(r.Context(), logFieldsVarKey, map[string]any{
@@ -349,6 +374,13 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid idle_entry_ttl %q: %v", d.Val(), err)
 				}
 				h.IdleEntryTTL = dur
+
+			case "session_cookie":
+				sc, err := parseSessionCookieBlock(d)
+				if err != nil {
+					return err
+				}
+				h.SessionCookie = sc
 
 			case "scoring":
 				overrides, err := parseScoringBlock(d)
@@ -484,6 +516,74 @@ func parseScoringBlock(d *caddyfile.Dispenser) (*scoringOverrides, error) {
 	}
 
 	return o, nil
+}
+
+// parseSessionCookieBlock parses a `session_cookie { }` sub-block (session.go).
+// Grammar:
+//
+//	session_cookie {
+//	    mode check|issue|both     # default check
+//	    key  <kid> <file>         # repeatable, at least one; the first signs, all verify
+//	    name <cookie-name>        # default aac_session
+//	    ttl  <duration>           # default 30m
+//	}
+//
+// Key files are read (and mode re-validated) in Provision, not here.
+func parseSessionCookieBlock(d *caddyfile.Dispenser) (*SessionCookieConfig, error) {
+	sc := &SessionCookieConfig{}
+	if d.NextArg() {
+		return nil, d.ArgErr()
+	}
+	for d.NextBlock(1) {
+		switch d.Val() {
+		case "mode":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			switch d.Val() {
+			case sessionModeCheck, sessionModeIssue, sessionModeBoth:
+				sc.Mode = d.Val()
+			default:
+				return nil, d.Errf("session_cookie mode must be check, issue, or both, got %q", d.Val())
+			}
+
+		case "key":
+			args := d.RemainingArgs()
+			if len(args) != 2 {
+				return nil, d.Errf("expected 'key <kid> <file>'")
+			}
+			if err := validateSessionKID(args[0]); err != nil {
+				return nil, d.Err(err.Error())
+			}
+			sc.Keys = append(sc.Keys, SessionKey{KID: args[0], File: args[1]})
+
+		case "name":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			sc.Name = d.Val()
+
+		case "ttl":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return nil, d.Errf("invalid session_cookie ttl %q: %v", d.Val(), err)
+			}
+			if dur <= 0 {
+				return nil, d.Errf("session_cookie ttl must be > 0, got %v", dur)
+			}
+			sc.TTL = dur
+
+		default:
+			return nil, d.Errf("unrecognized session_cookie subdirective '%s'", d.Val())
+		}
+	}
+	if len(sc.Keys) == 0 {
+		return nil, d.Errf("session_cookie requires at least one 'key <kid> <file>'")
+	}
+	return sc, nil
 }
 
 // Interface guards.

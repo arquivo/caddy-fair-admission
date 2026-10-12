@@ -53,6 +53,11 @@ type Config struct {
 	// traffic for longer than this is swept from its dimension map. Zero/
 	// unset uses defaultIdleEntryTTL (scoring.go).
 	IdleEntryTTL time.Duration `json:"idle_entry_ttl,omitempty"`
+
+	// SessionCookie configures the signed session cookie (session.go). Nil
+	// means the feature is off on this block: the cookie is neither issued
+	// nor checked.
+	SessionCookie *SessionCookieConfig `json:"session_cookie,omitempty"`
 }
 
 // backendLabel returns the configured Backend label, or "default" if unset.

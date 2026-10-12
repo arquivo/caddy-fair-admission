@@ -21,6 +21,7 @@ type fairnessMetricsSet struct {
 	init sync.Once
 
 	scoreDistribution *prometheus.HistogramVec
+	sessionCookies    *prometheus.CounterVec
 }
 
 var fairnessMetrics fairnessMetricsSet
@@ -45,12 +46,17 @@ func initFairnessMetrics(registry *prometheus.Registry) {
 			Help:      "Distribution of computed fairness scores.",
 			Buckets:   prometheus.LinearBuckets(0, 10, 11),
 		}, []string{"backend", "user_class"})
+		fairnessMetrics.sessionCookies = promauto.With(nil).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "fairness",
+			Name:      "session_cookies_total",
+			Help:      "Session cookies seen on checking blocks (valid/invalid/expired) and set on issuing blocks (issued/renewed).",
+		}, []string{"backend", "result"})
 	})
 
 	if registry == nil {
 		return
 	}
-	for _, c := range []prometheus.Collector{fairnessMetrics.scoreDistribution} {
+	for _, c := range []prometheus.Collector{fairnessMetrics.scoreDistribution, fairnessMetrics.sessionCookies} {
 		var already prometheus.AlreadyRegisteredError
 		if err := registry.Register(c); err != nil && !errors.As(err, &already) {
 			panic("fairness: registering metric: " + err.Error())

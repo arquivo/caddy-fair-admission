@@ -91,6 +91,9 @@ See [`examples/`](examples/) for runnable Caddyfiles, from minimal to exhaustive
   directives and inside an explicit `route {}` block.
 - [`fairness-full.Caddyfile`](examples/fairness-full.Caddyfile) — every `fairness` directive and
   every `scoring { }` sub-directive set explicitly, one per commented line.
+- [`fairness-session-cookie.Caddyfile`](examples/fairness-session-cookie.Caddyfile) — a signed
+  session cookie issued behind Anubis and checked on Wayback replay, giving recent human browser
+  sessions a better base priority (still penalized per session if they flood).
 - [`adaptive-admission-full.Caddyfile`](examples/adaptive-admission-full.Caddyfile) — both
   controller kinds (`fixed` and `adaptive`) with every sub-field set explicitly, one per commented
   line.
@@ -121,7 +124,7 @@ default.
 ### Admin API and metrics
 
 Both modules expose introspection endpoints on Caddy's admin API (`GET /fairness/status`,
-`GET /adaptive_admission/status`) and register 12 Prometheus metrics total (1 `fairness` + 11
+`GET /adaptive_admission/status`) and register 13 Prometheus metrics total (2 `fairness` + 11
 `adaptive_admission`) on Caddy's own metrics registry, exposed via Caddy's built-in `metrics`
 directive. `adaptive_admission` also emits one structured JSON log line per admission decision,
 folding in `fairness`'s classification/score fields.
