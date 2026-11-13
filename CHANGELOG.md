@@ -1,3 +1,9 @@
+## [3.2.0](https://github.com/arquivo/caddy-fair-admission/compare/v3.1.0...v3.2.0) (2026-11-13)
+
+### Features
+
+* **fairness:** add archived_domain scoring dimension ([54f8d12](https://github.com/arquivo/caddy-fair-admission/commit/54f8d12ec0af5b7047db1b2e1bc09efca345dc6d))
+
 ## [3.1.0](https://github.com/arquivo/caddy-fair-admission/compare/v3.0.0...v3.1.0) (2026-10-13)
 
 ### Features
