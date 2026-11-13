@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -232,6 +233,52 @@ func TestLogDecision_RejectedRequest_EmitsExactlyOneLineWithRejectReason(t *test
 		t.Errorf("admitted = %v, want false", fields["admitted"])
 	}
 	for _, k := range []string{"queue_wait_ms", "backend_latency_ms", "status_code"} {
+		if _, ok := fields[k]; ok {
+			t.Errorf("rejected entry must not carry admitted-only field %q", k)
+		}
+	}
+}
+
+// TestServeHTTP_QueueTimedOut_LogsReasonAndWaitAndCountsMetric covers the
+// rejection of an already-queued request: its reject_reason, the
+// queue_wait_ms it actually spent queued, and the rejected counter label.
+func TestServeHTTP_QueueTimedOut_LogsReasonAndWaitAndCountsMetric(t *testing.T) {
+	backend := "metrics-test-backend-" + t.Name()
+	core, logs := observer.New(zap.InfoLevel)
+
+	c := NewFixedController(1)
+	c.Acquire(1)
+	s := NewScheduler(QueueConfig{MaxSize: 10, WaitTimeout: 30 * time.Millisecond}, c)
+	s.Start()
+	defer func() {
+		c.Release(1, time.Millisecond, 200, false)
+		s.Stop()
+	}()
+
+	h := &Handler{Config: Config{Backend: backend}, controller: c, scheduler: s, logger: zap.New(core)}
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		t.Fatal("next must not be called when the request times out")
+		return nil
+	})
+	if err := h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil), next); err == nil {
+		t.Fatal("expected a rejection error")
+	}
+
+	if got := testutil.ToFloat64(admissionMetrics.requestsRejected.WithLabelValues(backend, "queue_timed_out")); got != 1 {
+		t.Errorf(`requests_rejected_total{reason="queue_timed_out"} = %v, want 1`, got)
+	}
+	entries := logs.All()
+	if len(entries) != 1 {
+		t.Fatalf("got %d log entries, want exactly 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if got := fields["reject_reason"]; got != "queue_timed_out" {
+		t.Errorf("reject_reason = %v, want queue_timed_out", got)
+	}
+	if wait, _ := fields["queue_wait_ms"].(int64); wait < 30 {
+		t.Errorf("queue_wait_ms = %v, want >= 30", fields["queue_wait_ms"])
+	}
+	for _, k := range []string{"backend_latency_ms", "status_code"} {
 		if _, ok := fields[k]; ok {
 			t.Errorf("rejected entry must not carry admitted-only field %q", k)
 		}

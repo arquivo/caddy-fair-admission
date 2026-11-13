@@ -168,7 +168,7 @@ fairness_score_distribution_count{backend="default",user_class="anonymous"} 1523
 | `adaptive_admission_queue_size` | Gauge | `backend` | Current number of queued (not yet admitted) requests. |
 | `adaptive_admission_requests_total` | Counter | `backend` | Total requests seen. |
 | `adaptive_admission_requests_admitted_total` | Counter | `backend` | Total requests admitted (dispatched to next handler). |
-| `adaptive_admission_requests_rejected_total` | Counter | `backend`, `reason` | Total requests rejected, by reason (`queue_full` or `queue_wait_exceeded`). |
+| `adaptive_admission_requests_rejected_total` | Counter | `backend`, `reason` | Total requests rejected, by reason (`queue_full`, `queue_wait_exceeded`, `queue_timed_out` or `client_gone`, see §7 of [`configuration.md`](configuration.md)). |
 | `adaptive_admission_backend_errors_total` | Counter | `backend` | Total dispatched requests whose outcome was a 5xx/error. |
 | `adaptive_admission_backend_timeouts_total` | Counter | `backend` | Total dispatched requests whose outcome was a timeout. |
 | `adaptive_admission_adaptive_limit_changes_total` | Counter | `backend`, `direction` | Total adaptive-controller limit changes, by direction (`grow` or `shrink`). |
@@ -210,8 +210,10 @@ Fields present on **every** line: `backend` (string), `admitted` (bool).
 Fields present **only when `admitted: true`**: `queue_wait_ms` (int64), `backend_latency_ms`
 (int64), `status_code` (int).
 
-Fields present **only when `admitted: false`**: `reject_reason` (string, `queue_full` or
-`queue_wait_exceeded`) — mutually exclusive with the three admitted-only fields above.
+Fields present **only when `admitted: false`**: `reject_reason` (string, `queue_full`,
+`queue_wait_exceeded`, `queue_timed_out` or `client_gone`). The last two were already queued, so
+they also carry `queue_wait_ms`, the time they spent queued. `backend_latency_ms` and
+`status_code` are never present on a rejection.
 
 Fields folded in from `fairness` **when a `fairness` handler ran earlier in the chain** (absent
 entirely if `fairness` wasn't configured for this route): `ip` (string), `asn` (uint64, the numeric

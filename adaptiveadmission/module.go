@@ -48,6 +48,12 @@ const neutralScore float64 = 0
 // convention as fairnessScoreVarKey above.
 const fairnessLogFieldsVarKey = "fairness_log_fields"
 
+// statusClientClosedRequest is the status recorded for a client_gone
+// rejection. Nobody receives it; it only shows in Caddy's own logs, and
+// matches what reverse_proxy reports for a client that disconnects while
+// proxying.
+const statusClientClosedRequest = 499
+
 // Handler is the http.handlers.adaptive_admission middleware. It admits a
 // request through a priority queue backed by a capacity controller
 // (queue.go/capacity.go), then dispatches to the next handler in the chain
@@ -164,9 +170,9 @@ func (h *Handler) Cleanup() error {
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler. It reads the fairness
 // score that fairness (or another earlier handler) set via caddyhttp.SetVar,
-// enqueues the request, waits for admission, then dispatches (§4.5),
-// recording metrics and emitting one structured log line per request (§4.8,
-// §4.9).
+// enqueues the request, waits for admission (or rejects it, see reject),
+// then dispatches (§4.5), recording metrics and emitting one structured log
+// line per request (§4.8, §4.9).
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	backend := h.Config.backendLabel()
 	admissionMetrics.requestsTotal.WithLabelValues(backend).Inc()
@@ -183,13 +189,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	admissionMetrics.queueSize.WithLabelValues(backend).Set(float64(h.scheduler.Depth()))
 
 	if reason != RejectNone {
-		admissionMetrics.requestsRejected.WithLabelValues(backend, reason.String()).Inc()
-		h.logDecision(r, logDecisionParams{backend: backend, admitted: false, rejectReason: reason})
-		return caddyhttp.Error(http.StatusTooManyRequests, fmt.Errorf("adaptive_admission: %s", reason))
+		return h.reject(w, r, backend, reason, 0)
 	}
 
-	<-ticket.Granted()
+	reason = h.scheduler.Wait(r.Context(), ticket)
 	queueWait := time.Since(enqueuedAt)
+	if reason != RejectNone {
+		admissionMetrics.queueSize.WithLabelValues(backend).Set(float64(h.scheduler.Depth()))
+		return h.reject(w, r, backend, reason, queueWait)
+	}
 	admissionMetrics.queueWaitDuration.WithLabelValues(backend).Observe(queueWait.Seconds())
 	admissionMetrics.requestsAdmitted.WithLabelValues(backend).Inc()
 	// InFlight() can read up to 1 higher than genuinely in-flight work here
@@ -208,6 +216,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	})
 
 	return err
+}
+
+// reject records and logs a request that was never dispatched, and returns
+// the error that makes Caddy answer it: 429 for the overload reasons, 499
+// for client_gone.
+func (h *Handler) reject(w http.ResponseWriter, r *http.Request, backend string, reason RejectReason, queueWait time.Duration) error {
+	admissionMetrics.requestsRejected.WithLabelValues(backend, reason.String()).Inc()
+	h.logDecision(r, logDecisionParams{backend: backend, admitted: false, rejectReason: reason, queueWait: queueWait})
+
+	err := fmt.Errorf("adaptive_admission: %s", reason)
+	if reason == RejectClientGone {
+		return caddyhttp.Error(statusClientClosedRequest, err)
+	}
+	return caddyhttp.Error(http.StatusTooManyRequests, err)
 }
 
 // logDecisionParams carries the fields logDecision needs beyond what it
@@ -242,6 +264,9 @@ func (h *Handler) logDecision(r *http.Request, p logDecisionParams) {
 		)
 	} else {
 		fields = append(fields, zap.String("reject_reason", p.rejectReason.String()))
+		if p.rejectReason == RejectQueueTimedOut || p.rejectReason == RejectClientGone {
+			fields = append(fields, zap.Int64("queue_wait_ms", p.queueWait.Milliseconds()))
+		}
 	}
 
 	if lf, ok := caddyhttp.GetVar(r.Context(), fairnessLogFieldsVarKey).(map[string]any); ok {

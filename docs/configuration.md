@@ -295,7 +295,7 @@ adaptive_admission {
 | `backend <string>` | `"default"` | Label only, as in `fairness`. |
 | `controller <fixed\|adaptive>` | — (required) | Selects the capacity-control strategy for this backend. |
 | `queue_max_size <int>` | `0` (unbounded) | Max tickets the priority queue holds before rejecting new arrivals with `queue_full`. |
-| `queue_timeout <duration>` | `0` (unbounded) | Max Little's-law-projected wait before rejecting with `queue_wait_exceeded` (§7). |
+| `queue_timeout <duration>` | `0` (unbounded) | Max queue wait. Checked as a Little's-law projection on arrival (`queue_wait_exceeded`) and against each queued request's real wait (`queue_timed_out`), see §7. |
 
 `controller fixed { limit <int> }` — a static concurrency ceiling. `limit` must be `> 0`.
 
@@ -326,8 +326,10 @@ to use the new capacity — it doesn't wait for the next request to finish and r
 
 The priority queue orders tickets by **score descending**, then **arrival order (FIFO)** within
 equal scores — a higher-scored request is always served first, but two requests with the same
-score are served in the order they arrived. Two distinct rejection reasons, both surfaced as HTTP
-429 but logged/labeled separately (see [`monitoring.md`](monitoring.md)):
+score are served in the order they arrived.
+
+Four rejection reasons, logged/labeled separately (see [`monitoring.md`](monitoring.md)).
+The first three are answered with HTTP 429:
 
 - **`queue_full`** — the queue already holds `queue_max_size` tickets when a new one arrives.
 - **`queue_wait_exceeded`** — a Little's-law-style projection already exceeds `queue_timeout`
@@ -340,6 +342,12 @@ score are served in the order they arrived. Two distinct rejection reasons, both
   This projection is skipped (never rejects) until at least one request has completed and produced
   a real latency sample — an empty/cold queue never gets rejected on a wait estimate that doesn't
   exist yet.
+- **`queue_timed_out`** — the request joined the queue, but its real wait reached `queue_timeout`
+  before it was admitted. It's removed from the queue and never reaches the backend.
+- **`client_gone`** — the client disconnected while the request was queued. It's removed from the
+  queue and never reaches the backend; the status (499) only shows in Caddy's own logs. Behind a
+  proxy such as httpd, Caddy only sees the disconnect once the proxy closes its own connection to
+  Caddy, so `queue_timeout` is what bounds such a request's wait there.
 
 ## 8. How `fairness` and `adaptive_admission` hand off
 
