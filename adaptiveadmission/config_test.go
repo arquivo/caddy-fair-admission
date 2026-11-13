@@ -94,10 +94,19 @@ func TestControllerConfig_BuildController_UnrecognizedKind(t *testing.T) {
 }
 
 func TestConfig_QueueConfig(t *testing.T) {
-	c := Config{QueueMaxSize: 100, QueueTimeout: 5 * time.Second}
+	c := Config{QueueMaxSize: 100, QueueTimeout: 5 * time.Second, QueueAgingRate: 2.5}
 	got := c.queueConfig()
-	want := QueueConfig{MaxSize: 100, WaitTimeout: 5 * time.Second}
+	want := QueueConfig{MaxSize: 100, WaitTimeout: 5 * time.Second, AgingRate: 2.5}
 	if got != want {
 		t.Errorf("queueConfig() = %+v, want %+v", got, want)
+	}
+}
+
+func TestConfig_RejectStatus_DefaultsTo429(t *testing.T) {
+	if got := (Config{}).rejectStatus(); got != 429 {
+		t.Errorf("rejectStatus() unset = %d, want 429", got)
+	}
+	if got := (Config{RejectStatus: 503}).rejectStatus(); got != 503 {
+		t.Errorf("rejectStatus() = %d, want 503", got)
 	}
 }

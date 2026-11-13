@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -140,4 +141,149 @@ measured for throughput/percentiles.
 	if inv.Inverted {
 		t.Fatalf("throughput inversion detected across concurrency 50-250 -- per REQUIREMENTS.md §8, profile with pprof before applying a fix (see %s): %s", loadTestReportPath, inv.Detail)
 	}
+}
+
+// TestLoadTest_StarvationScenario replays the 2026-11-13 load test of the
+// p85 dev broker against the full chain, with the broker's fairness
+// scoring and trusted_proxies setup: one heavy client (c=50) and 20 light
+// clients (c=2), each a fake X-Forwarded-For in its own /24, against a
+// fixed limit-20 backend. The heavy client earns an ip penalty and, with
+// strict priority, got nothing served for over 30s while the light clients
+// ran. Here, with queue_aging_rate set, it must keep being served, and with
+// aging off, queue_timeout must reject its starved requests rather than
+// leave them queued. Gated like the sweep above:
+//
+//	RUN_LOADTEST_E2E=1 go test . -run TestLoadTest_StarvationScenario -v
+func TestLoadTest_StarvationScenario(t *testing.T) {
+	if os.Getenv("RUN_LOADTEST_E2E") != "1" {
+		t.Skip("set RUN_LOADTEST_E2E=1 to run the p85 starvation scenario against the full chain (slow, not run in CI)")
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	const queueTimeout = 5 * time.Second
+	for _, tc := range []struct {
+		name  string
+		port  int
+		aging string
+	}{
+		{"aging off", 19113, ""},
+		{"aging 5 per second", 19114, "queue_aging_rate 5"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loadCaddy(t, fmt.Sprintf(`
+{
+	servers {
+		trusted_proxies static 127.0.0.1/32
+		trusted_proxies_strict
+	}
+}
+:%d {
+	fairness {
+		scoring {
+			base_score anonymous 60
+			penalty ip          alpha=0.2 soft=20:10  hard=100:40
+			penalty ipv4_subnet alpha=0.2 soft=100:10 hard=500:40
+		}
+	}
+	adaptive_admission {
+		controller fixed {
+			limit 20
+		}
+		queue_max_size 1000
+		queue_timeout  %s
+		%s
+	}
+	reverse_proxy %s
+}
+`, tc.port, queueTimeout, tc.aging, upstream.Listener.Addr().String()))
+
+			r := runStarvationClients(t, fmt.Sprintf("http://127.0.0.1:%d/", tc.port), 12*time.Second)
+			t.Logf("heavy: %s", r.heavy)
+			t.Logf("light: %s", r.light)
+
+			for _, s := range []clientStats{r.heavy, r.light} {
+				if s.maxLatency > queueTimeout+2*time.Second {
+					t.Errorf("a request took %v, want at most queue_timeout (%v) plus backend time", s.maxLatency, queueTimeout)
+				}
+			}
+			if tc.aging != "" && r.heavy.servedSecondHalf == 0 {
+				t.Errorf("heavy client got nothing served in the second half of the run, despite aging")
+			}
+		})
+	}
+}
+
+type clientStats struct {
+	served, rejected, failed int
+	servedSecondHalf         int
+	maxLatency               time.Duration
+}
+
+func (s clientStats) String() string {
+	return fmt.Sprintf("served=%d (second half %d) rejected=%d failed=%d max_latency=%v",
+		s.served, s.servedSecondHalf, s.rejected, s.failed, s.maxLatency.Round(time.Millisecond))
+}
+
+type starvationResult struct{ heavy, light clientStats }
+
+// runStarvationClients runs the heavy (10.0.0.1, c=50) and light (10.1.N.1,
+// c=2, N=1..20) closed-loop clients against url for d.
+func runStarvationClients(t *testing.T, url string, d time.Duration) starvationResult {
+	t.Helper()
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{MaxIdleConnsPerHost: 256},
+	}
+	start := time.Now()
+	half, end := start.Add(d/2), start.Add(d)
+
+	var mu sync.Mutex
+	var res starvationResult
+	var wg sync.WaitGroup
+	worker := func(ip string, stats *clientStats) {
+		defer wg.Done()
+		for time.Now().Before(end) {
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+			req.Header.Set("X-Forwarded-For", ip)
+			reqStart := time.Now()
+			resp, err := client.Do(req)
+			latency := time.Since(reqStart)
+			mu.Lock()
+			switch {
+			case err != nil:
+				stats.failed++
+			case resp.StatusCode == http.StatusOK:
+				stats.served++
+				if time.Now().After(half) {
+					stats.servedSecondHalf++
+				}
+			default:
+				stats.rejected++
+			}
+			if latency > stats.maxLatency {
+				stats.maxLatency = latency
+			}
+			mu.Unlock()
+			if resp != nil {
+				resp.Body.Close()
+			}
+		}
+	}
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go worker("10.0.0.1", &res.heavy)
+	}
+	for n := 1; n <= 20; n++ {
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go worker(fmt.Sprintf("10.1.%d.1", n), &res.light)
+		}
+	}
+	wg.Wait()
+	return res
 }

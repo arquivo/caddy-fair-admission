@@ -1091,12 +1091,28 @@ func queueFloodScenario(t *testing.T, port int, queueDirectives string, flood ti
 	return resp.StatusCode, resp.Header.Get("Retry-After"), took
 }
 
-func TestIntegration_EndToEnd_QueueTimeout_StarvedRequestRejected(t *testing.T) {
-	// The anonymous request never outranks the flood, so its real queue
-	// wait must hit queue_timeout instead of hanging until the flood ends.
-	status, _, took := queueFloodScenario(t, 19111, "queue_timeout 500ms", 3*time.Second)
-	if status != http.StatusTooManyRequests {
-		t.Errorf("anonymous request status = %d, want 429", status)
+func TestIntegration_EndToEnd_QueueAging_LowerScoreServedDuringHigherScoreFlood(t *testing.T) {
+	// Gap 40 at 100 points/s: the anonymous request outranks fresh
+	// researcher requests after ~0.4s queued.
+	status, _, took := queueFloodScenario(t, 19110, "queue_aging_rate 100\n\t\tqueue_timeout 10s", 3*time.Second)
+	if status != http.StatusOK {
+		t.Errorf("anonymous request status = %d, want 200", status)
+	}
+	if took > 1500*time.Millisecond {
+		t.Errorf("anonymous request took %v, want well under the flood (aging should bound it near 0.4s)", took)
+	}
+}
+
+func TestIntegration_EndToEnd_QueueTimeout_StarvedRequestRejectedWithRejectStatus(t *testing.T) {
+	// No aging: the anonymous request never outranks the flood, so its real
+	// queue wait must hit queue_timeout instead of hanging until the flood
+	// ends.
+	status, retryAfter, took := queueFloodScenario(t, 19111, "queue_timeout 500ms\n\t\treject_status 503\n\t\tretry_after 3s", 3*time.Second)
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("anonymous request status = %d, want 503", status)
+	}
+	if retryAfter != "3" {
+		t.Errorf("Retry-After = %q, want %q", retryAfter, "3")
 	}
 	if took < 500*time.Millisecond || took > 1500*time.Millisecond {
 		t.Errorf("anonymous request took %v, want about the 500ms queue_timeout", took)

@@ -61,7 +61,15 @@
 		}
 
 		queue_max_size 1000
+		# Also rejects (queue_timed_out) a request still queued after 15s.
 		queue_timeout  15s
+		# A queued request gains 5 score points per second waited, so a
+		# lower score is slowed down (10 points = 2s) but never starved.
+		queue_aging_rate 5
+		# Answer queue_full/queue_wait_exceeded/queue_timed_out with 503
+		# instead of 429, with a Retry-After of 5 seconds.
+		reject_status 503
+		retry_after   5s
 	}
 
 	reverse_proxy page-search-api-3:8080 page-search-api-4:8080

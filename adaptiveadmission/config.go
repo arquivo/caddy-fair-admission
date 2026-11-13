@@ -2,6 +2,7 @@ package adaptiveadmission
 
 import (
 	"fmt"
+	"net/http"
 	"time"
 )
 
@@ -41,6 +42,39 @@ type Config struct {
 	// it arrives and against its real wait once queued. Zero/unset means
 	// neither check ever rejects.
 	QueueTimeout time.Duration `json:"queue_timeout,omitempty"`
+	// QueueAgingRate is QueueConfig.AgingRate: score points per second of
+	// waiting. Zero/unset keeps strict score order.
+	QueueAgingRate float64 `json:"queue_aging_rate,omitempty"`
+
+	// RejectStatus is the HTTP status for queue_full, queue_wait_exceeded
+	// and queue_timed_out rejections. Zero/unset means 429.
+	RejectStatus int `json:"reject_status,omitempty"`
+	// RetryAfter, if set, is sent as a Retry-After header (whole seconds,
+	// rounded up) on those same rejections.
+	RetryAfter time.Duration `json:"retry_after,omitempty"`
+}
+
+// validate checks the queue and rejection settings; the controller settings
+// are checked by buildController.
+func (c Config) validate() error {
+	if c.QueueAgingRate < 0 {
+		return fmt.Errorf("adaptive_admission: queue_aging_rate must be >= 0")
+	}
+	if c.RejectStatus != 0 && (c.RejectStatus < 400 || c.RejectStatus > 599) {
+		return fmt.Errorf("adaptive_admission: reject_status must be a 4xx or 5xx status, got %d", c.RejectStatus)
+	}
+	if c.RetryAfter < 0 {
+		return fmt.Errorf("adaptive_admission: retry_after must be >= 0")
+	}
+	return nil
+}
+
+// rejectStatus returns the configured RejectStatus, or 429 if unset.
+func (c Config) rejectStatus() int {
+	if c.RejectStatus == 0 {
+		return http.StatusTooManyRequests
+	}
+	return c.RejectStatus
 }
 
 // ControllerConfig selects and tunes the backend's Controller (capacity.go,
@@ -93,7 +127,7 @@ func (cc ControllerConfig) buildController() (*Controller, error) {
 
 // queueConfig derives this handler's QueueConfig (queue.go).
 func (c Config) queueConfig() QueueConfig {
-	return QueueConfig{MaxSize: c.QueueMaxSize, WaitTimeout: c.QueueTimeout}
+	return QueueConfig{MaxSize: c.QueueMaxSize, WaitTimeout: c.QueueTimeout, AgingRate: c.QueueAgingRate}
 }
 
 // backendLabel returns the configured Backend label, or "default" if unset.
