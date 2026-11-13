@@ -192,7 +192,9 @@ both.
 - GeoIP DB paths and JWKS issuer/audience/refresh-interval are declared per `fairness` block
   (typically shared across blocks via Caddy's native `import`, §5) — the `fairness` app module
   dedupes the actual DB opens/JWKS refresh loops by resource identity (§3.1) rather than requiring
-  one process-wide config location.
+  one process-wide config location. Each shared reader polls its file (`geoip_reload_interval`,
+  default `1m`) and swaps in a replaced file once it has opened and validated, so a
+  `geoipupdate` run is picked up without a Caddy reload.
 
 ### 4.3 Scoring / penalties (`app/scoring.py`, `app/config.py`'s `ScoringConfig`) — EWMA-based, `fairness`
 

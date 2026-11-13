@@ -88,6 +88,34 @@ func TestUnmarshalCaddyfile_InvalidIPv6PrefixLength(t *testing.T) {
 	}
 }
 
+func TestUnmarshalCaddyfile_GeoIPReloadInterval(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  time.Duration
+	}{
+		{"", defaultGeoIPReloadInterval},
+		{"geoip_reload_interval 5m", 5 * time.Minute},
+		{"geoip_reload_interval 0", 0},
+	} {
+		d := caddyfile.NewTestDispenser("fairness {\n" + tc.input + "\n}")
+		var h Handler
+		if err := h.UnmarshalCaddyfile(d); err != nil {
+			t.Fatalf("%q: UnmarshalCaddyfile: %v", tc.input, err)
+		}
+		if got := h.Config.geoIPReloadInterval(); got != tc.want {
+			t.Errorf("%q: geoIPReloadInterval() = %v, want %v", tc.input, got, tc.want)
+		}
+	}
+
+	for _, input := range []string{"geoip_reload_interval -1m", "geoip_reload_interval soon", "geoip_reload_interval"} {
+		d := caddyfile.NewTestDispenser("fairness {\n" + input + "\n}")
+		var h Handler
+		if err := h.UnmarshalCaddyfile(d); err == nil {
+			t.Errorf("%q: expected error, got nil", input)
+		}
+	}
+}
+
 func TestUnmarshalCaddyfile_UnrecognizedDirective(t *testing.T) {
 	input := `fairness {
 		not_a_real_directive foo

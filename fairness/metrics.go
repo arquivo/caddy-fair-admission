@@ -20,8 +20,10 @@ import (
 type fairnessMetricsSet struct {
 	init sync.Once
 
-	scoreDistribution *prometheus.HistogramVec
-	sessionCookies    *prometheus.CounterVec
+	scoreDistribution   *prometheus.HistogramVec
+	sessionCookies      *prometheus.CounterVec
+	geoipBuildTimestamp *prometheus.GaugeVec
+	geoipReloads        *prometheus.CounterVec
 }
 
 var fairnessMetrics fairnessMetricsSet
@@ -51,12 +53,27 @@ func initFairnessMetrics(registry *prometheus.Registry) {
 			Name:      "session_cookies_total",
 			Help:      "Session cookies seen on checking blocks (valid/invalid/expired) and set on issuing blocks (issued/renewed).",
 		}, []string{"backend", "result"})
+		fairnessMetrics.geoipBuildTimestamp = promauto.With(nil).NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "fairness",
+			Name:      "geoip_build_timestamp_seconds",
+			Help:      "Build time (Unix seconds) of the GeoIP database currently loaded from each path.",
+		}, []string{"path"})
+		fairnessMetrics.geoipReloads = promauto.With(nil).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "fairness",
+			Name:      "geoip_reloads_total",
+			Help:      "GeoIP database reloads after the file changed, by result (ok/failed).",
+		}, []string{"path", "result"})
 	})
 
 	if registry == nil {
 		return
 	}
-	for _, c := range []prometheus.Collector{fairnessMetrics.scoreDistribution, fairnessMetrics.sessionCookies} {
+	for _, c := range []prometheus.Collector{
+		fairnessMetrics.scoreDistribution,
+		fairnessMetrics.sessionCookies,
+		fairnessMetrics.geoipBuildTimestamp,
+		fairnessMetrics.geoipReloads,
+	} {
 		var already prometheus.AlreadyRegisteredError
 		if err := registry.Register(c); err != nil && !errors.As(err, &already) {
 			panic("fairness: registering metric: " + err.Error())

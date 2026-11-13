@@ -25,11 +25,17 @@ type Config struct {
 
 	// GeoIPCityDB is the path to a MaxMind city/country .mmdb database.
 	// Empty, missing, or unopenable: country lookups silently return "" (no
-	// error, no panic) — fail-open per §4.2.
+	// error, no panic) — fail-open per §4.2 — until a valid file appears
+	// (see GeoIPReloadInterval).
 	GeoIPCityDB string `json:"geoip_city_db,omitempty"`
 	// GeoIPASNDB is the path to a MaxMind ASN .mmdb database. Same
 	// independent fail-open behavior as GeoIPCityDB.
 	GeoIPASNDB string `json:"geoip_asn_db,omitempty"`
+	// GeoIPReloadInterval is how often the GeoIP DB files are checked for a
+	// replacement (e.g. by geoipupdate), which is then opened, validated and
+	// swapped in without a Caddy reload (geoip.go). Nil/unset uses
+	// defaultGeoIPReloadInterval; zero (or negative) disables reloading.
+	GeoIPReloadInterval *time.Duration `json:"geoip_reload_interval,omitempty"`
 
 	// AuthIssuer is the expected JWT `iss` claim. Empty means the issuer
 	// isn't checked.
@@ -78,6 +84,15 @@ func (c *Config) backendLabel() string {
 		return "default"
 	}
 	return c.Backend
+}
+
+// geoIPReloadInterval returns the configured GeoIP reload interval, or the
+// default if unset. Safe to call on a nil *Config.
+func (c *Config) geoIPReloadInterval() time.Duration {
+	if c == nil || c.GeoIPReloadInterval == nil {
+		return defaultGeoIPReloadInterval
+	}
+	return *c.GeoIPReloadInterval
 }
 
 // ipv6PrefixLength returns the configured IPv6 bucketing prefix length, or

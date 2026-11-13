@@ -18,6 +18,10 @@
 		# MaxMind ASN DB, enabling the asn dimension. Independent of
 		# geoip_city_db -- either can be set without the other.
 		geoip_asn_db /etc/caddy/GeoLite2-ASN.mmdb
+		# How often both GeoIP files are checked for a replacement (e.g.
+		# by geoipupdate), which is validated and swapped in without a
+		# Caddy reload. 0 disables reloading.
+		geoip_reload_interval 1m
 
 		# Expected JWT issuer claim for the user dimension/user-class
 		# classification. Not itself validated at parse time.

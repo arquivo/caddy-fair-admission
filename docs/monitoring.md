@@ -56,8 +56,15 @@ curl -s http://localhost:2019/fairness/status | jq .
   ],
   "shared": {
     "geoip": [
-      { "key": "/etc/caddy/GeoLite2-City.mmdb", "healthy": true, "references": 1 },
-      { "key": "/etc/caddy/GeoLite2-ASN.mmdb", "healthy": true, "references": 1 }
+      {
+        "key": "/etc/caddy/GeoLite2-City.mmdb", "healthy": true, "references": 1,
+        "build_epoch": 1762992000, "loaded_at": "2026-11-13T22:35:12.418Z"
+      },
+      {
+        "key": "/etc/caddy/GeoLite2-ASN.mmdb", "healthy": true, "references": 1,
+        "build_epoch": 1762992000, "loaded_at": "2026-11-13T22:35:12.420Z",
+        "last_error": "not a usable ASN database (database_type \"GeoLite2-City\"): ..."
+      }
     ],
     "jwks": [
       { "key": "https://idp.example.com/.well-known/jwks.json", "healthy": true, "references": 1 }
@@ -92,6 +99,12 @@ curl -s http://localhost:2019/fairness/status | jq .
   *all* backends, since GeoIP readers and JWKS verifiers are pooled app-wide rather than
   per-backend — `references` counts how many backend configs currently point at that same
   resource.
+- `shared.geoip[]` also reports, when a database is loaded, its `build_epoch` (MaxMind build time,
+  Unix seconds) and `loaded_at` (when this reader opened it, at startup or on a reload). `healthy`
+  is `false` while no valid database has been loaded yet. `last_error` is the most recent open or
+  reload failure since the current database was loaded (absent if none) — with `healthy: true`, it
+  means a replacement file was rejected and the previous database is still in use
+  ([`configuration.md`](configuration.md) §1, `geoip_reload_interval`).
 
 ### `GET /adaptive_admission/status`
 
@@ -133,7 +146,7 @@ curl -s http://localhost:2019/adaptive_admission/status | jq .
 ## Prometheus metrics
 
 Registered on Caddy's own metrics registry — exposed via Caddy's built-in `metrics` directive (no
-separate `/metrics` server to run). **13 series total: 2 from `fairness`, 11 from
+separate `/metrics` server to run). **15 series total: 4 from `fairness`, 11 from
 `adaptive_admission`** (this corrects an earlier "14" figure that appeared in this project's own
 README before this documentation pass).
 
@@ -141,12 +154,14 @@ README before this documentation pass).
 curl -s http://localhost:2019/metrics | grep -E '^(fairness|adaptive_admission)_'
 ```
 
-### `fairness` (2 metrics)
+### `fairness` (4 metrics)
 
 | Metric | Type | Labels | Help |
 |---|---|---|---|
 | `fairness_score_distribution` | Histogram | `backend`, `user_class` | Distribution of computed fairness scores. Linear buckets, width 10, from 0 to 100 (11 buckets: `0,10,20,...,100`, plus `+Inf`). |
 | `fairness_session_cookies_total` | Counter | `backend`, `result` | Session cookies ([`configuration.md`](configuration.md) §10). `result` is `valid`, `invalid` (malformed, unknown key, bad MAC), or `expired` on checking blocks — requests without the cookie aren't counted — and `issued` or `renewed` on issuing blocks. Never carries the cookie value. |
+| `fairness_geoip_build_timestamp_seconds` | Gauge | `path` | Build time (Unix seconds) of the GeoIP database currently loaded from `path`. Alert on a database that stopped updating, e.g. `time() - fairness_geoip_build_timestamp_seconds > 10 * 86400`. |
+| `fairness_geoip_reloads_total` | Counter | `path`, `result` | Reloads of a GeoIP file after it changed on disk ([`configuration.md`](configuration.md) §1, `geoip_reload_interval`), by `result`: `ok` or `failed` (the file didn't open or validate; the previous database stays in use). |
 
 Example scrape output:
 
