@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -29,6 +30,7 @@ func init() {
 type App struct {
 	geoPool  *caddy.UsagePool
 	authPool *caddy.UsagePool
+	logger   *zap.Logger
 
 	mu       sync.Mutex
 	handlers map[string]*Handler
@@ -48,6 +50,7 @@ func (a *App) Provision(ctx caddy.Context) error {
 	a.geoPool = caddy.NewUsagePool()
 	a.authPool = caddy.NewUsagePool()
 	a.handlers = make(map[string]*Handler)
+	a.logger = ctx.Logger()
 	initFairnessMetrics(ctx.GetMetricsRegistry())
 	return nil
 }
@@ -63,16 +66,22 @@ func (a *App) Stop() error {
 }
 
 // acquireGeoReader returns a shared *geoReader for path, opening it (fail-
-// open, see geoip.go) if this is the first reference, or reusing the
-// existing one and incrementing its refcount otherwise. An empty path
-// returns (nil, nil) without touching the pool at all — callers should
-// treat a nil *geoReader as "this DB isn't configured".
-func (a *App) acquireGeoReader(path string) (*geoReader, error) {
+// open, see geoip.go) as a kind DB polled every reloadInterval if this is
+// the first reference, or reusing the existing one and incrementing its
+// refcount otherwise — so for blocks sharing a path, the first block to
+// open it sets the kind and reload interval. An empty path returns
+// (nil, nil) without touching the pool at all — callers should treat a nil
+// *geoReader as "this DB isn't configured".
+func (a *App) acquireGeoReader(path string, kind geoDBKind, reloadInterval time.Duration) (*geoReader, error) {
 	if path == "" {
 		return nil, nil
 	}
+	logger := a.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	key := geoPoolKey(path)
-	val, _, err := a.geoPool.LoadOrNew(key, openGeoReader(path))
+	val, _, err := a.geoPool.LoadOrNew(key, openGeoReader(path, kind, reloadInterval, logger))
 	if err != nil {
 		return nil, err
 	}
@@ -177,21 +186,29 @@ func (a *App) snapshotHandlers() []*Handler {
 
 // resourceHealth is one shared pooled resource's admin-reported health
 // (admin.go, §4.10): whether it's actually usable (vs. configured-but-
-// failed-open) and how many handler blocks currently reference it.
+// failed-open) and how many handler blocks currently reference it. GeoIP
+// readers also report the loaded DB's build epoch, when it was loaded, and
+// the last open/reload error since then.
 type resourceHealth struct {
-	Key        string `json:"key"`
-	Healthy    bool   `json:"healthy"`
-	References int    `json:"references"`
+	Key        string     `json:"key"`
+	Healthy    bool       `json:"healthy"`
+	References int        `json:"references"`
+	BuildEpoch uint       `json:"build_epoch,omitempty"`
+	LoadedAt   *time.Time `json:"loaded_at,omitempty"`
+	LastError  string     `json:"last_error,omitempty"`
 }
 
 // geoHealth snapshots every currently-pooled GeoIP reader's health, sorted
-// by key for deterministic output. A reader is "healthy" if geoip2.Open
-// actually succeeded for it (see geoReader/openGeoReader, geoip.go) —
-// otherwise it's pooled but permanently fails open on every lookup.
+// by key for deterministic output. A reader is "healthy" if a valid DB is
+// currently loaded (see geoReader, geoip.go) — otherwise it's pooled but
+// fails open on every lookup until a reload succeeds.
 func (a *App) geoHealth() []resourceHealth {
-	return poolHealth(a.geoPool, func(v any) bool {
+	return poolHealth(a.geoPool, func(v any) resourceHealth {
 		r, ok := v.(*geoReader)
-		return ok && r != nil && r.reader != nil
+		if !ok || r == nil {
+			return resourceHealth{}
+		}
+		return r.health()
 	})
 }
 
@@ -200,16 +217,16 @@ func (a *App) geoHealth() []resourceHealth {
 // obtained a keyfunc.Keyfunc (see jwksVerifier/openJWKSVerifier, auth.go) —
 // otherwise it's pooled but permanently fails open (treated as unauthenticated).
 func (a *App) jwksHealth() []resourceHealth {
-	return poolHealth(a.authPool, func(v any) bool {
+	return poolHealth(a.authPool, func(v any) resourceHealth {
 		jv, ok := v.(*jwksVerifier)
-		return ok && jv != nil && jv.kf != nil
+		return resourceHealth{Healthy: ok && jv != nil && jv.kf != nil}
 	})
 }
 
-// poolHealth walks pool, reporting each entry's key, reference count, and
-// healthy(entry) — pool may be nil (an unprovisioned App), in which case it
-// returns an empty slice rather than panicking.
-func poolHealth(pool *caddy.UsagePool, healthy func(any) bool) []resourceHealth {
+// poolHealth walks pool, reporting each entry's describe(entry) with its key
+// and reference count filled in — pool may be nil (an unprovisioned App), in
+// which case it returns an empty slice rather than panicking.
+func poolHealth(pool *caddy.UsagePool, describe func(any) resourceHealth) []resourceHealth {
 	if pool == nil {
 		return nil
 	}
@@ -217,7 +234,9 @@ func poolHealth(pool *caddy.UsagePool, healthy func(any) bool) []resourceHealth 
 	pool.Range(func(key, val any) bool {
 		k, _ := key.(string)
 		refs, _ := pool.References(key)
-		out = append(out, resourceHealth{Key: k, Healthy: healthy(val), References: refs})
+		h := describe(val)
+		h.Key, h.References = k, refs
+		out = append(out, h)
 		return true
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })

@@ -84,11 +84,11 @@ func TestApp_AcquireGeoReader_DedupsByPath(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "does-not-exist.mmdb")
 
-	r1, err := app.acquireGeoReader(path)
+	r1, err := app.acquireGeoReader(path, geoDBCity, 0)
 	if err != nil {
 		t.Fatalf("first acquireGeoReader: %v", err)
 	}
-	r2, err := app.acquireGeoReader(path)
+	r2, err := app.acquireGeoReader(path, geoDBCity, 0)
 	if err != nil {
 		t.Fatalf("second acquireGeoReader: %v", err)
 	}
@@ -109,12 +109,34 @@ func TestApp_AcquireGeoReader_DedupsByPath(t *testing.T) {
 	}
 }
 
+func TestApp_GeoHealth_ReportsLoadedDatabase(t *testing.T) {
+	app := &App{}
+	if err := app.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "asn.mmdb")
+	replaceFile(t, path, testASNDB(1930, 1700000000))
+	if _, err := app.acquireGeoReader(path, geoDBASN, 0); err != nil {
+		t.Fatalf("acquireGeoReader: %v", err)
+	}
+	t.Cleanup(func() { app.releaseGeoReader(path) })
+
+	health := app.geoHealth()
+	if len(health) != 1 {
+		t.Fatalf("geoHealth() = %+v, want 1 entry", health)
+	}
+	h := health[0]
+	if h.Key != geoPoolKey(path) || !h.Healthy || h.References != 1 || h.BuildEpoch != 1700000000 || h.LoadedAt == nil || h.LastError != "" {
+		t.Errorf("geoHealth()[0] = %+v, want key %q, healthy, 1 reference, build_epoch 1700000000, loaded_at set, no last_error", h, geoPoolKey(path))
+	}
+}
+
 func TestApp_AcquireGeoReader_EmptyPathNoOp(t *testing.T) {
 	app := &App{}
 	if err := app.Provision(caddy.Context{}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	r, err := app.acquireGeoReader("")
+	r, err := app.acquireGeoReader("", geoDBCity, 0)
 	if err != nil || r != nil {
 		t.Errorf("acquireGeoReader(\"\") = (%v, %v), want (nil, nil)", r, err)
 	}

@@ -18,8 +18,9 @@ across blocks with Caddy's native `import`/named-snippet mechanism. See
 | Directive | Args | Default | Notes |
 |---|---|---|---|
 | `backend <string>` | 1 | `"default"` | A label only — used in metrics/logs/admin output, never affects routing. |
-| `geoip_city_db <path>` | 1 | unset (no country/ASN lookups) | Path to a MaxMind city `.mmdb`. Fails open independently of `geoip_asn_db` if unopenable. |
-| `geoip_asn_db <path>` | 1 | unset | Path to a MaxMind ASN `.mmdb`. Fails open independently of `geoip_city_db`. |
+| `geoip_city_db <path>` | 1 | unset (no country/ASN lookups) | Path to a MaxMind City or Country `.mmdb`. Fails open independently of `geoip_asn_db` if unopenable (missing, corrupt, or not a City/Country database), with a `warn` log, until a valid file appears (see `geoip_reload_interval`). |
+| `geoip_asn_db <path>` | 1 | unset | Path to a MaxMind ASN `.mmdb`. Fails open independently of `geoip_city_db`, same as above. |
+| `geoip_reload_interval <duration>` | 1 | `1m` | How often both GeoIP files are checked for a replacement (`os.Stat`: inode, modification time, size). A changed file is opened, validated (database type matches the directive, a test lookup succeeds) and swapped in while Caddy keeps running — **no Caddy reload is needed after a `geoipupdate` run**. A file that fails validation is logged at `warn` and skipped until it changes again; the current database stays in use. A file missing or invalid at startup is picked up the same way once a valid one appears. `0` disables reloading: the files are opened once, at config load. Several blocks pointing at the same file share one reader, and the interval of the first block to open it applies — keep the value the same across blocks (e.g. in a shared snippet). With Docker, mount the GeoIP *directory*, not the files: a file bind mount keeps showing the old file after `geoipupdate` renames a new one into place. |
 | `auth_issuer <string>` | 1 | `""` | Expected JWT `iss` claim; not itself validated at parse time. |
 | `auth_jwks_url <url>` | 1 | `""` (auth disabled) | JWKS endpoint for verifying bearer tokens (RS256), refreshed on a background loop. |
 | `auth_audience <string>` | 1 | `""` | Expected JWT `aud` claim; not itself validated at parse time. |

@@ -517,6 +517,26 @@ func TestIntegration_EndToEnd_AdminStatusEndpoints(t *testing.T) {
 // distinct wording for "not configured at all" vs. "configured but failed
 // to open/initialize".
 
+// TestIntegration_GeoIPReloadInterval_ZeroSurvivesAdapter guards the
+// Caddyfile adapter → JSON step: `geoip_reload_interval 0` (reloading off)
+// must stay distinguishable from unset (the default interval).
+func TestIntegration_GeoIPReloadInterval_ZeroSurvivesAdapter(t *testing.T) {
+	cfg := adaptCaddyfile(t, `
+:19100 {
+	fairness {
+		geoip_reload_interval 0
+	}
+}
+`)
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if !strings.Contains(string(cfgJSON), `"geoip_reload_interval":0`) {
+		t.Errorf("adapted config = %s, want it to carry geoip_reload_interval 0", cfgJSON)
+	}
+}
+
 func TestIntegration_ConfigError_AsnEnabled_NotConfigured(t *testing.T) {
 	input := `
 :19085 {

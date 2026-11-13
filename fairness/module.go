@@ -128,14 +128,14 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 	geo := &geoLookup{}
 	if h.GeoIPCityDB != "" {
-		reader, err := app.acquireGeoReader(h.GeoIPCityDB)
+		reader, err := app.acquireGeoReader(h.GeoIPCityDB, geoDBCity, h.Config.geoIPReloadInterval())
 		if err != nil {
 			return err
 		}
 		geo.city = reader
 	}
 	if h.GeoIPASNDB != "" {
-		reader, err := app.acquireGeoReader(h.GeoIPASNDB)
+		reader, err := app.acquireGeoReader(h.GeoIPASNDB, geoDBASN, h.Config.geoIPReloadInterval())
 		if err != nil {
 			return err
 		}
@@ -171,7 +171,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	resolved := resolveScoringConfig(h.ScoringOverrides)
 
 	if _, ok := resolved.Dimensions["asn"]; ok {
-		if h.geo.asn == nil || h.geo.asn.reader == nil {
+		if !h.geo.asn.available() {
 			h.releaseAcquired()
 			if h.GeoIPASNDB == "" {
 				return fmt.Errorf("fairness: scoring dimension %q is enabled but geoip_asn_db is not configured on this block", "asn")
@@ -180,7 +180,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 	if _, ok := resolved.Dimensions["country"]; ok {
-		if h.geo.city == nil || h.geo.city.reader == nil {
+		if !h.geo.city.available() {
 			h.releaseAcquired()
 			if h.GeoIPCityDB == "" {
 				return fmt.Errorf("fairness: scoring dimension %q is enabled but geoip_city_db is not configured on this block", "country")
@@ -218,7 +218,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		if len(pc.ExemptCountries) == 0 {
 			continue
 		}
-		if h.geo.city == nil || h.geo.city.reader == nil {
+		if !h.geo.city.available() {
 			h.releaseAcquired()
 			if h.GeoIPCityDB == "" {
 				return fmt.Errorf("fairness: scoring dimension %q configures exempt_country but geoip_city_db is not configured on this block", dim)
@@ -349,6 +349,19 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				h.GeoIPASNDB = d.Val()
+
+			case "geoip_reload_interval":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("invalid geoip_reload_interval %q: %v", d.Val(), err)
+				}
+				if dur < 0 {
+					return d.Errf("geoip_reload_interval must be >= 0, got %v", dur)
+				}
+				h.GeoIPReloadInterval = &dur
 
 			case "auth_issuer":
 				if !d.NextArg() {
