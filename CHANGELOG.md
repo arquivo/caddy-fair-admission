@@ -1,3 +1,13 @@
+## [3.3.0](https://github.com/arquivo/caddy-fair-admission/compare/v3.2.0...v3.3.0) (2026-11-13)
+
+### Features
+
+* **adaptive_admission:** add opt-in queue aging and configurable reject status ([a7e10c8](https://github.com/arquivo/caddy-fair-admission/commit/a7e10c8e68f014f89aaf6fce47ead543dbf8f1df))
+
+### Bug Fixes
+
+* **adaptive_admission:** reject queued requests on timeout or client disconnect ([eba1cd6](https://github.com/arquivo/caddy-fair-admission/commit/eba1cd6743a9bc3510a7e116ec8b8f10d148d539))
+
 ## [3.2.0](https://github.com/arquivo/caddy-fair-admission/compare/v3.1.0...v3.2.0) (2026-11-13)
 
 ### Features
