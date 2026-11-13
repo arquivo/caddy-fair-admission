@@ -570,7 +570,9 @@ Caddyfile global-options block of its own.
    (2026-11-13):** yes, after a broker load test left a penalised client's requests queued for
    over 30s. Each queued request waits in `Scheduler.Wait` (queue.go) on its own `queue_timeout`
    timer and on `r.Context().Done()`, and is removed from the heap with reason `queue_timed_out` or
-   `client_gone` — no sweep or expiry index needed. Join-time rejection is unchanged.
+   `client_gone` — no sweep or expiry index needed. Join-time rejection is unchanged. The
+   starvation itself is addressed by the opt-in `queue_aging_rate` (configuration.md §7), and the
+   rejection status by `reject_status` (default still 429).
 
 ## 8. Performance requirements and lessons from the Python implementation
 

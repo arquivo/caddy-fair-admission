@@ -285,8 +285,11 @@ adaptive_admission {
         adjust_interval        <duration>
     }
 
-    queue_max_size <int>
-    queue_timeout  <duration>
+    queue_max_size   <int>
+    queue_timeout    <duration>
+    queue_aging_rate <float>
+    reject_status    <int>
+    retry_after      <duration>
 }
 ```
 
@@ -296,6 +299,9 @@ adaptive_admission {
 | `controller <fixed\|adaptive>` | — (required) | Selects the capacity-control strategy for this backend. |
 | `queue_max_size <int>` | `0` (unbounded) | Max tickets the priority queue holds before rejecting new arrivals with `queue_full`. |
 | `queue_timeout <duration>` | `0` (unbounded) | Max queue wait. Checked as a Little's-law projection on arrival (`queue_wait_exceeded`) and against each queued request's real wait (`queue_timed_out`), see §7. |
+| `queue_aging_rate <float>` | `0` (off, strict score order) | Score points per second a queued request gains over a fresh one, so a lower score is slowed down but never starved (§7). Must be `>= 0`. |
+| `reject_status <int>` | `429` | HTTP status for `queue_full`, `queue_wait_exceeded` and `queue_timed_out` rejections. Any 4xx/5xx, e.g. `503` behind a proxy that counts `429`s against the client (§7). |
+| `retry_after <duration>` | unset (no header) | Sends `Retry-After` (whole seconds, rounded up) on those same rejections. |
 
 `controller fixed { limit <int> }` — a static concurrency ceiling. `limit` must be `> 0`.
 
@@ -328,8 +334,19 @@ The priority queue orders tickets by **score descending**, then **arrival order 
 equal scores — a higher-scored request is always served first, but two requests with the same
 score are served in the order they arrived.
 
+**Aging (`queue_aging_rate`).** Strict score order lets a lower-scored request wait for as long as
+higher-scored ones keep arriving — a 2026-11-13 load test on a broker left a penalised client
+(score 50) with nothing served for over 30s while lighter clients (score 60) ran. With a rate `r`,
+a queued request is ordered by `score + r × seconds waited`, so a request whose score is `d` below
+a fresh arrival is served first once it has waited `d / r` seconds. For example, at `5`, the
+`ip` soft penalty (10 points) costs at most 2s of extra wait against fresh traffic, and the hard
+penalty (40 points) at most 8s. Because every queued request ages at the same rate, the order of
+two queued requests never changes as they wait, which keeps the queue an ordinary heap. `0` keeps
+strict score order.
+
 Four rejection reasons, logged/labeled separately (see [`monitoring.md`](monitoring.md)).
-The first three are answered with HTTP 429:
+The first three are answered with `reject_status` (default 429, plus `Retry-After` if
+`retry_after` is set):
 
 - **`queue_full`** — the queue already holds `queue_max_size` tickets when a new one arrives.
 - **`queue_wait_exceeded`** — a Little's-law-style projection already exceeds `queue_timeout`
@@ -348,6 +365,11 @@ The first three are answered with HTTP 429:
   queue and never reaches the backend; the status (499) only shows in Caddy's own logs. Behind a
   proxy such as httpd, Caddy only sees the disconnect once the proxy closes its own connection to
   Caddy, so `queue_timeout` is what bounds such a request's wait there.
+
+Behind a proxy that rate-limits on the status code — e.g. httpd's mod_qos with
+`QS_SetEnvIfStatus 429 QS_Block`, which counts each 429 towards blocking that client IP — a
+rejection caused by overall overload can get a client blocked at the proxy. Set
+`reject_status 503` there.
 
 ## 8. How `fairness` and `adaptive_admission` hand off
 

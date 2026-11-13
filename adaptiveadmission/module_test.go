@@ -96,13 +96,17 @@ func TestHandler_ServeHTTP_RejectsQueueFull_As429(t *testing.T) {
 	}
 }
 
-func TestHandler_ServeHTTP_QueueTimeout_RejectsAs429AndRemovesTicket(t *testing.T) {
+func TestHandler_ServeHTTP_QueueTimeout_UsesRejectStatusAndRetryAfter(t *testing.T) {
 	c := NewFixedController(1)
 	c.Acquire(1) // hold the only slot until the queued request times out
 	s := NewScheduler(QueueConfig{MaxSize: 10, WaitTimeout: 50 * time.Millisecond}, c)
 	s.Start()
 
-	h := &Handler{Config: Config{QueueTimeout: 50 * time.Millisecond}, controller: c, scheduler: s}
+	h := &Handler{
+		Config:     Config{QueueTimeout: 50 * time.Millisecond, RejectStatus: http.StatusServiceUnavailable, RetryAfter: 1500 * time.Millisecond},
+		controller: c,
+		scheduler:  s,
+	}
 
 	rec := httptest.NewRecorder()
 	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
@@ -114,8 +118,11 @@ func TestHandler_ServeHTTP_QueueTimeout_RejectsAs429AndRemovesTicket(t *testing.
 	if !errors.As(err, &he) {
 		t.Fatalf("ServeHTTP error = %v, want a caddyhttp.HandlerError", err)
 	}
-	if he.StatusCode != http.StatusTooManyRequests {
-		t.Errorf("StatusCode = %d, want 429", he.StatusCode)
+	if he.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("StatusCode = %d, want 503", he.StatusCode)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "2" {
+		t.Errorf("Retry-After = %q, want %q (1.5s rounded up)", got, "2")
 	}
 	if got := s.Depth(); got != 0 {
 		t.Errorf("Depth() after timeout = %d, want 0", got)
@@ -134,7 +141,7 @@ func TestHandler_ServeHTTP_ClientGoneWhileQueued_NeverDispatches(t *testing.T) {
 	s := NewScheduler(QueueConfig{MaxSize: 10}, c)
 	s.Start()
 
-	h := &Handler{controller: c, scheduler: s}
+	h := &Handler{Config: Config{RetryAfter: time.Second}, controller: c, scheduler: s}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := newVarsRequest(nil)
@@ -159,6 +166,9 @@ func TestHandler_ServeHTTP_ClientGoneWhileQueued_NeverDispatches(t *testing.T) {
 	var he caddyhttp.HandlerError
 	if !errors.As(err, &he) || he.StatusCode != statusClientClosedRequest {
 		t.Errorf("ServeHTTP error = %v, want a HandlerError with status 499", err)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Errorf("Retry-After = %q on client_gone, want none", got)
 	}
 
 	// The freed slot is never handed to the abandoned request.
@@ -321,6 +331,25 @@ func TestHandler_Provision_InvalidControllerConfigReturnsError(t *testing.T) {
 	}
 }
 
+func TestHandler_Provision_InvalidQueueConfigReturnsError(t *testing.T) {
+	fixed := ControllerConfig{Kind: controllerKindFixed, Limit: 5}
+	cases := map[string]Config{
+		"negative queue_aging_rate": {Controller: fixed, QueueAgingRate: -1},
+		"reject_status 200":         {Controller: fixed, RejectStatus: 200},
+		"reject_status 600":         {Controller: fixed, RejectStatus: 600},
+		"negative retry_after":      {Controller: fixed, RetryAfter: -time.Second},
+	}
+	for name, cfg := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := &Handler{Config: cfg}
+			if err := h.Provision(caddy.Context{}); err == nil {
+				_ = h.Cleanup()
+				t.Fatal("expected a Provision error, got nil")
+			}
+		})
+	}
+}
+
 func TestHandler_Cleanup_SafeWithoutProvision(t *testing.T) {
 	h := &Handler{}
 	if err := h.Cleanup(); err != nil {
@@ -354,6 +383,42 @@ func TestUnmarshalCaddyfile_ControllerFixed(t *testing.T) {
 	}
 	if h.QueueTimeout != 10*time.Second {
 		t.Errorf("QueueTimeout = %v, want 10s", h.QueueTimeout)
+	}
+}
+
+func TestUnmarshalCaddyfile_QueueAgingAndRejectStatus(t *testing.T) {
+	input := `adaptive_admission {
+		controller fixed {
+			limit 20
+		}
+		queue_aging_rate 5
+		reject_status    503
+		retry_after      5s
+	}`
+	var h Handler
+	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+		t.Fatalf("UnmarshalCaddyfile: %v", err)
+	}
+	if h.QueueAgingRate != 5 {
+		t.Errorf("QueueAgingRate = %v, want 5", h.QueueAgingRate)
+	}
+	if h.RejectStatus != 503 {
+		t.Errorf("RejectStatus = %d, want 503", h.RejectStatus)
+	}
+	if h.RetryAfter != 5*time.Second {
+		t.Errorf("RetryAfter = %v, want 5s", h.RetryAfter)
+	}
+}
+
+func TestUnmarshalCaddyfile_QueueAgingAndRejectStatus_InvalidValues(t *testing.T) {
+	for _, line := range []string{"queue_aging_rate fast", "reject_status busy", "retry_after soon", "reject_status"} {
+		t.Run(line, func(t *testing.T) {
+			input := "adaptive_admission {\n" + line + "\n}"
+			var h Handler
+			if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {
+				t.Fatalf("expected an error for %q, got nil", line)
+			}
+		})
 	}
 }
 

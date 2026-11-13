@@ -5,6 +5,7 @@ package adaptiveadmission
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -110,6 +111,9 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // this guard never affects real deployments — see metrics.go's near-identical
 // comment for the same underlying hazard.
 func (h *Handler) Provision(ctx caddy.Context) error {
+	if err := h.Config.validate(); err != nil {
+		return err
+	}
 	controller, err := h.Config.Controller.buildController()
 	if err != nil {
 		return err
@@ -219,8 +223,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 }
 
 // reject records and logs a request that was never dispatched, and returns
-// the error that makes Caddy answer it: 429 for the overload reasons, 499
-// for client_gone.
+// the error that makes Caddy answer it: RejectStatus (default 429) with an
+// optional Retry-After for the overload reasons, 499 for client_gone.
 func (h *Handler) reject(w http.ResponseWriter, r *http.Request, backend string, reason RejectReason, queueWait time.Duration) error {
 	admissionMetrics.requestsRejected.WithLabelValues(backend, reason.String()).Inc()
 	h.logDecision(r, logDecisionParams{backend: backend, admitted: false, rejectReason: reason, queueWait: queueWait})
@@ -229,7 +233,10 @@ func (h *Handler) reject(w http.ResponseWriter, r *http.Request, backend string,
 	if reason == RejectClientGone {
 		return caddyhttp.Error(statusClientClosedRequest, err)
 	}
-	return caddyhttp.Error(http.StatusTooManyRequests, err)
+	if h.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(h.RetryAfter.Seconds()))))
+	}
+	return caddyhttp.Error(h.Config.rejectStatus(), err)
 }
 
 // logDecisionParams carries the fields logDecision needs beyond what it
@@ -310,8 +317,11 @@ func (h *Handler) logDecision(r *http.Request, p logDecisionParams) {
 //	        error_rate_threshold   <float>
 //	        adjust_interval        <duration>
 //	    }
-//	    queue_max_size <int>
-//	    queue_timeout  <duration>
+//	    queue_max_size   <int>
+//	    queue_timeout    <duration>
+//	    queue_aging_rate <float>
+//	    reject_status    <int>
+//	    retry_after      <duration>
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -347,6 +357,36 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid queue_timeout %q: %v", d.Val(), err)
 				}
 				h.QueueTimeout = dur
+
+			case "queue_aging_rate":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				f, err := strconv.ParseFloat(d.Val(), 64)
+				if err != nil {
+					return d.Errf("invalid queue_aging_rate %q: %v", d.Val(), err)
+				}
+				h.QueueAgingRate = f
+
+			case "reject_status":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				n, err := strconv.Atoi(d.Val())
+				if err != nil {
+					return d.Errf("invalid reject_status %q: %v", d.Val(), err)
+				}
+				h.RejectStatus = n
+
+			case "retry_after":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("invalid retry_after %q: %v", d.Val(), err)
+				}
+				h.RetryAfter = dur
 
 			default:
 				return d.Errf("unrecognized adaptive_admission subdirective '%s'", d.Val())

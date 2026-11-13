@@ -274,6 +274,130 @@ func TestRejectReason_String(t *testing.T) {
 	}
 }
 
+// --- aging -------------------------------------------------------------------
+
+// fakeClock drives Scheduler.now so tests control each ticket's enqueue time.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) set(d time.Duration, base time.Time) {
+	c.mu.Lock()
+	c.t = base.Add(d)
+	c.mu.Unlock()
+}
+
+func newSchedulerWithClock(cfg QueueConfig, c *Controller) (*Scheduler, *fakeClock) {
+	s := NewScheduler(cfg, c)
+	clock := &fakeClock{t: s.epoch}
+	s.now = clock.now
+	return s, clock
+}
+
+func TestScheduler_Aging_LongWaitingLowerScoreOvertakesFresherHigherScore(t *testing.T) {
+	cases := []struct {
+		name        string
+		highArrival time.Duration
+		wantFirst   string
+	}{
+		// Rate 5/s: the score-50 ticket gains 10 points (the gap) after 2s.
+		{"high arrives after 1s: high still first", 1 * time.Second, "high"},
+		{"high arrives after 3s: low has aged past it", 3 * time.Second, "low"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewFixedController(1)
+			c.Acquire(1)
+			s, clock := newSchedulerWithClock(QueueConfig{MaxSize: 10, AgingRate: 5}, c)
+			s.Start()
+			defer s.Stop()
+
+			low, _ := s.Enqueue(50)
+			clock.set(tc.highArrival, s.epoch)
+			high, _ := s.Enqueue(60)
+
+			first, second := high, low
+			if tc.wantFirst == "low" {
+				first, second = low, high
+			}
+			c.Release(1, time.Millisecond, 200, false)
+			mustGrantWithin(t, first, time.Second, tc.wantFirst+" ticket not granted first")
+			mustNotGrantWithin(t, second, 30*time.Millisecond, "second ticket granted with only one slot freed")
+			c.Release(1, time.Millisecond, 200, false)
+			mustGrantWithin(t, second, time.Second, "second ticket never granted")
+			c.Release(1, time.Millisecond, 200, false)
+		})
+	}
+}
+
+// grantsBeforeLowScoreServed reproduces the p85 starvation scenario at the
+// scheduler level: one score-50 ticket is queued, then a fresh score-60
+// ticket arrives every 100ms (fake clock) for each of maxRounds single-slot
+// dispatches. It returns the round at which the score-50 ticket was granted,
+// or -1 if every round went to a score-60 ticket.
+func grantsBeforeLowScoreServed(t *testing.T, agingRate float64, maxRounds int) int {
+	t.Helper()
+	c := NewFixedController(1)
+	c.Acquire(1)
+	s, clock := newSchedulerWithClock(QueueConfig{MaxSize: 10, AgingRate: agingRate}, c)
+	s.Start()
+
+	low, _ := s.Enqueue(50)
+	var pending *Ticket
+	defer func() {
+		// Withdraw whatever is still queued, then free the held slot so the
+		// dispatch loop's lookahead Acquire can return and Stop can finish.
+		s.Cancel(low)
+		if pending != nil {
+			s.Cancel(pending)
+		}
+		c.Release(1, time.Millisecond, 200, false)
+		s.Stop()
+		if got := c.InFlight(); got != 0 {
+			t.Errorf("InFlight() after Stop = %d, want 0", got)
+		}
+	}()
+
+	for round := 1; round <= maxRounds; round++ {
+		clock.set(time.Duration(round)*100*time.Millisecond, s.epoch)
+		high, _ := s.Enqueue(60)
+		pending = high
+		c.Release(1, time.Millisecond, 200, false)
+		select {
+		case <-low.Granted():
+			return round
+		case <-high.Granted():
+			pending = nil
+		case <-time.After(time.Second):
+			t.Fatalf("round %d: nothing granted after freeing a slot", round)
+		}
+	}
+	return -1
+}
+
+func TestScheduler_Aging_PreventsStarvationUnderContinuousHigherScoreArrivals(t *testing.T) {
+	// Gap 10 at 5 points/s: the score-50 ticket ties a fresh score-60 one
+	// after 2s (round 20) and wins the tie on arrival order.
+	if got := grantsBeforeLowScoreServed(t, 5, 100); got != 20 {
+		t.Errorf("score-50 ticket granted at round %d, want 20", got)
+	}
+}
+
+func TestScheduler_NoAging_StrictPriorityStarvesLowerScore(t *testing.T) {
+	// Documents the default (aging off): strict score order, the p85 load
+	// test's starvation. queue_timeout is what bounds such a wait.
+	if got := grantsBeforeLowScoreServed(t, 0, 100); got != -1 {
+		t.Errorf("score-50 ticket granted at round %d, want never with aging off", got)
+	}
+}
+
 // --- Wait: deadline, client gone, and the grant/cancel race ---------------
 
 func TestScheduler_Wait_DeadlineRejectsAndRemovesTicket(t *testing.T) {
@@ -377,7 +501,7 @@ func TestScheduler_Wait_ConcurrentCancelsAndTimeouts_NoLeakNoOverAdmission(t *te
 	const iterationsEach = 50
 
 	c := NewFixedController(limit)
-	s := NewScheduler(QueueConfig{MaxSize: goroutines * iterationsEach, WaitTimeout: 2 * time.Millisecond}, c)
+	s := NewScheduler(QueueConfig{MaxSize: goroutines * iterationsEach, WaitTimeout: 2 * time.Millisecond, AgingRate: 50}, c)
 	s.Start()
 
 	var inFlight, maxObserved, admitted, timedOut, gone int64

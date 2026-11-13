@@ -2,7 +2,9 @@
 // (REQUIREMENTS.md §4.5), built on top of capacity.go's Controller.
 //
 // A request is enqueued with its fairness score (higher score = served
-// first; arrival order breaks ties), then waits in Scheduler.Wait until it is granted, its queue_timeout
+// first; arrival order breaks ties, and an optional aging rate lets a
+// long-waiting lower score overtake fresher higher ones — see Ticket.key),
+// then waits in Scheduler.Wait until it is granted, its queue_timeout
 // deadline passes, or its client goes away. A single dispatch-loop goroutine repeatedly acquires one unit of
 // capacity from the Controller and only then pops the current highest-
 // priority ticket — never the other way around — so admission always
@@ -64,12 +66,18 @@ func (r RejectReason) String() string {
 	}
 }
 
-// QueueConfig tunes a Scheduler's admission bounds (§4.5). Zero value means
-// "unbounded" for either field: MaxSize<=0 never rejects on depth,
-// WaitTimeout<=0 never rejects on projected or real wait.
+// QueueConfig tunes a Scheduler's admission bounds and ordering (§4.5).
+// Zero value means "unbounded"/"off" for each field: MaxSize<=0 never
+// rejects on depth, WaitTimeout<=0 never rejects on projected or real wait,
+// AgingRate<=0 keeps strict score order.
 type QueueConfig struct {
 	MaxSize     int
 	WaitTimeout time.Duration
+	// AgingRate is how many score points per second of waiting a queued
+	// ticket gains over a ticket that just arrived. With a rate r, a ticket
+	// whose score is d below a fresh one is served first once it has waited
+	// d/r seconds, so a lower score is slowed down but never starved.
+	AgingRate float64
 }
 
 // Ticket represents one request's place in the queue. Score is read-only
@@ -77,7 +85,14 @@ type QueueConfig struct {
 type Ticket struct {
 	Score float64
 
-	seq     uint64 // arrival order, for FIFO tie-break within equal scores
+	// key is the heap's priority, higher first: Score minus AgingRate times
+	// the enqueue time in seconds since the Scheduler was created. Every
+	// queued ticket gains AgingRate points per second at the same pace, so
+	// comparing "Score + AgingRate*waited" between two tickets reduces to
+	// comparing this fixed key — the heap never needs re-sorting as time
+	// passes. With AgingRate 0, key is just Score.
+	key     float64
+	seq     uint64 // arrival order, for FIFO tie-break within equal keys
 	index   int    // heap.Interface bookkeeping; -1 once popped or removed
 	granted chan struct{}
 }
@@ -89,15 +104,15 @@ func (t *Ticket) Granted() <-chan struct{} {
 	return t.granted
 }
 
-// ticketHeap is a container/heap.Interface ordering by score descending,
-// then seq ascending (FIFO within equal scores) — heap.Pop always yields the
+// ticketHeap is a container/heap.Interface ordering by key descending, then
+// seq ascending (FIFO within equal keys) — heap.Pop always yields the
 // current highest-priority ticket.
 type ticketHeap []*Ticket
 
 func (h ticketHeap) Len() int { return len(h) }
 func (h ticketHeap) Less(i, j int) bool {
-	if h[i].Score != h[j].Score {
-		return h[i].Score > h[j].Score
+	if h[i].key != h[j].key {
+		return h[i].key > h[j].key
 	}
 	return h[i].seq < h[j].seq
 }
@@ -130,6 +145,11 @@ type Scheduler struct {
 	pq   ticketHeap
 	seq  uint64
 
+	// epoch and now feed Ticket.key; now is time.Now except in tests that
+	// need to control enqueue times.
+	epoch time.Time
+	now   func() time.Time
+
 	cfg        QueueConfig
 	controller *Controller
 
@@ -140,7 +160,8 @@ type Scheduler struct {
 // NewScheduler builds a Scheduler over controller. Start() must be called
 // before any enqueued ticket can ever be granted.
 func NewScheduler(cfg QueueConfig, controller *Controller) *Scheduler {
-	s := &Scheduler{cfg: cfg, controller: controller}
+	s := &Scheduler{cfg: cfg, controller: controller, now: time.Now}
+	s.epoch = s.now()
 	s.cond = sync.NewCond(&s.mu)
 	return s
 }
@@ -181,7 +202,11 @@ func (s *Scheduler) Enqueue(score float64) (*Ticket, RejectReason) {
 	}
 
 	s.seq++
-	t := &Ticket{Score: score, seq: s.seq, granted: make(chan struct{})}
+	key := score
+	if s.cfg.AgingRate > 0 {
+		key -= s.cfg.AgingRate * s.now().Sub(s.epoch).Seconds()
+	}
+	t := &Ticket{Score: score, key: key, seq: s.seq, granted: make(chan struct{})}
 	heap.Push(&s.pq, t)
 	s.cond.Signal()
 	return t, RejectNone
