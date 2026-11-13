@@ -64,6 +64,11 @@ type Config struct {
 	// value is invalid, or lacks a capturing group), exactly like
 	// geoip_asn_db being required for the asn dimension.
 	ArchivedDomainRegex string `json:"archived_domain_regex,omitempty"`
+
+	// SessionCookie configures the signed session cookie (session.go). Nil
+	// means the feature is off on this block: the cookie is neither issued
+	// nor checked.
+	SessionCookie *SessionCookieConfig `json:"session_cookie,omitempty"`
 }
 
 // backendLabel returns the configured Backend label, or "default" if unset.

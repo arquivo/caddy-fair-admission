@@ -32,7 +32,7 @@ var validScoringDimensions = map[string]bool{
 	"archived_domain": true,
 }
 
-// validUserClasses are the 5 user classes base_score may legitimately be
+// validUserClasses are the 6 user classes base_score may legitimately be
 // configured for (unlike validClaimedUserClasses in classify.go, this
 // includes anonymous/unknown since a Caddyfile author configures base scores
 // for all identity outcomes, not just JWT-claimed ones).
@@ -42,6 +42,7 @@ var validUserClasses = map[UserClass]bool{
 	UserClassServiceAccount: true,
 	UserClassInternal:       true,
 	UserClassUnknown:        true,
+	UserClassHumanVerified:  true,
 }
 
 // Scoring-specific defaults (§4.3/§3.2). EWMATickInterval/IdleEntryTTL zero
@@ -158,7 +159,10 @@ type ScoringConfig struct {
 //     anonymous gets a lower base (60, matching §5's example); unknown (a
 //     present-but-unverifiable token) gets the same base as anonymous, since
 //     it shouldn't be trusted *less* than having no token at all, nor
-//     rejected outright — scoring/penalties do the rest.
+//     rejected outright — scoring/penalties do the rest. human_verified (a
+//     valid session cookie, session.go) sits in between (80): a recent
+//     human session earns a better baseline than anonymous traffic, but
+//     less than an authenticated, trusted identity.
 //   - MinScore/MaxScore: 0/100.
 //   - Per-dimension alpha/soft/hard, roughly scaled by how many distinct
 //     requesters typically share that bucket: ip/user (single entity) use
@@ -174,6 +178,7 @@ func newDefaultScoringConfig() ScoringConfig {
 			UserClassInternal:       100,
 			UserClassAnonymous:      60,
 			UserClassUnknown:        60,
+			UserClassHumanVerified:  80,
 		},
 		MinScore: 0,
 		MaxScore: 100,
@@ -341,6 +346,7 @@ func dimensionKey(dim string, c Classification) (key string, ok bool) {
 		}
 		return c.Country, true
 	case "user":
+		// JWT `sub`, or "session:<random-id>" for a session cookie.
 		if c.UserID == "" {
 			return "", false
 		}

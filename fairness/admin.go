@@ -89,6 +89,38 @@ type backendScoringStatus struct {
 	Dimensions           map[string]PenaltyConfig `json:"dimensions"`
 	Divisors             map[string]float64       `json:"divisors"`
 	DimensionEntryCounts map[string]int           `json:"dimension_entry_counts"`
+	SessionCookie        *sessionCookieStatus     `json:"session_cookie,omitempty"`
+}
+
+// sessionCookieStatus is a backend's session_cookie config as reported by
+// the admin API — key IDs only, never the secrets or their file paths.
+type sessionCookieStatus struct {
+	Name       string   `json:"name"`
+	Issue      bool     `json:"issue"`
+	Check      bool     `json:"check"`
+	TTLSeconds float64  `json:"ttl_seconds"`
+	SigningKID string   `json:"signing_kid"`
+	KIDs       []string `json:"kids"`
+}
+
+// status returns sc's admin-reportable config, or nil if sc is nil.
+func (sc *sessionCookies) status() *sessionCookieStatus {
+	if sc == nil {
+		return nil
+	}
+	kids := make([]string, 0, len(sc.keys))
+	for kid := range sc.keys {
+		kids = append(kids, kid)
+	}
+	sort.Strings(kids)
+	return &sessionCookieStatus{
+		Name:       sc.name,
+		Issue:      sc.issue,
+		Check:      sc.check,
+		TTLSeconds: sc.ttl.Seconds(),
+		SigningKID: sc.signKID,
+		KIDs:       kids,
+	}
 }
 
 type statusResponse struct {
@@ -128,6 +160,7 @@ func (a *AdminAPI) handleStatus(w http.ResponseWriter, r *http.Request) error {
 			Dimensions:           cfg.Dimensions,
 			Divisors:             cfg.Divisors,
 			DimensionEntryCounts: h.scoring.entryCounts(),
+			SessionCookie:        h.session.status(),
 		})
 	}
 	sort.Slice(backends, func(i, j int) bool { return backends[i].Backend < backends[j].Backend })

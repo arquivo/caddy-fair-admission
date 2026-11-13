@@ -1,0 +1,100 @@
+# Human-session priority with a signed session cookie
+# (docs/configuration.md §10, arquivo/pwa-technologies#1664).
+#
+# Human-facing pages go through Anubis first. Anubis forwards the browsers
+# that pass its challenge to the internal listener below, where fairness
+# *issues* a short-lived HMAC-signed `aac_session` cookie. Wayback replay is
+# served from the same host, so the browser sends that cookie with the replay
+# page and every subresource request, and the checking block there gives the
+# whole page load the higher human_verified base score.
+#
+# Requests without a valid cookie (direct/automated clients, or a
+# forged/expired cookie) are never blocked. They keep the anonymous/unknown
+# base score, exactly as without this feature. Fairness doesn't know Anubis
+# exists: the only link is that the issuing block sits behind it here.
+#
+# Validate with:
+#   caddy validate --config examples/fairness-session-cookie.Caddyfile --adapter caddyfile
+
+arquivo.example.org {
+	# Human-facing pages: through Anubis. Anubis's TARGET is the internal
+	# listener below (http://127.0.0.1:8081), never the webapp directly.
+	@human path / /search* /image/search* /services/savepagenow* /services/citationsaver*
+	handle @human {
+		reverse_proxy 127.0.0.1:8923
+	}
+
+	# Wayback replay (page + subresources): check the cookie.
+	handle /wayback/* {
+		fairness {
+			backend wayback
+
+			session_cookie {
+				# Classify by the cookie, never set it on this route.
+				mode check
+				# Same key file(s) as the issuing block, on every
+				# instance. First key signs, all keys verify -- to
+				# rotate, prepend the new key and drop the old one
+				# after one ttl.
+				key k1 /etc/caddy/aac-session-k1.key
+			}
+
+			scoring {
+				# Between anonymous (60) and the JWT-trusted classes
+				# (100). For a first observation-only rollout, set this
+				# to 60 and compare per-class metrics before raising it.
+				base_score human_verified 80
+				base_score anonymous      60
+				base_score unknown        60
+
+				# Per browser session (the cookie's random-id): a
+				# cookie holder that floods requests still drops back
+				# down, and users behind one NAT don't share a counter.
+				penalty user
+				# Per IP, for everyone -- also bounds a client that
+				# mints many sessions to spread its load.
+				penalty ip
+			}
+		}
+
+		adaptive_admission {
+			backend wayback
+			controller adaptive {
+				min_concurrency     10
+				initial_concurrency 40
+				max_concurrency     200
+				target_p95          2s
+			}
+			queue_max_size 1000
+			queue_timeout  15s
+		}
+
+		reverse_proxy pywb:8080
+	}
+
+	# Everything else (static assets, ...) goes straight to the webapp.
+	handle {
+		reverse_proxy webapp:3000
+	}
+}
+
+# Internal listener: only Anubis reaches it. It must not be reachable from
+# outside, or a bot could get the cookie without passing the challenge.
+http://127.0.0.1:8081 {
+	bind 127.0.0.1
+
+	fairness {
+		backend webapp
+		session_cookie {
+			# Set the cookie on responses: a new session if the request
+			# has none, or a renewal (same session id) once the current
+			# one is past half its ttl.
+			mode issue
+			key  k1 /etc/caddy/aac-session-k1.key
+			name aac_session
+			ttl  30m
+		}
+	}
+
+	reverse_proxy webapp:3000
+}

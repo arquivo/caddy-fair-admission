@@ -1,3 +1,9 @@
+## [3.1.0](https://github.com/arquivo/caddy-fair-admission/compare/v3.0.0...v3.1.0) (2026-10-13)
+
+### Features
+
+* **fairness:** add signed session cookie for human-session priority ([089eca0](https://github.com/arquivo/caddy-fair-admission/commit/089eca07d901d326f9dd723d327e2721f2ab3d5d)), closes [arquivo/pwa-technologies#1664](https://github.com/arquivo/pwa-technologies/issues/1664)
+
 ## [3.0.0](https://github.com/arquivo/caddy-fair-admission/compare/v2.1.0...v3.0.0) (2026-08-07)
 
 
