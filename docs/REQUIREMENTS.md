@@ -553,7 +553,7 @@ Caddyfile global-options block of its own.
    (§3.1/§5)~~ — **decided:** enforced via `httpcaddyfile.RegisterOrder` (`fairness` immediately
    before `adaptive_admission`); explicit `route { ... }` wrapping remains valid but is no longer
    required.
-8. **Open — flagged for future discussion, not decided here (2026-08-07):** should an already-queued
+8. ~~**Open — flagged for future discussion, not decided here (2026-08-07):** should an already-queued
    ticket be actively evicted with `RejectQueueWaitExceeded`/429 (the same reason and status code as
    the existing join-time rejection, §4.5) once its own wait has exceeded `queue_timeout`, rather
    than only checking a *projected* wait for new arrivals at `Enqueue` time? Today there is no
@@ -566,7 +566,11 @@ Caddyfile global-options block of its own.
    loop, or a lightweight periodic sweep, reject tickets past that deadline the same way join-time
    rejection already works. Needs its own design pass (data structure for efficiently finding expired
    tickets in a score-ordered heap, interaction with §4.3's priority divisor, whether this is even
-   worth the added complexity) before it's decided one way or the other.
+   worth the added complexity) before it's decided one way or the other.~~ — **decided
+   (2026-11-13):** yes, after a broker load test left a penalised client's requests queued for
+   over 30s. Each queued request waits in `Scheduler.Wait` (queue.go) on its own `queue_timeout`
+   timer and on `r.Context().Done()`, and is removed from the heap with reason `queue_timed_out` or
+   `client_gone` — no sweep or expiry index needed. Join-time rejection is unchanged.
 
 ## 8. Performance requirements and lessons from the Python implementation
 

@@ -36,8 +36,10 @@ type Config struct {
 	// QueueMaxSize is QueueConfig.MaxSize (§4.5). Zero/unset means
 	// unbounded.
 	QueueMaxSize int `json:"queue_max_size,omitempty"`
-	// QueueTimeout is QueueConfig.WaitTimeout (§4.5). Zero/unset means the
-	// Little's-law wait-projection check never rejects.
+	// QueueTimeout is QueueConfig.WaitTimeout (§4.5): the longest a request
+	// may wait in the queue, checked both as a Little's-law projection when
+	// it arrives and against its real wait once queued. Zero/unset means
+	// neither check ever rejects.
 	QueueTimeout time.Duration `json:"queue_timeout,omitempty"`
 }
 

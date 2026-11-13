@@ -1,6 +1,8 @@
 package adaptiveadmission
 
 import (
+	"context"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -262,10 +264,190 @@ func TestRejectReason_String(t *testing.T) {
 		{RejectNone, "none"},
 		{RejectQueueFull, "queue_full"},
 		{RejectQueueWaitExceeded, "queue_wait_exceeded"},
+		{RejectQueueTimedOut, "queue_timed_out"},
+		{RejectClientGone, "client_gone"},
 	}
 	for _, tc := range cases {
 		if got := tc.r.String(); got != tc.want {
 			t.Errorf("RejectReason(%d).String() = %q, want %q", tc.r, got, tc.want)
 		}
+	}
+}
+
+// --- Wait: deadline, client gone, and the grant/cancel race ---------------
+
+func TestScheduler_Wait_DeadlineRejectsAndRemovesTicket(t *testing.T) {
+	c := NewFixedController(1)
+	c.Acquire(1) // nothing can be granted until the test releases
+	s := NewScheduler(QueueConfig{MaxSize: 10, WaitTimeout: 50 * time.Millisecond}, c)
+	s.Start()
+
+	tk, reason := s.Enqueue(1)
+	if reason != RejectNone {
+		t.Fatalf("Enqueue rejected: %v", reason)
+	}
+	start := time.Now()
+	if got := s.Wait(context.Background(), tk); got != RejectQueueTimedOut {
+		t.Fatalf("Wait = %v, want RejectQueueTimedOut", got)
+	}
+	if waited := time.Since(start); waited < 50*time.Millisecond {
+		t.Errorf("Wait returned after %v, before the 50ms deadline", waited)
+	}
+	if got := s.Depth(); got != 0 {
+		t.Errorf("Depth() after timeout = %d, want 0 (ticket removed)", got)
+	}
+	mustNotGrantWithin(t, tk, 20*time.Millisecond, "timed-out ticket was granted")
+
+	// The freed slot must go to the next ticket, not to the removed one.
+	next, _ := s.Enqueue(1)
+	c.Release(1, time.Millisecond, 200, false)
+	if got := s.Wait(context.Background(), next); got != RejectNone {
+		t.Fatalf("Wait(next) = %v, want RejectNone", got)
+	}
+	c.Release(1, time.Millisecond, 200, false)
+	s.Stop()
+	if got := c.InFlight(); got != 0 {
+		t.Errorf("InFlight() after Stop = %d, want 0", got)
+	}
+}
+
+func TestScheduler_Wait_ClientGoneWhileQueuedRemovesTicketWithoutLeakingCapacity(t *testing.T) {
+	c := NewFixedController(1)
+	c.Acquire(1)
+	s := NewScheduler(QueueConfig{MaxSize: 10}, c)
+	s.Start()
+
+	tk, _ := s.Enqueue(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(20*time.Millisecond, cancel)
+	if got := s.Wait(ctx, tk); got != RejectClientGone {
+		t.Fatalf("Wait = %v, want RejectClientGone", got)
+	}
+	if got := s.Depth(); got != 0 {
+		t.Errorf("Depth() after client gone = %d, want 0", got)
+	}
+
+	c.Release(1, time.Millisecond, 200, false)
+	s.Stop()
+	if got := c.InFlight(); got != 0 {
+		t.Errorf("InFlight() after Stop = %d, want 0", got)
+	}
+	if got := c.window.total; got != 1 {
+		t.Errorf("outcome window total = %d, want 1 (a cancelled ticket records no outcome)", got)
+	}
+}
+
+func TestScheduler_Wait_ClientGoneAfterGrantReleasesCapacityUnused(t *testing.T) {
+	c := NewFixedController(1)
+	s := NewScheduler(QueueConfig{MaxSize: 10}, c)
+	s.Start()
+
+	tk, _ := s.Enqueue(1)
+	mustGrantWithin(t, tk, time.Second, "ticket never granted with free capacity")
+	if s.Cancel(tk) {
+		t.Fatal("Cancel of an already-granted ticket returned true")
+	}
+
+	// Granted and cancelled are both ready: whichever select case runs,
+	// the unit must go back unused and the request must not be dispatched.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := s.Wait(ctx, tk); got != RejectClientGone {
+		t.Fatalf("Wait = %v, want RejectClientGone", got)
+	}
+
+	s.Stop()
+	if got := c.InFlight(); got != 0 {
+		t.Errorf("InFlight() after Stop = %d, want 0 (granted capacity given back)", got)
+	}
+	if got := c.window.total; got != 0 {
+		t.Errorf("outcome window total = %d, want 0 (nothing was dispatched)", got)
+	}
+}
+
+// TestScheduler_Wait_ConcurrentCancelsAndTimeouts_NoLeakNoOverAdmission
+// races grants against client cancellations and queue timeouts: some
+// requests are cancelled at random moments, often the same instant the
+// dispatch loop pops them, and a short queue_timeout expires others. Every
+// request must end exactly once, admissions must never exceed the limit,
+// and once everything drains no capacity may be left held. Run with -race.
+func TestScheduler_Wait_ConcurrentCancelsAndTimeouts_NoLeakNoOverAdmission(t *testing.T) {
+	const limit = 3
+	const goroutines = 40
+	const iterationsEach = 50
+
+	c := NewFixedController(limit)
+	s := NewScheduler(QueueConfig{MaxSize: goroutines * iterationsEach, WaitTimeout: 2 * time.Millisecond}, c)
+	s.Start()
+
+	var inFlight, maxObserved, admitted, timedOut, gone int64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(seed int64) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(seed))
+			for i := 0; i < iterationsEach; i++ {
+				tk, reason := s.Enqueue(float64(rng.Intn(100)))
+				if reason != RejectNone {
+					t.Errorf("unexpected Enqueue rejection: %v", reason)
+					return
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				if rng.Intn(3) == 0 {
+					time.AfterFunc(time.Duration(rng.Intn(1500))*time.Microsecond, cancel)
+				}
+				switch s.Wait(ctx, tk) {
+				case RejectNone:
+					n := atomic.AddInt64(&inFlight, 1)
+					for {
+						cur := atomic.LoadInt64(&maxObserved)
+						if n <= cur || atomic.CompareAndSwapInt64(&maxObserved, cur, n) {
+							break
+						}
+					}
+					time.Sleep(time.Duration(rng.Intn(300)) * time.Microsecond)
+					atomic.AddInt64(&inFlight, -1)
+					atomic.AddInt64(&admitted, 1)
+					c.Release(1, time.Microsecond, 200, false)
+				case RejectQueueTimedOut:
+					atomic.AddInt64(&timedOut, 1)
+				case RejectClientGone:
+					atomic.AddInt64(&gone, 1)
+				default:
+					t.Error("Wait returned an Enqueue-only reason")
+				}
+				cancel()
+			}
+		}(int64(g))
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("deadlock or lost wakeup: goroutines did not finish within 30s")
+	}
+
+	s.Stop()
+	if got := c.InFlight(); got != 0 {
+		t.Errorf("InFlight() after Stop = %d, want 0 (capacity leaked or double-released)", got)
+	}
+	if got := s.Depth(); got != 0 {
+		t.Errorf("Depth() after all requests ended = %d, want 0", got)
+	}
+	if got := atomic.LoadInt64(&maxObserved); got > limit {
+		t.Errorf("observed %d concurrently admitted, want <= limit (%d)", got, limit)
+	}
+	total := atomic.LoadInt64(&admitted) + atomic.LoadInt64(&timedOut) + atomic.LoadInt64(&gone)
+	if total != goroutines*iterationsEach {
+		t.Errorf("admitted+timed out+gone = %d, want %d", total, goroutines*iterationsEach)
+	}
+	if atomic.LoadInt64(&admitted) == 0 || atomic.LoadInt64(&timedOut)+atomic.LoadInt64(&gone) == 0 {
+		t.Errorf("race not exercised: admitted=%d timed_out=%d gone=%d", admitted, timedOut, gone)
 	}
 }

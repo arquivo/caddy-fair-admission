@@ -2,8 +2,8 @@
 // (REQUIREMENTS.md §4.5), built on top of capacity.go's Controller.
 //
 // A request is enqueued with its fairness score (higher score = served
-// first; arrival order breaks ties), then blocks on its Ticket's Granted()
-// channel. A single dispatch-loop goroutine repeatedly acquires one unit of
+// first; arrival order breaks ties), then waits in Scheduler.Wait until it is granted, its queue_timeout
+// deadline passes, or its client goes away. A single dispatch-loop goroutine repeatedly acquires one unit of
 // capacity from the Controller and only then pops the current highest-
 // priority ticket — never the other way around — so admission always
 // reflects the queue's current priority order rather than a snapshot of
@@ -22,13 +22,14 @@ package adaptiveadmission
 
 import (
 	"container/heap"
+	"context"
 	"sync"
 	"time"
 )
 
-// RejectReason distinguishes why Enqueue refused a request (§4.5) — both
-// map to an HTTP 429 at the caller, but are reported separately in
-// logs/metrics.
+// RejectReason distinguishes why a request was never dispatched (§4.5):
+// refused at Enqueue, or withdrawn from the queue by Wait. Each is reported
+// separately in logs/metrics.
 type RejectReason int
 
 const (
@@ -40,6 +41,12 @@ const (
 	// request joining the queue right now already exceeds
 	// QueueConfig.WaitTimeout.
 	RejectQueueWaitExceeded
+	// RejectQueueTimedOut means the ticket was queued, but its real wait
+	// reached QueueConfig.WaitTimeout before it was granted.
+	RejectQueueTimedOut
+	// RejectClientGone means the request's context was cancelled (the
+	// client disconnected) while it was still queued.
+	RejectClientGone
 )
 
 func (r RejectReason) String() string {
@@ -48,6 +55,10 @@ func (r RejectReason) String() string {
 		return "queue_full"
 	case RejectQueueWaitExceeded:
 		return "queue_wait_exceeded"
+	case RejectQueueTimedOut:
+		return "queue_timed_out"
+	case RejectClientGone:
+		return "client_gone"
 	default:
 		return "none"
 	}
@@ -55,7 +66,7 @@ func (r RejectReason) String() string {
 
 // QueueConfig tunes a Scheduler's admission bounds (§4.5). Zero value means
 // "unbounded" for either field: MaxSize<=0 never rejects on depth,
-// WaitTimeout<=0 never rejects on projected wait.
+// WaitTimeout<=0 never rejects on projected or real wait.
 type QueueConfig struct {
 	MaxSize     int
 	WaitTimeout time.Duration
@@ -67,7 +78,7 @@ type Ticket struct {
 	Score float64
 
 	seq     uint64 // arrival order, for FIFO tie-break within equal scores
-	index   int    // heap.Interface bookkeeping
+	index   int    // heap.Interface bookkeeping; -1 once popped or removed
 	granted chan struct{}
 }
 
@@ -112,7 +123,7 @@ func (h *ticketHeap) Pop() any {
 
 // Scheduler is a backend-scoped bounded priority queue paired with a
 // Controller (§4.5). Not safe for concurrent Start()/Stop() calls, but
-// Enqueue is safe to call concurrently from many goroutines.
+// Enqueue/Wait/Cancel are safe to call concurrently from many goroutines.
 type Scheduler struct {
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -174,6 +185,63 @@ func (s *Scheduler) Enqueue(score float64) (*Ticket, RejectReason) {
 	heap.Push(&s.pq, t)
 	s.cond.Signal()
 	return t, RejectNone
+}
+
+// Wait blocks until t is granted (RejectNone), its real wait reaches
+// QueueConfig.WaitTimeout (RejectQueueTimedOut), or ctx is done
+// (RejectClientGone). Only on RejectNone does the caller hold the ticket's
+// unit of capacity, and it must then dispatch and Release it; on any other
+// result the ticket is gone from the queue and holds no capacity.
+//
+// The dispatch loop can pop t at the same moment the timer fires or ctx is
+// cancelled. Cancel settles that race under s.mu: if the loop got there
+// first, t already owns one unit of capacity. A timed-out ticket then is
+// simply served (the capacity is free right now, so dropping it would only
+// waste it); a ticket whose client is gone gives the unit back via
+// ReleaseUnused instead of sending work to the backend for nobody. Wait must
+// be called exactly once per ticket.
+func (s *Scheduler) Wait(ctx context.Context, t *Ticket) RejectReason {
+	var deadline <-chan time.Time
+	if s.cfg.WaitTimeout > 0 {
+		timer := time.NewTimer(s.cfg.WaitTimeout)
+		defer timer.Stop()
+		deadline = timer.C
+	}
+
+	select {
+	case <-t.Granted():
+	case <-deadline:
+		if s.Cancel(t) {
+			return RejectQueueTimedOut
+		}
+	case <-ctx.Done():
+		if s.Cancel(t) {
+			return RejectClientGone
+		}
+	}
+
+	// Granted, possibly in the same instant ctx was cancelled (select picks
+	// among ready cases at random): don't dispatch for a client that's gone.
+	if ctx.Err() != nil {
+		s.controller.ReleaseUnused(1)
+		return RejectClientGone
+	}
+	return RejectNone
+}
+
+// Cancel removes t from the queue if it's still there, returning true; t
+// will then never be granted. It returns false if the dispatch loop has
+// already popped t, in which case t owns one unit of capacity (Granted() is
+// closed or about to be). Callers outside this file should use Wait, which
+// handles both outcomes.
+func (s *Scheduler) Cancel(t *Ticket) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t.index < 0 {
+		return false
+	}
+	heap.Remove(&s.pq, t.index)
+	return true
 }
 
 // Depth returns the number of tickets currently queued (not yet granted) —

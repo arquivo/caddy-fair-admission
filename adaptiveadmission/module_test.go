@@ -96,6 +96,79 @@ func TestHandler_ServeHTTP_RejectsQueueFull_As429(t *testing.T) {
 	}
 }
 
+func TestHandler_ServeHTTP_QueueTimeout_RejectsAs429AndRemovesTicket(t *testing.T) {
+	c := NewFixedController(1)
+	c.Acquire(1) // hold the only slot until the queued request times out
+	s := NewScheduler(QueueConfig{MaxSize: 10, WaitTimeout: 50 * time.Millisecond}, c)
+	s.Start()
+
+	h := &Handler{Config: Config{QueueTimeout: 50 * time.Millisecond}, controller: c, scheduler: s}
+
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		t.Fatal("next must not be called for a timed-out request")
+		return nil
+	})
+	err := h.ServeHTTP(rec, newVarsRequest(nil), next)
+	var he caddyhttp.HandlerError
+	if !errors.As(err, &he) {
+		t.Fatalf("ServeHTTP error = %v, want a caddyhttp.HandlerError", err)
+	}
+	if he.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("StatusCode = %d, want 429", he.StatusCode)
+	}
+	if got := s.Depth(); got != 0 {
+		t.Errorf("Depth() after timeout = %d, want 0", got)
+	}
+
+	c.Release(1, time.Millisecond, 200, false)
+	s.Stop()
+	if got := c.InFlight(); got != 0 {
+		t.Errorf("InFlight() after Stop = %d, want 0", got)
+	}
+}
+
+func TestHandler_ServeHTTP_ClientGoneWhileQueued_NeverDispatches(t *testing.T) {
+	c := NewFixedController(1)
+	c.Acquire(1)
+	s := NewScheduler(QueueConfig{MaxSize: 10}, c)
+	s.Start()
+
+	h := &Handler{controller: c, scheduler: s}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := newVarsRequest(nil)
+	req = req.WithContext(context.WithValue(ctx, caddyhttp.VarsCtxKey, map[string]any{}))
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		t.Error("next must not be called once the client is gone")
+		return nil
+	})
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- h.ServeHTTP(rec, req, next) }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	var err error
+	select {
+	case err = <-errCh:
+	case <-time.After(time.Second):
+		t.Fatal("ServeHTTP still waiting after its client went away")
+	}
+	var he caddyhttp.HandlerError
+	if !errors.As(err, &he) || he.StatusCode != statusClientClosedRequest {
+		t.Errorf("ServeHTTP error = %v, want a HandlerError with status 499", err)
+	}
+
+	// The freed slot is never handed to the abandoned request.
+	c.Release(1, time.Millisecond, 200, false)
+	s.Stop()
+	if got := c.InFlight(); got != 0 {
+		t.Errorf("InFlight() after Stop = %d, want 0", got)
+	}
+}
+
 func TestHandler_ServeHTTP_UpstreamHandlerError_ClassifiesGatewayTimeout(t *testing.T) {
 	c := NewFixedController(1)
 	s := NewScheduler(QueueConfig{MaxSize: 10}, c)

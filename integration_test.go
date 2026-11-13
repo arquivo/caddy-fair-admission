@@ -1020,3 +1020,168 @@ func TestIntegration_ConfigError_UserEnabled_IssueOnlySessionCookieIsNotEnough(t
 		t.Errorf("error = %v, want the user-dimension prerequisite error", err)
 	}
 }
+
+// queueFloodScenario runs the p85 starvation shape end to end: researcher
+// (score 100) clients keep a fixed limit-2 backend saturated for flood,
+// while one anonymous (score 60) request arrives after 300ms. It returns
+// that anonymous request's status, Retry-After header, and how long it took.
+func queueFloodScenario(t *testing.T, port int, queueDirectives string, flood time.Duration) (status int, retryAfter string, took time.Duration) {
+	t.Helper()
+	jwksURL, researcherToken := startJWKSServerAndSignToken(t, "researcher")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	loadCaddy(t, fmt.Sprintf(`
+:%d {
+	fairness {
+		auth_jwks_url %s
+		scoring {
+			base_score researcher 100
+			base_score anonymous  60
+		}
+	}
+	adaptive_admission {
+		controller fixed {
+			limit 2
+		}
+		queue_max_size 100
+		%s
+	}
+	reverse_proxy %s
+}
+`, port, jwksURL, queueDirectives, upstream.Listener.Addr().String()))
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", port)
+	client := &http.Client{Timeout: 10 * time.Second}
+	stop := time.Now().Add(flood)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(stop) {
+				req, _ := http.NewRequest(http.MethodGet, url, nil)
+				req.Header.Set("Authorization", "Bearer "+researcherToken)
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Errorf("researcher request: %v", err)
+					return
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		}()
+	}
+	t.Cleanup(wg.Wait)
+
+	time.Sleep(300 * time.Millisecond)
+	start := time.Now()
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("anonymous request: %v", err)
+	}
+	resp.Body.Close()
+	took = time.Since(start)
+	if time.Now().After(stop) {
+		t.Fatalf("anonymous request only finished after the flood ended (took %v)", took)
+	}
+	return resp.StatusCode, resp.Header.Get("Retry-After"), took
+}
+
+func TestIntegration_EndToEnd_QueueTimeout_StarvedRequestRejected(t *testing.T) {
+	// The anonymous request never outranks the flood, so its real queue
+	// wait must hit queue_timeout instead of hanging until the flood ends.
+	status, _, took := queueFloodScenario(t, 19111, "queue_timeout 500ms", 3*time.Second)
+	if status != http.StatusTooManyRequests {
+		t.Errorf("anonymous request status = %d, want 429", status)
+	}
+	if took < 500*time.Millisecond || took > 1500*time.Millisecond {
+		t.Errorf("anonymous request took %v, want about the 500ms queue_timeout", took)
+	}
+}
+
+func TestIntegration_EndToEnd_ClientGoneWhileQueued_FreesItsQueueSlot(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var seen []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path == "/hold" {
+			<-release
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	// One slot and room for one queued request.
+	loadCaddy(t, fmt.Sprintf(`
+:19112 {
+	adaptive_admission {
+		controller fixed {
+			limit 1
+		}
+		queue_max_size 1
+		queue_timeout 10s
+	}
+	reverse_proxy %s
+}
+`, upstream.Listener.Addr().String()))
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	get := func(path string) (int, error) {
+		resp, err := client.Get("http://127.0.0.1:19112" + path)
+		if err != nil {
+			return 0, err
+		}
+		resp.Body.Close()
+		return resp.StatusCode, nil
+	}
+
+	holdDone := make(chan struct{})
+	go func() {
+		defer close(holdDone)
+		if _, err := get("/hold"); err != nil {
+			t.Errorf("hold request: %v", err)
+		}
+	}()
+	time.Sleep(150 * time.Millisecond) // /hold owns the only slot
+
+	// Queued behind /hold, then abandoned by its client, like ab giving up.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:19112/abandoned", nil)
+	if resp, err := client.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("abandoned request unexpectedly completed")
+	}
+	time.Sleep(100 * time.Millisecond) // let Caddy see the disconnect
+
+	// The abandoned request must have left the queue: this one fits in the
+	// single queue slot (instead of a queue_full 429) and is served once
+	// /hold finishes.
+	afterStatus := make(chan int, 1)
+	go func() {
+		status, err := get("/after")
+		if err != nil {
+			t.Errorf("after request: %v", err)
+		}
+		afterStatus <- status
+	}()
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	<-holdDone
+	if got := <-afterStatus; got != http.StatusOK {
+		t.Errorf("/after status = %d, want 200 (the abandoned request still held the queue slot)", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[0] != "/hold" || seen[1] != "/after" {
+		t.Errorf("upstream saw %v, want [/hold /after]", seen)
+	}
+}
