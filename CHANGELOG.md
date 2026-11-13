@@ -1,3 +1,9 @@
+## [3.4.0](https://github.com/arquivo/caddy-fair-admission/compare/v3.3.0...v3.4.0) (2026-11-13)
+
+### Features
+
+* **fairness:** reload GeoIP databases when the files change ([7663218](https://github.com/arquivo/caddy-fair-admission/commit/76632184d9440154b2dd95653bea023511a9b49e)), closes [arquivo/pwa-technologies#1602](https://github.com/arquivo/pwa-technologies/issues/1602)
+
 ## [3.3.0](https://github.com/arquivo/caddy-fair-admission/compare/v3.2.0...v3.3.0) (2026-11-13)
 
 ### Features
