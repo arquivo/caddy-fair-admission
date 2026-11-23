@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -16,25 +17,22 @@ import (
 // request's structured log line (§4.9). This is the only place capacity
 // granted by ServeHTTP's Enqueue/Granted gets released.
 //
-// The release runs in a deferred call, so it also happens when next panics:
-// reverse_proxy panics with http.ErrAbortHandler when copying a response
-// body fails after the headers were sent (the client or the upstream went
-// away mid-body), and net/http recovers that panic silently. The panic is
-// not recovered here; it carries on to net/http once the slot is given back.
+// A request that switches protocols (e.g. a WebSocket upgrade, see
+// switchesProtocols) is finished as soon as the switch is written, so the
+// tunnel that follows neither holds a slot nor counts towards latency.
+//
+// Any other request is finished in a deferred call, so it also happens
+// when next panics: reverse_proxy panics with http.ErrAbortHandler when
+// copying a response body fails after the headers were sent (the client or
+// the upstream went away mid-body), and net/http recovers that panic
+// silently. The panic is not recovered here; it carries on to net/http once
+// the slot is given back.
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, queueWait time.Duration) (err error) {
-	rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
-
 	start := time.Now()
-	panicked := true
-	defer func() {
+	finished := false
+	finish := func(statusCode int, timedOut bool) {
+		finished = true
 		latency := time.Since(start)
-		var statusCode int
-		var timedOut bool
-		if panicked {
-			statusCode = classifyAbort(r.Context())
-		} else {
-			statusCode, timedOut = classifyOutcome(rec.statusCode, err)
-		}
 		h.controller.Release(1, latency, statusCode, timedOut)
 
 		backend := h.Config.backendLabel()
@@ -54,6 +52,25 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, next caddyhtt
 			latency:    latency,
 			statusCode: statusCode,
 		})
+	}
+
+	rec := &statusRecorder{
+		ResponseWriter:    w,
+		statusCode:        http.StatusOK,
+		switchesProtocols: func(code int) bool { return switchesProtocols(r, code) },
+		onSwitchProtocols: func(code int) { finish(code, false) },
+	}
+
+	panicked := true
+	defer func() {
+		if finished {
+			return
+		}
+		if panicked {
+			finish(classifyAbort(r.Context()), false)
+		} else {
+			finish(classifyOutcome(rec.statusCode, err))
+		}
 	}()
 
 	err = next.ServeHTTP(rec, r)
@@ -93,24 +110,65 @@ func classifyAbort(ctx context.Context) int {
 	return http.StatusInternalServerError
 }
 
-// statusRecorder captures the status code the wrapped handler actually
-// wrote, defaulting to 200 to match net/http's own behavior when
-// WriteHeader is never called explicitly.
+// switchesProtocols reports whether writing code in answer to r hands the
+// client connection over to a tunnel: the upstream accepted a protocol
+// switch (reverse_proxy records its 101 before writing anything), and
+// reverse_proxy passes it on, as a 101 to an HTTP/1.x Upgrade request or as
+// a 2xx to a WebSocket over HTTP/2 or HTTP/3 (an extended CONNECT). Without
+// a replacer or an upstream 101 it reports false, so the request keeps its
+// slot until next returns.
+func switchesProtocols(r *http.Request, code int) bool {
+	passedOn := code == http.StatusSwitchingProtocols ||
+		r.Method == http.MethodConnect && code >= http.StatusOK && code < http.StatusMultipleChoices
+	if !passedOn {
+		return false
+	}
+	repl, ok := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	if !ok {
+		return false
+	}
+	upstreamStatus, _ := repl.Get("http.reverse_proxy.status_code")
+	return upstreamStatus == http.StatusSwitchingProtocols
+}
+
+// statusRecorder captures the final status code the wrapped handler
+// actually wrote, defaulting to 200 to match net/http's own behavior when
+// WriteHeader is never called explicitly. Informational responses (1xx,
+// e.g. 100 Continue or 103 Early Hints) come before the final status and
+// are not recorded. A status for which switchesProtocols reports true is
+// final and calls onSwitchProtocols.
 type statusRecorder struct {
 	http.ResponseWriter
-	statusCode  int
-	wroteHeader bool
+	statusCode        int
+	wroteHeader       bool
+	switchesProtocols func(code int) bool
+	onSwitchProtocols func(code int)
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
-	if !r.wroteHeader {
-		r.statusCode = code
-		r.wroteHeader = true
-	}
 	r.ResponseWriter.WriteHeader(code)
+	if r.wroteHeader {
+		return
+	}
+	switched := r.switchesProtocols != nil && r.switchesProtocols(code)
+	if code < http.StatusOK && !switched {
+		return
+	}
+	r.statusCode = code
+	r.wroteHeader = true
+	if switched && r.onSwitchProtocols != nil {
+		r.onSwitchProtocols(code)
+	}
 }
 
 func (r *statusRecorder) Write(b []byte) (int, error) {
 	r.wroteHeader = true
 	return r.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.NewResponseController reach the wrapped writer's optional
+// methods, such as the Flush and Hijack that reverse_proxy uses for streamed
+// responses and protocol upgrades (e.g. WebSocket).
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }

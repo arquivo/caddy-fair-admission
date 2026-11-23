@@ -336,8 +336,9 @@ to use the new capacity — it doesn't wait for the next request to finish and r
 ### How long a slot is held
 
 An admitted request holds one unit of the backend's concurrency limit until `reverse_proxy`
-returns. Nothing is admitted while the in-flight count is at or above the limit, so a backend that
-accepts connections but never answers can take every slot and close the backend to new requests.
+returns, or, for a request that switches protocols, until the switch (see below). Nothing is
+admitted while the in-flight count is at or above the limit, so a backend that accepts connections
+but never answers can take every slot and close the backend to new requests.
 `reverse_proxy` waits for response headers indefinitely unless told otherwise, so set
 `response_header_timeout` on every backend:
 
@@ -356,6 +357,25 @@ gives up first. Connecting is already bounded: `dial_timeout` defaults to 3s, an
 timed-out connection is a 502, which counts towards `error_rate_threshold`. A client that stops
 reading the response body also holds its slot until it disconnects; the server `write` timeout
 (global option `servers { timeouts { write <duration> } }`) bounds that.
+
+A request that switches protocols gives its slot back once Caddy passes the backend's `101` on to
+the client; its latency is the time until then. Caddy passes it on as a `101` to an HTTP/1.1
+`Upgrade` request (e.g. a WebSocket), or as a `200` to a WebSocket over HTTP/2 or HTTP/3 (an
+extended `CONNECT`). The tunnel that follows is not limited by `adaptive_admission`, and the server
+`write` timeout doesn't apply to it: bound its lifetime with `reverse_proxy`'s `stream_timeout`.
+
+When Caddy stops or reloads, the default eternal grace period also waits for open HTTP/2 and
+HTTP/3 tunnels; the global `grace_period` option bounds that.
+
+If a backend doesn't need protocol upgrades, refuse them before `adaptive_admission`, so none
+reaches the backend. This also refuses clients that offer an optional upgrade, such as `h2c`:
+
+```caddyfile
+@upgrade header Upgrade *
+@connect method CONNECT
+respond @upgrade 400
+respond @connect 405
+```
 
 A slot is also given back when `reverse_proxy` aborts a response part-way through the body. That
 outcome is recorded as a 499 when the client left, and as a 500 otherwise.

@@ -6,6 +6,7 @@
 package caddyaac
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -1219,5 +1220,143 @@ func TestIntegration_EndToEnd_ClientGoneWhileQueued_FreesItsQueueSlot(t *testing
 	defer mu.Unlock()
 	if len(seen) != 2 || seen[0] != "/hold" || seen[1] != "/after" {
 		t.Errorf("upstream saw %v, want [/hold /after]", seen)
+	}
+}
+
+// adaptive_admission must not hide the response writer's Flush from
+// reverse_proxy: a response without Content-Length is flushed to the client
+// as the upstream produces it, not held until the upstream finishes.
+func TestIntegration_EndToEnd_StreamedResponseIsFlushedThroughAdmission(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "first\n")
+		http.NewResponseController(w).Flush()
+		<-release
+		io.WriteString(w, "second\n")
+	}))
+	t.Cleanup(upstream.Close)
+	// Deferred rather than a Cleanup so the upstream finishes before
+	// caddy.Stop, which waits for in-flight requests.
+	defer close(release)
+
+	loadCaddy(t, fmt.Sprintf(`
+:19120 {
+	adaptive_admission {
+		controller fixed {
+			limit 1
+		}
+	}
+	reverse_proxy %s
+}
+`, upstream.Listener.Addr().String()))
+
+	// Headers and the first line must both arrive while the upstream is
+	// still blocked on release.
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:19120/")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	if err != nil || line != "first\n" {
+		t.Fatalf("first line = %q, %v; want %q while the upstream is still responding", line, err, "first\n")
+	}
+}
+
+// adaptive_admission must not hide the response writer's Hijack from
+// reverse_proxy: an HTTP/1.1 Upgrade request switches protocols end to end,
+// and its slot is given back at the switch, not when the upgraded
+// connection closes.
+func TestIntegration_EndToEnd_ProtocolUpgradeWorksThroughAdmission(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") == "" {
+			return
+		}
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("upstream Hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n")
+		brw.Flush()
+		for {
+			line, err := brw.ReadString('\n')
+			if err != nil {
+				return
+			}
+			brw.WriteString(line)
+			brw.Flush()
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	loadCaddy(t, fmt.Sprintf(`
+:19121 {
+	adaptive_admission {
+		controller fixed {
+			limit 1
+		}
+	}
+	reverse_proxy %s
+}
+`, upstream.Listener.Addr().String()))
+
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:19121", 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n"); err != nil {
+		t.Fatalf("write upgrade request: %v", err)
+	}
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read upgrade response: %v", err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusSwitchingProtocols)
+	}
+
+	// With limit 1, this request is only admitted if the upgraded
+	// connection, still open, gave its slot back.
+	client := &http.Client{Timeout: 2 * time.Second}
+	plain, err := client.Get("http://127.0.0.1:19121/")
+	if err != nil {
+		t.Fatalf("GET while the upgraded connection is open: %v", err)
+	}
+	plain.Body.Close()
+	if plain.StatusCode != http.StatusOK {
+		t.Errorf("status while the upgraded connection is open = %d, want %d", plain.StatusCode, http.StatusOK)
+	}
+
+	if _, err := io.WriteString(conn, "ping\n"); err != nil {
+		t.Fatalf("write over upgraded connection: %v", err)
+	}
+	line, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read over upgraded connection: %v", err)
+	}
+	if line != "ping\n" {
+		t.Errorf("echoed %q, want %q", line, "ping\n")
+	}
+
+	// Stopping Caddy must not wait for the upgraded connection to close.
+	stopped := make(chan error, 1)
+	go func() { stopped <- caddy.Stop() }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Errorf("caddy.Stop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		// Let this Stop finish before loadCaddy's cleanup stops Caddy again.
+		conn.Close()
+		<-stopped
+		t.Fatal("caddy.Stop blocked while an upgraded connection was open")
 	}
 }
