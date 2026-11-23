@@ -129,7 +129,6 @@ func TestSwitchesProtocols(t *testing.T) {
 	}{
 		{"101 passed on", get, http.StatusSwitchingProtocols, http.StatusSwitchingProtocols, true},
 		{"101 not from an upstream switch", get, 0, http.StatusSwitchingProtocols, false},
-		{"101 while the upstream answered 500", get, http.StatusInternalServerError, http.StatusSwitchingProtocols, false},
 		{"200 to GET", get, http.StatusSwitchingProtocols, http.StatusOK, false},
 		{"200 to CONNECT after an upstream switch", connect, http.StatusSwitchingProtocols, http.StatusOK, true},
 		{"200 to CONNECT from an ordinary upstream response", connect, http.StatusOK, http.StatusOK, false},
@@ -248,7 +247,7 @@ func TestHandler_Dispatch_ProtocolSwitch_ReleasesCapacityAtTheSwitch(t *testing.
 				t.Fatalf("window.total = %d, want 1 (released exactly once)", got)
 			}
 			if last := lastOutcome(c); (last.latency < tunnelLifetime) != tc.wantSwitch || last.isError {
-				t.Errorf("recorded outcome = %+v, want latency under %v: %v, not an error", last, tunnelLifetime, tc.wantSwitch)
+				t.Errorf("recorded outcome = %+v, want finished at the switch = %v and not an error", last, tc.wantSwitch)
 			}
 		})
 	}

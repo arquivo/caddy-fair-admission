@@ -358,12 +358,11 @@ timed-out connection is a 502, which counts towards `error_rate_threshold`. A cl
 reading the response body also holds its slot until it disconnects; the server `write` timeout
 (global option `servers { timeouts { write <duration> } }`) bounds that.
 
-A request that switches protocols gives its slot back as soon as the backend has accepted the
-switch (answered `101`) and Caddy passes that on to the client, and its latency is the time until
-then. Caddy passes it on as a `101` to an HTTP/1.1 `Upgrade` request (e.g. a WebSocket), or as a
-`200` to a WebSocket over HTTP/2 or HTTP/3 (an extended `CONNECT`). The tunnel that follows is not
-limited by `adaptive_admission`, and the server `write` timeout doesn't apply to it: bound its
-lifetime with `reverse_proxy`'s `stream_timeout`.
+A request that switches protocols gives its slot back once Caddy passes the backend's `101` on to
+the client; its latency is the time until then. Caddy passes it on as a `101` to an HTTP/1.1
+`Upgrade` request (e.g. a WebSocket), or as a `200` to a WebSocket over HTTP/2 or HTTP/3 (an
+extended `CONNECT`). The tunnel that follows is not limited by `adaptive_admission`, and the server
+`write` timeout doesn't apply to it: bound its lifetime with `reverse_proxy`'s `stream_timeout`.
 
 When Caddy stops or reloads, the default eternal grace period also waits for open HTTP/2 and
 HTTP/3 tunnels; the global `grace_period` option bounds that.

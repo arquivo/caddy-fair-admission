@@ -114,10 +114,13 @@ func classifyAbort(ctx context.Context) int {
 // client connection over to a tunnel: the upstream accepted a protocol
 // switch (reverse_proxy records its 101 before writing anything), and
 // reverse_proxy passes it on, as a 101 to an HTTP/1.x Upgrade request or as
-// a 2xx to a WebSocket over HTTP/2 or HTTP/3 (an extended CONNECT).
+// a 2xx to a WebSocket over HTTP/2 or HTTP/3 (an extended CONNECT). Without
+// a replacer or an upstream 101 it reports false, so the request keeps its
+// slot until next returns.
 func switchesProtocols(r *http.Request, code int) bool {
-	if code != http.StatusSwitchingProtocols &&
-		(r.Method != http.MethodConnect || code < http.StatusOK || code >= http.StatusMultipleChoices) {
+	passedOn := code == http.StatusSwitchingProtocols ||
+		r.Method == http.MethodConnect && code >= http.StatusOK && code < http.StatusMultipleChoices
+	if !passedOn {
 		return false
 	}
 	repl, ok := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
