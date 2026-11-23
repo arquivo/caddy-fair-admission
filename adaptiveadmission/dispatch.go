@@ -16,11 +16,11 @@ import (
 // request's structured log line (§4.9). This is the only place capacity
 // granted by ServeHTTP's Enqueue/Granted gets released.
 //
-// A request that switches protocols (101, e.g. a WebSocket upgrade) is
-// finished as soon as the 101 is written: its latency is the time until the
-// backend accepted the switch, and the upgraded connection that follows
-// holds no capacity, so it neither keeps a slot taken nor has its whole
-// lifetime recorded as latency.
+// A request that switches protocols (e.g. a WebSocket upgrade) is finished
+// as soon as the switch is written, so the tunnel that follows neither holds
+// a slot nor counts towards latency. That is a 101 to an HTTP/1.x Upgrade
+// request, or a 2xx to a CONNECT request (WebSocket over HTTP/2 or HTTP/3
+// answers an extended CONNECT with 200).
 //
 // Any other request is finished in a deferred call, so it also happens
 // when next panics: reverse_proxy panics with http.ErrAbortHandler when
@@ -58,7 +58,9 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, next caddyhtt
 	rec := &statusRecorder{
 		ResponseWriter:    w,
 		statusCode:        http.StatusOK,
-		onSwitchProtocols: func() { finish(http.StatusSwitchingProtocols, false) },
+		upgrade:           r.ProtoMajor == 1 && r.Header.Get("Upgrade") != "",
+		connect:           r.Method == http.MethodConnect,
+		onSwitchProtocols: func(code int) { finish(code, false) },
 	}
 
 	panicked := true
@@ -114,24 +116,31 @@ func classifyAbort(ctx context.Context) int {
 // actually wrote, defaulting to 200 to match net/http's own behavior when
 // WriteHeader is never called explicitly. Informational responses (1xx,
 // e.g. 100 Continue or 103 Early Hints) come before the final status and
-// are not recorded, except 101 Switching Protocols, which is final and
-// calls onSwitchProtocols.
+// are not recorded. A status that switches protocols (a 101 when upgrade
+// is set, a 2xx when connect is set) is final and calls onSwitchProtocols.
 type statusRecorder struct {
 	http.ResponseWriter
 	statusCode        int
 	wroteHeader       bool
-	onSwitchProtocols func()
+	upgrade           bool // the request is an HTTP/1.x Upgrade request
+	connect           bool // the request is a CONNECT request
+	onSwitchProtocols func(code int)
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
-	if r.wroteHeader || (code < http.StatusOK && code != http.StatusSwitchingProtocols) {
+	if r.wroteHeader {
+		return
+	}
+	switched := (r.upgrade && code == http.StatusSwitchingProtocols) ||
+		(r.connect && code >= http.StatusOK && code < http.StatusMultipleChoices)
+	if code < http.StatusOK && !switched {
 		return
 	}
 	r.statusCode = code
 	r.wroteHeader = true
-	if code == http.StatusSwitchingProtocols && r.onSwitchProtocols != nil {
-		r.onSwitchProtocols()
+	if switched && r.onSwitchProtocols != nil {
+		r.onSwitchProtocols(code)
 	}
 }
 

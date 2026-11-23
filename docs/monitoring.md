@@ -181,7 +181,7 @@ fairness_score_distribution_count{backend="default",user_class="anonymous"} 1523
 
 | Metric | Type | Labels | Help |
 |---|---|---|---|
-| `adaptive_admission_requests_in_flight` | Gauge | `backend` | Requests currently admitted and in flight. |
+| `adaptive_admission_requests_in_flight` | Gauge | `backend` | Requests currently admitted and in flight. A request that switched protocols (e.g. a WebSocket) is no longer counted once it switched. |
 | `adaptive_admission_concurrency_limit` | Gauge | `backend` | Current controller concurrency limit. |
 | `adaptive_admission_queue_size` | Gauge | `backend` | Current number of queued (not yet admitted) requests. |
 | `adaptive_admission_requests_total` | Counter | `backend` | Total requests seen. |
@@ -190,7 +190,7 @@ fairness_score_distribution_count{backend="default",user_class="anonymous"} 1523
 | `adaptive_admission_backend_errors_total` | Counter | `backend` | Total dispatched requests whose outcome was a 5xx/error. |
 | `adaptive_admission_backend_timeouts_total` | Counter | `backend` | Total dispatched requests whose outcome was a timeout. |
 | `adaptive_admission_adaptive_limit_changes_total` | Counter | `backend`, `direction` | Total adaptive-controller limit changes, by direction (`grow` or `shrink`). |
-| `adaptive_admission_backend_request_duration_seconds` | Histogram | `backend` | Dispatched request duration. Prometheus default buckets. |
+| `adaptive_admission_backend_request_duration_seconds` | Histogram | `backend` | Dispatched request duration; for a request that switched protocols, the time until the switch. Prometheus default buckets. |
 | `adaptive_admission_queue_wait_duration_seconds` | Histogram | `backend` | Time an admitted request spent queued before admission. Prometheus default buckets. |
 
 A backend that stays closed — requests arrive, but none is admitted — shows as:
@@ -240,8 +240,10 @@ Fields present **only when `admitted: true`**: `queue_wait_ms` (int64), `backend
 (int64), `status_code` (int). When `reverse_proxy` aborted a response part-way through the body,
 `status_code` is `499` if the client left and `500` otherwise. `status_code` is the final status:
 informational responses (e.g. `100 Continue`, `103 Early Hints`) sent before it are not recorded.
-For a protocol upgrade (e.g. WebSocket), `status_code` is `101` and `backend_latency_ms` is the time
-until the backend accepted the switch; the upgraded connection that follows is not measured.
+For a request that switches protocols (e.g. a WebSocket), the line is written at the switch:
+`status_code` is `101` (HTTP/1.1 `Upgrade`) or the 2xx answering a `CONNECT` (HTTP/2 or HTTP/3),
+and `backend_latency_ms` is the time until the switch; the tunnel that follows is not measured, so
+Caddy's own access log for that request, written when the tunnel closes, shows a longer duration.
 
 Fields present **only when `admitted: false`**: `reject_reason` (string, `queue_full`,
 `queue_wait_exceeded`, `queue_timed_out`, `client_gone` or `evicted`). The last three were already

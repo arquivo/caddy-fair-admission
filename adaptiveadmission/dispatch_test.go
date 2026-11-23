@@ -90,7 +90,8 @@ func TestStatusRecorder_SwitchingProtocolsIsFinal(t *testing.T) {
 	rec := &statusRecorder{
 		ResponseWriter:    httptest.NewRecorder(),
 		statusCode:        http.StatusOK,
-		onSwitchProtocols: func() { calls++ },
+		upgrade:           true,
+		onSwitchProtocols: func(int) { calls++ },
 	}
 	rec.WriteHeader(http.StatusSwitchingProtocols)
 	rec.WriteHeader(http.StatusOK)
@@ -99,6 +100,35 @@ func TestStatusRecorder_SwitchingProtocolsIsFinal(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("onSwitchProtocols called %d times, want 1", calls)
+	}
+}
+
+func TestStatusRecorder_SwitchingProtocolsWithoutUpgradeIsInformational(t *testing.T) {
+	calls := 0
+	rec := &statusRecorder{
+		ResponseWriter:    httptest.NewRecorder(),
+		statusCode:        http.StatusOK,
+		onSwitchProtocols: func(int) { calls++ },
+	}
+	rec.WriteHeader(http.StatusSwitchingProtocols)
+	rec.WriteHeader(http.StatusInternalServerError)
+	if rec.statusCode != http.StatusInternalServerError || calls != 0 {
+		t.Errorf("statusCode = %d, onSwitchProtocols calls = %d; want %d and 0 for a request that asked for no upgrade",
+			rec.statusCode, calls, http.StatusInternalServerError)
+	}
+}
+
+func TestStatusRecorder_ConnectSuccessIsASwitch(t *testing.T) {
+	var switched int
+	rec := &statusRecorder{
+		ResponseWriter:    httptest.NewRecorder(),
+		statusCode:        http.StatusOK,
+		connect:           true,
+		onSwitchProtocols: func(code int) { switched = code },
+	}
+	rec.WriteHeader(http.StatusOK)
+	if switched != http.StatusOK {
+		t.Errorf("onSwitchProtocols got %d, want %d for a 2xx to CONNECT", switched, http.StatusOK)
 	}
 }
 
@@ -159,51 +189,47 @@ func TestHandler_Dispatch_RecordsLatencyAndReleasesCapacity(t *testing.T) {
 	}
 }
 
-func TestHandler_Dispatch_InformationalThen5xx_RecordedAsError(t *testing.T) {
-	c := NewFixedController(1)
-	c.Acquire(1)
-	h := &Handler{controller: c}
+func TestHandler_Dispatch_ProtocolSwitch_ReleasesCapacityAtTheSwitch(t *testing.T) {
+	upgrade := httptest.NewRequest(http.MethodGet, "/", nil)
+	upgrade.Header.Set("Connection", "Upgrade")
+	upgrade.Header.Set("Upgrade", "websocket")
+	// WebSocket over HTTP/2 or HTTP/3: an extended CONNECT answered with 200.
+	connect := httptest.NewRequest(http.MethodConnect, "/", nil)
+	connect.ProtoMajor = 3
 
-	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		w.WriteHeader(http.StatusContinue)
-		w.WriteHeader(http.StatusServiceUnavailable)
-		return nil
-	})
+	for _, tc := range []struct {
+		name   string
+		req    *http.Request
+		status int
+	}{
+		{"HTTP/1.1 Upgrade", upgrade, http.StatusSwitchingProtocols},
+		{"extended CONNECT", connect, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewFixedController(1)
+			c.Acquire(1)
+			h := &Handler{controller: c}
 
-	if err := h.dispatch(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/", nil), next, 0); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-	if last := lastOutcome(c); !last.isError {
-		t.Errorf("recorded outcome = %+v, want a 5xx error", last)
-	}
-}
+			const tunnelLifetime = 50 * time.Millisecond
+			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				w.WriteHeader(tc.status)
+				if got := c.InFlight(); got != 0 {
+					t.Errorf("InFlight() = %d after the switch, want 0 while the tunnel is open", got)
+				}
+				time.Sleep(tunnelLifetime)
+				return nil
+			})
 
-func TestHandler_Dispatch_SwitchingProtocols_ReleasesCapacityAtTheSwitch(t *testing.T) {
-	c := NewFixedController(1)
-	c.Acquire(1)
-	h := &Handler{controller: c}
-
-	const connLifetime = 50 * time.Millisecond
-	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		w.WriteHeader(http.StatusSwitchingProtocols)
-		if got := c.InFlight(); got != 0 {
-			t.Errorf("InFlight() = %d after the 101, want 0 while the upgraded connection is open", got)
-		}
-		time.Sleep(connLifetime) // the upgraded connection
-		return nil
-	})
-
-	if err := h.dispatch(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil), next, 0); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-	if got := c.InFlight(); got != 0 {
-		t.Errorf("InFlight() = %d, want 0 (released exactly once)", got)
-	}
-	if got := c.window.total; got != 1 {
-		t.Fatalf("window.total = %d, want 1", got)
-	}
-	if last := lastOutcome(c); last.latency >= connLifetime || last.isError {
-		t.Errorf("recorded outcome = %+v, want the time until the 101 (under %v), not an error", last, connLifetime)
+			if err := h.dispatch(httptest.NewRecorder(), tc.req, next, 0); err != nil {
+				t.Fatalf("dispatch: %v", err)
+			}
+			if got := c.window.total; got != 1 {
+				t.Fatalf("window.total = %d, want 1 (released exactly once)", got)
+			}
+			if last := lastOutcome(c); last.latency >= tunnelLifetime || last.isError {
+				t.Errorf("recorded outcome = %+v, want the time until the switch (under %v), not an error", last, tunnelLifetime)
+			}
+		})
 	}
 }
 

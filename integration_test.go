@@ -1354,6 +1354,9 @@ func TestIntegration_EndToEnd_ProtocolUpgradeWorksThroughAdmission(t *testing.T)
 			t.Errorf("caddy.Stop: %v", err)
 		}
 	case <-time.After(2 * time.Second):
+		// Let this Stop finish before loadCaddy's cleanup stops Caddy again.
+		conn.Close()
+		<-stopped
 		t.Fatal("caddy.Stop blocked while an upgraded connection was open")
 	}
 }
