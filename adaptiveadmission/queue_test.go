@@ -249,12 +249,12 @@ func TestScheduler_Stop_ReleasesUnusedCapacityAndDrainsQueuedTickets(t *testing.
 }
 
 func TestScheduler_InFlightAboveShrunkLimit_AdmitsAgainOnceDrained(t *testing.T) {
-	c := NewFixedController(150)
+	c := NewFixedController(8)
 	s := NewScheduler(QueueConfig{}, c)
 	s.Start()
 	defer s.Stop()
 
-	const admitted = 105
+	const admitted = 6
 	for i := 0; i < admitted; i++ {
 		tk, reason := s.Enqueue(1)
 		if reason != RejectNone {
@@ -265,7 +265,7 @@ func TestScheduler_InFlightAboveShrunkLimit_AdmitsAgainOnceDrained(t *testing.T)
 
 	// An adaptive shrink, as adjust() applies it.
 	c.mu.Lock()
-	c.limit = 16
+	c.limit = 2
 	c.mu.Unlock()
 
 	// The dispatch loop already holds its lookahead reservation, so one more
@@ -275,13 +275,14 @@ func TestScheduler_InFlightAboveShrunkLimit_AdmitsAgainOnceDrained(t *testing.T)
 	queued, _ := s.Enqueue(1)
 
 	inFlight := admitted + 1
-	for inFlight > 16 {
+	for inFlight > 2 {
 		c.Release(1, time.Millisecond, http.StatusOK, false)
 		inFlight--
 	}
 	mustNotGrantWithin(t, queued, 50*time.Millisecond, "ticket granted while in-flight was still at the limit")
 
 	c.Release(1, time.Millisecond, http.StatusOK, false)
+	inFlight--
 	mustGrantWithin(t, queued, time.Second, "ticket never granted after in-flight drained below the shrunk limit")
 
 	// Finish the remaining requests so Stop's dispatch loop isn't left

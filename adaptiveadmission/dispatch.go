@@ -21,30 +21,19 @@ import (
 // body fails after the headers were sent (the client or the upstream went
 // away mid-body), and net/http recovers that panic silently. The panic is
 // not recovered here; it carries on to net/http once the slot is given back.
-//
-// With DispatchTimeout set, next gets a request context that is cancelled
-// once it elapses, so a backend that never answers can't hold the slot for
-// longer than that.
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, queueWait time.Duration) (err error) {
 	rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
-
-	clientCtx := r.Context()
-	if h.DispatchTimeout > 0 {
-		ctx, cancel := context.WithTimeout(clientCtx, h.DispatchTimeout)
-		defer cancel()
-		r = r.WithContext(ctx)
-	}
 
 	start := time.Now()
 	panicked := true
 	defer func() {
 		latency := time.Since(start)
-		statusCode, timedOut := classifyOutcome(rec.statusCode, err)
+		var statusCode int
+		var timedOut bool
 		if panicked {
-			statusCode, timedOut = classifyAbort(clientCtx)
-		}
-		if (panicked || err != nil) && dispatchTimedOut(clientCtx, r.Context()) {
-			statusCode, timedOut = http.StatusGatewayTimeout, true
+			statusCode = classifyAbort(r.Context())
+		} else {
+			statusCode, timedOut = classifyOutcome(rec.statusCode, err)
 		}
 		h.controller.Release(1, latency, statusCode, timedOut)
 
@@ -93,22 +82,15 @@ func classifyOutcome(recordedStatus int, err error) (statusCode int, timedOut bo
 	return http.StatusInternalServerError, false
 }
 
-// classifyAbort derives the outcome to record when next panicked instead of
-// returning. A client that went away is not the backend's fault, so it is
-// recorded as 499, which the adaptive controller doesn't count as an error,
-// the same as reverse_proxy reports a client that disconnects before the
-// response starts. Anything else is recorded as a 500.
-func classifyAbort(clientCtx context.Context) (statusCode int, timedOut bool) {
-	if clientCtx.Err() != nil {
-		return statusClientClosedRequest, false
+// classifyAbort derives the status code to record when next panicked
+// instead of returning. A client that went away is not the backend's fault,
+// so it is recorded as 499, which the adaptive controller doesn't count as
+// an error. Anything else is recorded as a 500.
+func classifyAbort(ctx context.Context) int {
+	if ctx.Err() != nil {
+		return statusClientClosedRequest
 	}
-	return http.StatusInternalServerError, false
-}
-
-// dispatchTimedOut reports whether dispatchCtx was cancelled by
-// DispatchTimeout rather than by the client going away.
-func dispatchTimedOut(clientCtx, dispatchCtx context.Context) bool {
-	return clientCtx.Err() == nil && errors.Is(dispatchCtx.Err(), context.DeadlineExceeded)
+	return http.StatusInternalServerError
 }
 
 // statusRecorder captures the status code the wrapped handler actually

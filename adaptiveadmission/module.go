@@ -199,9 +199,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	reason = h.scheduler.Wait(r.Context(), ticket)
 	queueWait := time.Since(enqueuedAt)
-	// Refreshed on rejections too: Wait gives a slot granted to a client
-	// that already left back via ReleaseUnused. InFlight() can read up to 1
-	// higher than genuinely in-flight work here and in dispatch -- see
+	// Set before the rejection check: when the client left after its slot
+	// was granted, Wait returns that slot via ReleaseUnused. InFlight() can
+	// read up to 1 higher than genuinely in-flight work -- see
 	// Controller.InFlight's doc (capacity.go).
 	admissionMetrics.requestsInFlight.WithLabelValues(backend).Set(float64(h.controller.InFlight()))
 	if reason != RejectNone {
@@ -318,7 +318,6 @@ func (h *Handler) logDecision(r *http.Request, p logDecisionParams) {
 //	    queue_wait_projection all|ahead
 //	    reject_status         <int>
 //	    retry_after           <duration>
-//	    dispatch_timeout      <duration>
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -402,16 +401,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid retry_after %q: %v", d.Val(), err)
 				}
 				h.RetryAfter = dur
-
-			case "dispatch_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("invalid dispatch_timeout %q: %v", d.Val(), err)
-				}
-				h.DispatchTimeout = dur
 
 			default:
 				return d.Errf("unrecognized adaptive_admission subdirective '%s'", d.Val())

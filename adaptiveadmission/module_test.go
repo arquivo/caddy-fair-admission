@@ -62,7 +62,7 @@ func TestHandler_ServeHTTP_DispatchesAndReleasesCapacityOnSuccess(t *testing.T) 
 	if got := c.window.total; got != 1 {
 		t.Fatalf("outcome window total = %d, want 1", got)
 	}
-	if last := c.window.ring[(c.window.pos+c.window.size-1)%c.window.size]; last.isError {
+	if last := lastOutcome(c); last.isError {
 		t.Errorf("recorded outcome isError = true for a 201 response, want false")
 	}
 }
@@ -273,6 +273,9 @@ func TestHandler_ServeHTTP_ClientGoneWhileQueued_NeverDispatches(t *testing.T) {
 	if got := rec.Header().Get("Retry-After"); got != "" {
 		t.Errorf("Retry-After = %q on client_gone, want none", got)
 	}
+	if got, want := testutil.ToFloat64(admissionMetrics.requestsInFlight.WithLabelValues(h.Config.backendLabel())), float64(c.InFlight()); got != want {
+		t.Errorf("requests_in_flight = %v after client_gone, want %v", got, want)
+	}
 
 	// The freed slot is never handed to the abandoned request.
 	c.Release(1, time.Millisecond, 200, false)
@@ -308,46 +311,6 @@ func TestHandler_ServeHTTP_UpstreamHandlerError_ClassifiesGatewayTimeout(t *test
 	s.Stop()
 	if got := c.InFlight(); got != 0 {
 		t.Errorf("InFlight() after Stop = %d, want 0 (capacity released even on error)", got)
-	}
-}
-
-func TestHandler_ServeHTTP_DispatchTimeout_FreesSlotForQueuedRequest(t *testing.T) {
-	c := NewFixedController(1)
-	s := NewScheduler(QueueConfig{MaxSize: 10}, c)
-	s.Start()
-	defer s.Stop()
-
-	h := &Handler{Config: Config{DispatchTimeout: 50 * time.Millisecond}, controller: c, scheduler: s}
-
-	hung := make(chan struct{})
-	served := make(chan struct{})
-	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		select {
-		case hung <- struct{}{}:
-			// The first request: a backend that never answers.
-			<-r.Context().Done()
-			return r.Context().Err()
-		default:
-			close(served)
-			return nil
-		}
-	})
-
-	go func() { _ = h.ServeHTTP(httptest.NewRecorder(), newVarsRequest(nil), next) }()
-	select {
-	case <-hung:
-	case <-time.After(time.Second):
-		t.Fatal("first request never dispatched")
-	}
-
-	go func() { _ = h.ServeHTTP(httptest.NewRecorder(), newVarsRequest(nil), next) }()
-	select {
-	case <-served:
-	case <-time.After(time.Second):
-		t.Fatal("queued request never admitted after the hung request's dispatch_timeout")
-	}
-	if got := c.window.timeouts; got != 1 {
-		t.Errorf("recorded timeouts = %d, want 1", got)
 	}
 }
 
@@ -483,7 +446,6 @@ func TestHandler_Provision_InvalidQueueConfigReturnsError(t *testing.T) {
 		"reject_status 200":         {Controller: fixed, RejectStatus: 200},
 		"reject_status 600":         {Controller: fixed, RejectStatus: 600},
 		"negative retry_after":      {Controller: fixed, RetryAfter: -time.Second},
-		"negative dispatch_timeout": {Controller: fixed, DispatchTimeout: -time.Second},
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -540,7 +502,6 @@ func TestUnmarshalCaddyfile_QueueAgingAndRejectStatus(t *testing.T) {
 		queue_aging_rate 5
 		reject_status    503
 		retry_after      5s
-		dispatch_timeout 30s
 	}`
 	var h Handler
 	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
@@ -555,13 +516,10 @@ func TestUnmarshalCaddyfile_QueueAgingAndRejectStatus(t *testing.T) {
 	if h.RetryAfter != 5*time.Second {
 		t.Errorf("RetryAfter = %v, want 5s", h.RetryAfter)
 	}
-	if h.DispatchTimeout != 30*time.Second {
-		t.Errorf("DispatchTimeout = %v, want 30s", h.DispatchTimeout)
-	}
 }
 
 func TestUnmarshalCaddyfile_QueueAgingAndRejectStatus_InvalidValues(t *testing.T) {
-	for _, line := range []string{"queue_aging_rate fast", "reject_status busy", "retry_after soon", "reject_status", "dispatch_timeout never", "dispatch_timeout"} {
+	for _, line := range []string{"queue_aging_rate fast", "reject_status busy", "retry_after soon", "reject_status"} {
 		t.Run(line, func(t *testing.T) {
 			input := "adaptive_admission {\n" + line + "\n}"
 			var h Handler

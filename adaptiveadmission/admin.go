@@ -88,21 +88,13 @@ func (a *AdminAPI) Routes() []caddy.AdminRoute {
 
 // backendControllerStatus is one backend's admin-reported snapshot (§4.10):
 // controller kind/limit/latency plus current queue depth.
-//
-// InFlightOverLimit is how far InFlight is above Limit (0 when it isn't).
-// Nothing is admitted until it drops back to 0. It is expected to be
-// positive for a while after an adaptive limit shrinks, as the requests
-// admitted under the higher limit complete; one that stays positive with
-// nothing being admitted means requests are holding their slots without
-// finishing.
 type backendControllerStatus struct {
-	Backend           string  `json:"backend"`
-	ControllerKind    string  `json:"controller_kind"`
-	Limit             int     `json:"limit"`
-	InFlight          int     `json:"in_flight"`
-	InFlightOverLimit int     `json:"in_flight_over_limit"`
-	MeanLatencyMs     float64 `json:"mean_latency_ms"`
-	QueueSize         int     `json:"queue_size"`
+	Backend        string  `json:"backend"`
+	ControllerKind string  `json:"controller_kind"`
+	Limit          int     `json:"limit"`
+	InFlight       int     `json:"in_flight"`
+	MeanLatencyMs  float64 `json:"mean_latency_ms"`
+	QueueSize      int     `json:"queue_size"`
 }
 
 type statusResponse struct {
@@ -123,15 +115,13 @@ func (a *AdminAPI) handleStatus(w http.ResponseWriter, r *http.Request) error {
 	handlers := app.snapshotHandlers()
 	backends := make([]backendControllerStatus, 0, len(handlers))
 	for _, h := range handlers {
-		limit, inFlight := h.controller.Limit(), h.controller.InFlight()
 		backends = append(backends, backendControllerStatus{
-			Backend:           h.Config.backendLabel(),
-			ControllerKind:    h.controller.Kind().String(),
-			Limit:             limit,
-			InFlight:          inFlight,
-			InFlightOverLimit: max(0, inFlight-limit),
-			MeanLatencyMs:     float64(h.controller.MeanLatency()) / float64(time.Millisecond),
-			QueueSize:         h.scheduler.Depth(),
+			Backend:        h.Config.backendLabel(),
+			ControllerKind: h.controller.Kind().String(),
+			Limit:          h.controller.Limit(),
+			InFlight:       h.controller.InFlight(),
+			MeanLatencyMs:  float64(h.controller.MeanLatency()) / float64(time.Millisecond),
+			QueueSize:      h.scheduler.Depth(),
 		})
 	}
 	sort.Slice(backends, func(i, j int) bool { return backends[i].Backend < backends[j].Backend })

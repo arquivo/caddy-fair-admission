@@ -98,28 +98,3 @@ func TestAdminAPI_HandleStatus_SortsBackendsByLabel(t *testing.T) {
 		t.Fatalf("backends = %+v, want [aaa zzz]", body.Backends)
 	}
 }
-
-func TestAdminAPI_HandleStatus_ReportsInFlightOverLimit(t *testing.T) {
-	app := &App{}
-	h := newTestHandler("b1", 3)
-	for i := 0; i < 3; i++ {
-		h.controller.Acquire(1)
-	}
-	h.controller.mu.Lock()
-	h.controller.limit = 1
-	h.controller.mu.Unlock()
-	app.registerHandler("b1", h)
-
-	a := &AdminAPI{app: app}
-	rec := httptest.NewRecorder()
-	if err := a.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/adaptive_admission/status", nil)); err != nil {
-		t.Fatalf("handleStatus: %v", err)
-	}
-	var body statusResponse
-	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if got := body.Backends[0]; got.InFlight != 3 || got.Limit != 1 || got.InFlightOverLimit != 2 {
-		t.Errorf("backend status = %+v, want in_flight=3 limit=1 in_flight_over_limit=2", got)
-	}
-}
