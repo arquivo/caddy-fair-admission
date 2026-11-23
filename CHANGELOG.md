@@ -1,3 +1,9 @@
+## [3.5.2](https://github.com/arquivo/caddy-fair-admission/compare/v3.5.1...v3.5.2) (2026-11-23)
+
+### Bug Fixes
+
+* **adaptive_admission:** support streaming and protocol upgrades behind admission ([#16](https://github.com/arquivo/caddy-fair-admission/issues/16)) ([3bf5e08](https://github.com/arquivo/caddy-fair-admission/commit/3bf5e08535bc56c7f77656fad7c80e135098e62d)), closes [#15](https://github.com/arquivo/caddy-fair-admission/issues/15) [#17](https://github.com/arquivo/caddy-fair-admission/issues/17), references [arquivo/pwa-technologies#1602](https://github.com/arquivo/pwa-technologies/issues/1602)
+
 ## [3.5.1](https://github.com/arquivo/caddy-fair-admission/compare/v3.5.0...v3.5.1) (2026-11-23)
 
 ### Bug Fixes
