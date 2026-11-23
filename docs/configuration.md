@@ -303,8 +303,8 @@ adaptive_admission {
 | `queue_max_size <int>` | `0` (unbounded) | Max tickets the priority queue holds. What happens to an arrival at a full queue is set by `queue_full_policy`. |
 | `queue_timeout <duration>` | `0` (unbounded) | Max queue wait. Checked as a Little's-law projection on arrival (`queue_wait_exceeded`) and against each queued request's real wait (`queue_timed_out`), see §7. |
 | `queue_aging_rate <float>` | `0` (off, strict score order) | Score points per second a queued request gains over a fresh one, so a lower score is slowed down but never starved (§7). Must be `>= 0`. |
-| `queue_full_policy <reject_new\|evict_lowest>` | `reject_new` | At a full queue, `reject_new` rejects the arrival with `queue_full`. `evict_lowest` instead removes the queued request that would be served last (rejected as `evicted`), if the arrival would be served before it (§7). |
-| `queue_wait_projection <all\|ahead>` | `all` | Which queued requests the `queue_wait_exceeded` projection counts: `all` of them, or only those `ahead` of the arrival in the queue (§7). |
+| `queue_full_policy <reject_new\|evict_lowest>` | `reject_new` | At a full queue, `reject_new` rejects the arrival with `queue_full`. `evict_lowest` instead removes the queued request that would be served last (rejected as `evicted`), if the arrival would be served before it (§7). Needs `queue_max_size`. |
+| `queue_wait_projection <all\|ahead>` | `all` | Which queued requests the `queue_wait_exceeded` projection counts: `all` of them, or only those `ahead` of the arrival in the queue (§7). Needs `queue_timeout`. |
 | `reject_status <int>` | `429` | HTTP status for `queue_full`, `queue_wait_exceeded`, `queue_timed_out` and `evicted` rejections. Any 4xx/5xx, e.g. `503` behind a proxy that counts `429`s against the client (§7). |
 | `retry_after <duration>` | unset (no header) | Sends `Retry-After` (whole seconds, rounded up) on those same rejections. |
 
@@ -347,12 +347,9 @@ a fresh arrival is served first once it has waited `d / r` seconds. For example,
 `ip` soft penalty (10 points) costs at most 2s of extra wait against fresh traffic, and the hard
 penalty (40 points) at most 8s. Because every queued request ages at the same rate, the order of
 two queued requests never changes as they wait, which keeps the queue an ordinary heap. `0` keeps
-strict score order.
-
-**Queue position.** With aging on, "served before" compares `score + r × seconds waited`, not the
-raw scores: an older request with a lower score can be ahead of a fresher one with a higher score.
-Equal values keep arrival order, so a new request is always behind every queued request it ties
-with.
+strict score order. "Served before" below always means this order, so an older request with a
+lower score can be ahead of a fresher one with a higher score, and a new request is behind every
+queued request it ties with.
 
 Five rejection reasons, logged/labeled separately (see [`monitoring.md`](monitoring.md)).
 All but `client_gone` are answered with `reject_status` (default 429, plus `Retry-After` if
@@ -376,16 +373,24 @@ All but `client_gone` are answered with `reject_status` (default 429, plus `Retr
   This projection is skipped (never rejects) until at least one request has completed and produced
   a real latency sample — an empty/cold queue never gets rejected on a wait estimate that doesn't
   exist yet.
-- **`evicted`** — only with `queue_full_policy evict_lowest`: the request was queued, then a new
-  request that would be served before it arrived at the full queue, and it was the queued request
-  last in line (on ties, the most recent arrival). It's removed from the queue and never reaches
-  the backend. The new request takes its place, so the queue size doesn't change.
+- **`evicted`** — only with `queue_full_policy evict_lowest`: the request was last in line (on
+  ties, the most recent arrival) when a request that would be served before it arrived at the full
+  queue (see `queue_full`). It's removed from the queue and never reaches the backend.
 - **`queue_timed_out`** — the request joined the queue, but its real wait reached `queue_timeout`
   before it was admitted. It's removed from the queue and never reaches the backend.
 - **`client_gone`** — the client disconnected while the request was queued. It's removed from the
   queue and never reaches the backend; the status (499) only shows in Caddy's own logs. Behind a
   proxy such as httpd, Caddy only sees the disconnect once the proxy closes its own connection to
   Caddy, so `queue_timeout` is what bounds such a request's wait there.
+
+**Using `evict_lowest` and `ahead`.** Both are meant for a bounded queue. With `ahead`, the
+projection no longer caps the total queue depth, so `queue_max_size` is what bounds it, along with
+the work each arrival does under the queue lock, which grows with the queue size. Both act only on
+score differences: requests with the same score never evict each other, so a flood that stays
+under every penalty threshold is treated like everyone else. And both make a higher score count
+for more: it now takes a queued request's place instead of being rejected. Eviction is therefore
+only as trustworthy as the score inputs, and users who share a penalised bucket with a flood (the
+same subnet, ASN, country or archived domain) are the first to be evicted.
 
 Behind a proxy that rate-limits on the status code — e.g. httpd's mod_qos with
 `QS_SetEnvIfStatus 429 QS_Block`, which counts each 429 towards blocking that client IP — a

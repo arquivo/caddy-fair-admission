@@ -10,10 +10,10 @@
 // goroutine repeatedly acquires one unit of capacity from the Controller and
 // only then pops the current highest-priority ticket — never the other way
 // around — so admission always reflects the queue's current priority order
-// rather than a snapshot of arrival order at enqueue time. This ordering is only correct because cost
-// is uniformly 1 (§4.4/§4.5): a single Acquire(1) always corresponds to
-// admitting exactly one ticket, so there's no ambiguity about which queued
-// ticket a given acquired unit "belongs to".
+// rather than a snapshot of arrival order at enqueue time. This ordering is
+// only correct because cost is uniformly 1 (§4.4/§4.5): a single Acquire(1)
+// always corresponds to admitting exactly one ticket, so there's no
+// ambiguity about which queued ticket a given acquired unit "belongs to".
 //
 // Accepted tradeoff: because capacity is acquired before a ticket exists to
 // grant it to, the dispatch loop holds one "lookahead" reservation whenever
@@ -162,13 +162,10 @@ func (h *ticketHeap) Pop() any {
 }
 
 // last returns the ticket the heap would pop last (lowest key, newest among
-// equal keys), or nil if empty. Every parent comes before its children in
-// Less order, so that ticket has no children: only the leaves, the second
+// equal keys); h must not be empty. Every parent comes before its children
+// in Less order, so that ticket has no children: only the leaves, the second
 // half of the slice, need scanning.
 func (h ticketHeap) last() *Ticket {
-	if len(h) == 0 {
-		return nil
-	}
 	w := len(h) / 2
 	for i := w + 1; i < len(h); i++ {
 		if h.Less(w, i) {
@@ -270,11 +267,7 @@ func (s *Scheduler) Enqueue(score float64) (*Ticket, RejectReason) {
 		depth--
 	}
 	if s.cfg.WaitTimeout > 0 {
-		if s.cfg.ProjectAhead {
-			// The victim has a lower key, so it's never counted here.
-			depth = s.pq.countAhead(key, 0)
-		}
-		if projected, ok := s.projectedWaitLocked(depth); ok && projected > s.cfg.WaitTimeout {
+		if projected, ok := s.projectedWaitLocked(key, depth); ok && projected > s.cfg.WaitTimeout {
 			return nil, RejectQueueWaitExceeded
 		}
 	}
@@ -284,7 +277,10 @@ func (s *Scheduler) Enqueue(score float64) (*Ticket, RejectReason) {
 		close(victim.evicted)
 	}
 	s.seq++
-	t := &Ticket{Score: score, key: key, seq: s.seq, granted: make(chan struct{}), evicted: make(chan struct{})}
+	t := &Ticket{
+		Score: score, key: key, seq: s.seq,
+		granted: make(chan struct{}), evicted: make(chan struct{}),
+	}
 	heap.Push(&s.pq, t)
 	s.cond.Signal()
 	return t, RejectNone
@@ -317,21 +313,19 @@ func (s *Scheduler) Wait(ctx context.Context, t *Ticket) RejectReason {
 	select {
 	case <-t.Granted():
 	case <-t.evicted:
-		return RejectEvicted
 	case <-deadline:
 		if s.Cancel(t) {
 			return RejectQueueTimedOut
-		}
-		if t.wasEvicted() {
-			return RejectEvicted
 		}
 	case <-ctx.Done():
 		if s.Cancel(t) {
 			return RejectClientGone
 		}
-		if t.wasEvicted() {
-			return RejectEvicted
-		}
+	}
+	// Evicted, possibly in the same instant the timer fired or ctx was
+	// cancelled: t owns nothing, so there's nothing to release.
+	if t.wasEvicted() {
+		return RejectEvicted
 	}
 
 	// Granted, possibly in the same instant ctx was cancelled (select picks
@@ -368,17 +362,23 @@ func (s *Scheduler) Depth() int {
 	return len(s.pq)
 }
 
-// projectedWaitLocked estimates the wait a request joining the queue right
-// now behind depth tickets would face, Little's-law style (§4.5):
-// depth * mean_latency / concurrency_limit. ok=false when there isn't
-// enough data yet to project anything (no completed requests recorded, or a
-// zero/negative limit) — callers must not reject on an unknown projection,
-// only on a computed one that actually exceeds the timeout.
-func (s *Scheduler) projectedWaitLocked(depth int) (projected time.Duration, ok bool) {
+// projectedWaitLocked estimates the wait a request with the given key
+// joining the queue right now would face, Little's-law style (§4.5):
+// queued * mean_latency / concurrency_limit, where queued is depth, or with
+// QueueConfig.ProjectAhead the tickets that would be served before it.
+// ok=false when there isn't enough data yet to project anything (no
+// completed requests recorded, or a zero/negative limit) — callers must not
+// reject on an unknown projection, only on a computed one that actually
+// exceeds the timeout.
+func (s *Scheduler) projectedWaitLocked(key float64, depth int) (projected time.Duration, ok bool) {
 	limit := s.controller.Limit()
 	mean := s.controller.MeanLatency()
 	if limit <= 0 || mean <= 0 {
 		return 0, false
+	}
+	if s.cfg.ProjectAhead {
+		// An eviction victim has a lower key, so it's never counted here.
+		depth = s.pq.countAhead(key, 0)
 	}
 	return time.Duration(float64(depth) * float64(mean) / float64(limit)), true
 }

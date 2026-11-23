@@ -183,7 +183,7 @@ fairness_score_distribution_count{backend="default",user_class="anonymous"} 1523
 | `adaptive_admission_queue_size` | Gauge | `backend` | Current number of queued (not yet admitted) requests. |
 | `adaptive_admission_requests_total` | Counter | `backend` | Total requests seen. |
 | `adaptive_admission_requests_admitted_total` | Counter | `backend` | Total requests admitted (dispatched to next handler). |
-| `adaptive_admission_requests_rejected_total` | Counter | `backend`, `reason` | Total requests rejected, by reason (`queue_full`, `queue_wait_exceeded`, `queue_timed_out`, `client_gone` or `evicted`, see §7 of [`configuration.md`](configuration.md)). |
+| `adaptive_admission_requests_rejected_total` | Counter | `backend`, `reason` | Total requests rejected, by reason (`queue_full`, `queue_wait_exceeded`, `queue_timed_out`, `client_gone` or `evicted`, see §7 of [`configuration.md`](configuration.md)). With `queue_full_policy evict_lowest`, part of a full queue shows as `evicted` instead of `queue_full`, so saturation alerts should count both. |
 | `adaptive_admission_backend_errors_total` | Counter | `backend` | Total dispatched requests whose outcome was a 5xx/error. |
 | `adaptive_admission_backend_timeouts_total` | Counter | `backend` | Total dispatched requests whose outcome was a timeout. |
 | `adaptive_admission_adaptive_limit_changes_total` | Counter | `backend`, `direction` | Total adaptive-controller limit changes, by direction (`grow` or `shrink`). |

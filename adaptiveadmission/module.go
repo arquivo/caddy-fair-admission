@@ -38,10 +38,11 @@ func init() {
 const fairnessScoreVarKey = "fairness_score"
 
 // neutralScore is used when no fairness_score var was set (fairness wasn't
-// chained ahead of this directive, or the var isn't a float64). Its absolute
-// value is inconsequential: every request hitting this fallback gets the
-// same score, so they're served FIFO relative to each other — neutral, not
-// privileged or penalized (fail-open per §3.1).
+// chained ahead of this directive), or the var isn't a float64 or is NaN,
+// which has no place in the queue order. Its absolute value is
+// inconsequential: every request hitting this fallback gets the same score,
+// so they're served FIFO relative to each other — neutral, not privileged or
+// penalized (fail-open per §3.1).
 const neutralScore float64 = 0
 
 // fairnessLogFieldsVarKey mirrors fairness's own logFieldsVarKey constant
@@ -183,7 +184,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	score := neutralScore
 	if v := caddyhttp.GetVar(r.Context(), fairnessScoreVarKey); v != nil {
-		if f, ok := v.(float64); ok {
+		if f, ok := v.(float64); ok && !math.IsNaN(f) {
 			score = f
 		}
 	}
@@ -376,7 +377,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
-				if err := checkQueueFullPolicy(d.Val()); err != nil {
+				if err := checkOneOf("queue_full_policy", d.Val(), queueFullPolicyRejectNew, queueFullPolicyEvictLowest); err != nil {
 					return d.Err(err.Error())
 				}
 				h.QueueFullPolicy = d.Val()
@@ -385,7 +386,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
-				if err := checkQueueWaitProjection(d.Val()); err != nil {
+				if err := checkOneOf("queue_wait_projection", d.Val(), queueWaitProjectionAll, queueWaitProjectionAhead); err != nil {
 					return d.Err(err.Error())
 				}
 				h.QueueWaitProjection = d.Val()

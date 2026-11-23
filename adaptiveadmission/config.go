@@ -3,6 +3,7 @@ package adaptiveadmission
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 )
 
@@ -75,11 +76,11 @@ func (c Config) validate() error {
 	if c.QueueAgingRate < 0 {
 		return fmt.Errorf("adaptive_admission: queue_aging_rate must be >= 0")
 	}
-	if err := checkQueueFullPolicy(c.QueueFullPolicy); err != nil {
-		return err
+	if err := checkOneOf("queue_full_policy", c.QueueFullPolicy, queueFullPolicyRejectNew, queueFullPolicyEvictLowest); err != nil {
+		return fmt.Errorf("adaptive_admission: %w", err)
 	}
-	if err := checkQueueWaitProjection(c.QueueWaitProjection); err != nil {
-		return err
+	if err := checkOneOf("queue_wait_projection", c.QueueWaitProjection, queueWaitProjectionAll, queueWaitProjectionAhead); err != nil {
+		return fmt.Errorf("adaptive_admission: %w", err)
 	}
 	if c.RejectStatus != 0 && (c.RejectStatus < 400 || c.RejectStatus > 599) {
 		return fmt.Errorf("adaptive_admission: reject_status must be a 4xx or 5xx status, got %d", c.RejectStatus)
@@ -90,22 +91,12 @@ func (c Config) validate() error {
 	return nil
 }
 
-// checkQueueFullPolicy accepts "" (the default) and the known policies.
-func checkQueueFullPolicy(v string) error {
-	switch v {
-	case "", queueFullPolicyRejectNew, queueFullPolicyEvictLowest:
+// checkOneOf accepts "" (the directive's default) and the allowed values.
+func checkOneOf(directive, v string, allowed ...string) error {
+	if v == "" || slices.Contains(allowed, v) {
 		return nil
 	}
-	return fmt.Errorf("adaptive_admission: unrecognized queue_full_policy %q (want %q or %q)", v, queueFullPolicyRejectNew, queueFullPolicyEvictLowest)
-}
-
-// checkQueueWaitProjection accepts "" (the default) and the known modes.
-func checkQueueWaitProjection(v string) error {
-	switch v {
-	case "", queueWaitProjectionAll, queueWaitProjectionAhead:
-		return nil
-	}
-	return fmt.Errorf("adaptive_admission: unrecognized queue_wait_projection %q (want %q or %q)", v, queueWaitProjectionAll, queueWaitProjectionAhead)
+	return fmt.Errorf("unrecognized %s %q (want one of %q)", directive, v, allowed)
 }
 
 // rejectStatus returns the configured RejectStatus, or 429 if unset.

@@ -3,6 +3,7 @@ package adaptiveadmission
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -214,6 +215,26 @@ func TestHandler_ServeHTTP_Evicted_UsesRejectStatusAndRetryAfterAndCountsReason(
 	}
 	if _, ok := rejected[0].ContextMap()["queue_wait_ms"]; !ok {
 		t.Error("evicted log entry missing queue_wait_ms")
+	}
+}
+
+func TestHandler_ServeHTTP_NaNScoreIsQueuedAsNeutral(t *testing.T) {
+	c := NewFixedController(1)
+	// Never started: only Enqueue's full-queue check runs.
+	s := NewScheduler(QueueConfig{MaxSize: 1, EvictLowest: true}, c)
+	queued := enqueueAll(t, s, neutralScore)[0]
+	h := &Handler{controller: c, scheduler: s}
+
+	nan := math.NaN()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		t.Fatal("next must not be called when the queue is full")
+		return nil
+	})
+	if err := h.ServeHTTP(httptest.NewRecorder(), newVarsRequest(&nan), next); err == nil {
+		t.Fatal("expected a queue_full rejection, got nil")
+	}
+	if queued.wasEvicted() {
+		t.Error("a NaN score evicted a queued ticket; it should tie with the neutral score and lose")
 	}
 }
 
