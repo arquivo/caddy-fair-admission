@@ -286,11 +286,13 @@ adaptive_admission {
         adjust_interval        <duration>
     }
 
-    queue_max_size   <int>
-    queue_timeout    <duration>
-    queue_aging_rate <float>
-    reject_status    <int>
-    retry_after      <duration>
+    queue_max_size        <int>
+    queue_timeout         <duration>
+    queue_aging_rate      <float>
+    queue_full_policy     reject_new|evict_lowest
+    queue_wait_projection all|ahead
+    reject_status         <int>
+    retry_after           <duration>
 }
 ```
 
@@ -298,10 +300,12 @@ adaptive_admission {
 |---|---|---|
 | `backend <string>` | `"default"` | Label only, as in `fairness`. |
 | `controller <fixed\|adaptive>` | — (required) | Selects the capacity-control strategy for this backend. |
-| `queue_max_size <int>` | `0` (unbounded) | Max tickets the priority queue holds before rejecting new arrivals with `queue_full`. |
+| `queue_max_size <int>` | `0` (unbounded) | Max tickets the priority queue holds. What happens to an arrival at a full queue is set by `queue_full_policy`. |
 | `queue_timeout <duration>` | `0` (unbounded) | Max queue wait. Checked as a Little's-law projection on arrival (`queue_wait_exceeded`) and against each queued request's real wait (`queue_timed_out`), see §7. |
 | `queue_aging_rate <float>` | `0` (off, strict score order) | Score points per second a queued request gains over a fresh one, so a lower score is slowed down but never starved (§7). Must be `>= 0`. |
-| `reject_status <int>` | `429` | HTTP status for `queue_full`, `queue_wait_exceeded` and `queue_timed_out` rejections. Any 4xx/5xx, e.g. `503` behind a proxy that counts `429`s against the client (§7). |
+| `queue_full_policy <reject_new\|evict_lowest>` | `reject_new` | At a full queue, `reject_new` rejects the arrival with `queue_full`. `evict_lowest` instead removes the queued request that would be served last (rejected as `evicted`), if the arrival would be served before it (§7). |
+| `queue_wait_projection <all\|ahead>` | `all` | Which queued requests the `queue_wait_exceeded` projection counts: `all` of them, or only those `ahead` of the arrival in the queue (§7). |
+| `reject_status <int>` | `429` | HTTP status for `queue_full`, `queue_wait_exceeded`, `queue_timed_out` and `evicted` rejections. Any 4xx/5xx, e.g. `503` behind a proxy that counts `429`s against the client (§7). |
 | `retry_after <duration>` | unset (no header) | Sends `Retry-After` (whole seconds, rounded up) on those same rejections. |
 
 `controller fixed { limit <int> }` — a static concurrency ceiling. `limit` must be `> 0`.
@@ -345,21 +349,37 @@ penalty (40 points) at most 8s. Because every queued request ages at the same ra
 two queued requests never changes as they wait, which keeps the queue an ordinary heap. `0` keeps
 strict score order.
 
-Four rejection reasons, logged/labeled separately (see [`monitoring.md`](monitoring.md)).
-The first three are answered with `reject_status` (default 429, plus `Retry-After` if
+**Queue position.** With aging on, "served before" compares `score + r × seconds waited`, not the
+raw scores: an older request with a lower score can be ahead of a fresher one with a higher score.
+Equal values keep arrival order, so a new request is always behind every queued request it ties
+with.
+
+Five rejection reasons, logged/labeled separately (see [`monitoring.md`](monitoring.md)).
+All but `client_gone` are answered with `reject_status` (default 429, plus `Retry-After` if
 `retry_after` is set):
 
-- **`queue_full`** — the queue already holds `queue_max_size` tickets when a new one arrives.
+- **`queue_full`** — the queue already holds `queue_max_size` tickets when a new one arrives. With
+  `queue_full_policy evict_lowest`, only when the new request would not be served before the
+  queued request that is last in line (a tie counts as not before).
 - **`queue_wait_exceeded`** — a Little's-law-style projection already exceeds `queue_timeout`
   before the ticket even joins the queue:
 
   ```
-  projected_wait = queue_depth * mean_latency / concurrency_limit
+  projected_wait = queued * mean_latency / concurrency_limit
   ```
+
+  `queued` is every queued request with `queue_wait_projection all`, or only the requests that
+  would be served before the new one with `queue_wait_projection ahead`. With `all`, a deep queue
+  of low scores rejects a high-score arrival that would in fact be served next; with `ahead`, it
+  only rejects requests that would really wait that long.
 
   This projection is skipped (never rejects) until at least one request has completed and produced
   a real latency sample — an empty/cold queue never gets rejected on a wait estimate that doesn't
   exist yet.
+- **`evicted`** — only with `queue_full_policy evict_lowest`: the request was queued, then a new
+  request that would be served before it arrived at the full queue, and it was the queued request
+  last in line (on ties, the most recent arrival). It's removed from the queue and never reaches
+  the backend. The new request takes its place, so the queue size doesn't change.
 - **`queue_timed_out`** — the request joined the queue, but its real wait reached `queue_timeout`
   before it was admitted. It's removed from the queue and never reaches the backend.
 - **`client_gone`** — the client disconnected while the request was queued. It's removed from the

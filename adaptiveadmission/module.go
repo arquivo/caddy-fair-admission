@@ -224,7 +224,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 // reject records and logs a request that was never dispatched, and returns
 // the error that makes Caddy answer it: RejectStatus (default 429) with an
-// optional Retry-After for the overload reasons, 499 for client_gone.
+// optional Retry-After for the overload reasons (evicted included), 499 for
+// client_gone.
 func (h *Handler) reject(w http.ResponseWriter, r *http.Request, backend string, reason RejectReason, queueWait time.Duration) error {
 	admissionMetrics.requestsRejected.WithLabelValues(backend, reason.String()).Inc()
 	h.logDecision(r, logDecisionParams{backend: backend, admitted: false, rejectReason: reason, queueWait: queueWait})
@@ -271,7 +272,8 @@ func (h *Handler) logDecision(r *http.Request, p logDecisionParams) {
 		)
 	} else {
 		fields = append(fields, zap.String("reject_reason", p.rejectReason.String()))
-		if p.rejectReason == RejectQueueTimedOut || p.rejectReason == RejectClientGone {
+		switch p.rejectReason {
+		case RejectQueueTimedOut, RejectClientGone, RejectEvicted:
 			fields = append(fields, zap.Int64("queue_wait_ms", p.queueWait.Milliseconds()))
 		}
 	}
@@ -317,11 +319,13 @@ func (h *Handler) logDecision(r *http.Request, p logDecisionParams) {
 //	        error_rate_threshold   <float>
 //	        adjust_interval        <duration>
 //	    }
-//	    queue_max_size   <int>
-//	    queue_timeout    <duration>
-//	    queue_aging_rate <float>
-//	    reject_status    <int>
-//	    retry_after      <duration>
+//	    queue_max_size        <int>
+//	    queue_timeout         <duration>
+//	    queue_aging_rate      <float>
+//	    queue_full_policy     reject_new|evict_lowest
+//	    queue_wait_projection all|ahead
+//	    reject_status         <int>
+//	    retry_after           <duration>
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -367,6 +371,24 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid queue_aging_rate %q: %v", d.Val(), err)
 				}
 				h.QueueAgingRate = f
+
+			case "queue_full_policy":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				if err := checkQueueFullPolicy(d.Val()); err != nil {
+					return d.Err(err.Error())
+				}
+				h.QueueFullPolicy = d.Val()
+
+			case "queue_wait_projection":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				if err := checkQueueWaitProjection(d.Val()); err != nil {
+					return d.Err(err.Error())
+				}
+				h.QueueWaitProjection = d.Val()
 
 			case "reject_status":
 				if !d.NextArg() {

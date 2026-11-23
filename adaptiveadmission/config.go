@@ -9,6 +9,12 @@ import (
 const (
 	controllerKindFixed    = "fixed"
 	controllerKindAdaptive = "adaptive"
+
+	queueFullPolicyRejectNew   = "reject_new"
+	queueFullPolicyEvictLowest = "evict_lowest"
+
+	queueWaitProjectionAll   = "all"
+	queueWaitProjectionAhead = "ahead"
 )
 
 // Config is the adaptive_admission handler's configuration surface for
@@ -45,9 +51,18 @@ type Config struct {
 	// QueueAgingRate is QueueConfig.AgingRate: score points per second of
 	// waiting. Zero/unset keeps strict score order.
 	QueueAgingRate float64 `json:"queue_aging_rate,omitempty"`
+	// QueueFullPolicy is what a full queue does with an arrival:
+	// "reject_new" (empty/unset) rejects it with queue_full; "evict_lowest"
+	// removes the ticket that would be served last, if the arrival would be
+	// served before it (QueueConfig.EvictLowest).
+	QueueFullPolicy string `json:"queue_full_policy,omitempty"`
+	// QueueWaitProjection is which queued tickets the queue_wait_exceeded
+	// projection counts: "all" (empty/unset) or "ahead", only those that
+	// would be served before the arrival (QueueConfig.ProjectAhead).
+	QueueWaitProjection string `json:"queue_wait_projection,omitempty"`
 
-	// RejectStatus is the HTTP status for queue_full, queue_wait_exceeded
-	// and queue_timed_out rejections. Zero/unset means 429.
+	// RejectStatus is the HTTP status for queue_full, queue_wait_exceeded,
+	// queue_timed_out and evicted rejections. Zero/unset means 429.
 	RejectStatus int `json:"reject_status,omitempty"`
 	// RetryAfter, if set, is sent as a Retry-After header (whole seconds,
 	// rounded up) on those same rejections.
@@ -60,6 +75,12 @@ func (c Config) validate() error {
 	if c.QueueAgingRate < 0 {
 		return fmt.Errorf("adaptive_admission: queue_aging_rate must be >= 0")
 	}
+	if err := checkQueueFullPolicy(c.QueueFullPolicy); err != nil {
+		return err
+	}
+	if err := checkQueueWaitProjection(c.QueueWaitProjection); err != nil {
+		return err
+	}
 	if c.RejectStatus != 0 && (c.RejectStatus < 400 || c.RejectStatus > 599) {
 		return fmt.Errorf("adaptive_admission: reject_status must be a 4xx or 5xx status, got %d", c.RejectStatus)
 	}
@@ -67,6 +88,24 @@ func (c Config) validate() error {
 		return fmt.Errorf("adaptive_admission: retry_after must be >= 0")
 	}
 	return nil
+}
+
+// checkQueueFullPolicy accepts "" (the default) and the known policies.
+func checkQueueFullPolicy(v string) error {
+	switch v {
+	case "", queueFullPolicyRejectNew, queueFullPolicyEvictLowest:
+		return nil
+	}
+	return fmt.Errorf("adaptive_admission: unrecognized queue_full_policy %q (want %q or %q)", v, queueFullPolicyRejectNew, queueFullPolicyEvictLowest)
+}
+
+// checkQueueWaitProjection accepts "" (the default) and the known modes.
+func checkQueueWaitProjection(v string) error {
+	switch v {
+	case "", queueWaitProjectionAll, queueWaitProjectionAhead:
+		return nil
+	}
+	return fmt.Errorf("adaptive_admission: unrecognized queue_wait_projection %q (want %q or %q)", v, queueWaitProjectionAll, queueWaitProjectionAhead)
 }
 
 // rejectStatus returns the configured RejectStatus, or 429 if unset.
@@ -127,7 +166,13 @@ func (cc ControllerConfig) buildController() (*Controller, error) {
 
 // queueConfig derives this handler's QueueConfig (queue.go).
 func (c Config) queueConfig() QueueConfig {
-	return QueueConfig{MaxSize: c.QueueMaxSize, WaitTimeout: c.QueueTimeout, AgingRate: c.QueueAgingRate}
+	return QueueConfig{
+		MaxSize:      c.QueueMaxSize,
+		WaitTimeout:  c.QueueTimeout,
+		AgingRate:    c.QueueAgingRate,
+		EvictLowest:  c.QueueFullPolicy == queueFullPolicyEvictLowest,
+		ProjectAhead: c.QueueWaitProjection == queueWaitProjectionAhead,
+	}
 }
 
 // backendLabel returns the configured Backend label, or "default" if unset.

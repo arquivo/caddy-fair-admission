@@ -5,11 +5,12 @@
 // first; arrival order breaks ties, and an optional aging rate lets a
 // long-waiting lower score overtake fresher higher ones — see Ticket.key),
 // then waits in Scheduler.Wait until it is granted, its queue_timeout
-// deadline passes, or its client goes away. A single dispatch-loop goroutine repeatedly acquires one unit of
-// capacity from the Controller and only then pops the current highest-
-// priority ticket — never the other way around — so admission always
-// reflects the queue's current priority order rather than a snapshot of
-// arrival order at enqueue time. This ordering is only correct because cost
+// deadline passes, its client goes away, or (with QueueConfig.EvictLowest)
+// a better-placed arrival evicts it from a full queue. A single dispatch-loop
+// goroutine repeatedly acquires one unit of capacity from the Controller and
+// only then pops the current highest-priority ticket — never the other way
+// around — so admission always reflects the queue's current priority order
+// rather than a snapshot of arrival order at enqueue time. This ordering is only correct because cost
 // is uniformly 1 (§4.4/§4.5): a single Acquire(1) always corresponds to
 // admitting exactly one ticket, so there's no ambiguity about which queued
 // ticket a given acquired unit "belongs to".
@@ -49,6 +50,10 @@ const (
 	// RejectClientGone means the request's context was cancelled (the
 	// client disconnected) while it was still queued.
 	RejectClientGone
+	// RejectEvicted means the ticket was queued, but a later arrival with a
+	// better place in the queue removed it to make room (only with
+	// QueueConfig.EvictLowest).
+	RejectEvicted
 )
 
 func (r RejectReason) String() string {
@@ -61,6 +66,8 @@ func (r RejectReason) String() string {
 		return "queue_timed_out"
 	case RejectClientGone:
 		return "client_gone"
+	case RejectEvicted:
+		return "evicted"
 	default:
 		return "none"
 	}
@@ -78,6 +85,13 @@ type QueueConfig struct {
 	// whose score is d below a fresh one is served first once it has waited
 	// d/r seconds, so a lower score is slowed down but never starved.
 	AgingRate float64
+	// EvictLowest lets an arrival at a full queue take the place of the
+	// ticket that would be served last, if the arrival would be served
+	// before it. Off, a full queue rejects every arrival.
+	EvictLowest bool
+	// ProjectAhead computes the projected wait from the tickets that would
+	// be served before the arrival, instead of from the whole queue depth.
+	ProjectAhead bool
 }
 
 // Ticket represents one request's place in the queue. Score is read-only
@@ -95,6 +109,7 @@ type Ticket struct {
 	seq     uint64 // arrival order, for FIFO tie-break within equal keys
 	index   int    // heap.Interface bookkeeping; -1 once popped or removed
 	granted chan struct{}
+	evicted chan struct{} // closed, under Scheduler.mu, when evicted
 }
 
 // Granted returns a channel that's closed once this ticket has been
@@ -102,6 +117,16 @@ type Ticket struct {
 // popped it as the current highest-priority ticket).
 func (t *Ticket) Granted() <-chan struct{} {
 	return t.granted
+}
+
+// wasEvicted reports whether t was removed from the queue by an eviction.
+func (t *Ticket) wasEvicted() bool {
+	select {
+	case <-t.evicted:
+		return true
+	default:
+		return false
+	}
 }
 
 // ticketHeap is a container/heap.Interface ordering by key descending, then
@@ -134,6 +159,36 @@ func (h *ticketHeap) Pop() any {
 	t.index = -1
 	*h = old[:n-1]
 	return t
+}
+
+// last returns the ticket the heap would pop last (lowest key, newest among
+// equal keys), or nil if empty. Every parent comes before its children in
+// Less order, so that ticket has no children: only the leaves, the second
+// half of the slice, need scanning.
+func (h ticketHeap) last() *Ticket {
+	if len(h) == 0 {
+		return nil
+	}
+	w := len(h) / 2
+	for i := w + 1; i < len(h); i++ {
+		if h.Less(w, i) {
+			w = i
+		}
+	}
+	return h[w]
+}
+
+// countAhead returns how many tickets in the subtree rooted at i would be
+// popped before a new ticket with the given key: those with a key at least
+// as high (on equal keys, every queued ticket arrived first). A child's key
+// is never higher than its parent's, so a subtree whose root has a lower
+// key is skipped whole, and the walk only visits the tickets ahead plus
+// their direct children.
+func (h ticketHeap) countAhead(key float64, i int) int {
+	if i >= len(h) || h[i].key < key {
+		return 0
+	}
+	return 1 + h.countAhead(key, 2*i+1) + h.countAhead(key, 2*i+2)
 }
 
 // Scheduler is a backend-scoped bounded priority queue paired with a
@@ -187,44 +242,70 @@ func (s *Scheduler) Stop() {
 // RejectReason if the queue is already at QueueConfig.MaxSize or the
 // projected wait for a request joining right now already exceeds
 // QueueConfig.WaitTimeout.
+//
+// With QueueConfig.EvictLowest, a full queue only rejects the arrival if it
+// would not be served before the queue's last ticket; otherwise that last
+// ticket is removed (its Wait returns RejectEvicted) and the arrival takes
+// its place. Equal keys keep FIFO order, so an arrival never evicts a ticket
+// with the same key.
 func (s *Scheduler) Enqueue(score float64) (*Ticket, RejectReason) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	key := score
+	if s.cfg.AgingRate > 0 {
+		key -= s.cfg.AgingRate * s.now().Sub(s.epoch).Seconds()
+	}
+
 	depth := len(s.pq)
+	var victim *Ticket
 	if s.cfg.MaxSize > 0 && depth >= s.cfg.MaxSize {
-		return nil, RejectQueueFull
+		if !s.cfg.EvictLowest {
+			return nil, RejectQueueFull
+		}
+		victim = s.pq.last()
+		if key <= victim.key {
+			return nil, RejectQueueFull
+		}
+		depth--
 	}
 	if s.cfg.WaitTimeout > 0 {
+		if s.cfg.ProjectAhead {
+			// The victim has a lower key, so it's never counted here.
+			depth = s.pq.countAhead(key, 0)
+		}
 		if projected, ok := s.projectedWaitLocked(depth); ok && projected > s.cfg.WaitTimeout {
 			return nil, RejectQueueWaitExceeded
 		}
 	}
 
-	s.seq++
-	key := score
-	if s.cfg.AgingRate > 0 {
-		key -= s.cfg.AgingRate * s.now().Sub(s.epoch).Seconds()
+	if victim != nil {
+		heap.Remove(&s.pq, victim.index)
+		close(victim.evicted)
 	}
-	t := &Ticket{Score: score, key: key, seq: s.seq, granted: make(chan struct{})}
+	s.seq++
+	t := &Ticket{Score: score, key: key, seq: s.seq, granted: make(chan struct{}), evicted: make(chan struct{})}
 	heap.Push(&s.pq, t)
 	s.cond.Signal()
 	return t, RejectNone
 }
 
 // Wait blocks until t is granted (RejectNone), its real wait reaches
-// QueueConfig.WaitTimeout (RejectQueueTimedOut), or ctx is done
-// (RejectClientGone). Only on RejectNone does the caller hold the ticket's
-// unit of capacity, and it must then dispatch and Release it; on any other
-// result the ticket is gone from the queue and holds no capacity.
+// QueueConfig.WaitTimeout (RejectQueueTimedOut), ctx is done
+// (RejectClientGone), or an arrival evicts it (RejectEvicted). Only on
+// RejectNone does the caller hold the ticket's unit of capacity, and it must
+// then dispatch and Release it; on any other result the ticket is gone from
+// the queue and holds no capacity.
 //
-// The dispatch loop can pop t at the same moment the timer fires or ctx is
-// cancelled. Cancel settles that race under s.mu: if the loop got there
-// first, t already owns one unit of capacity. A timed-out ticket then is
-// simply served (the capacity is free right now, so dropping it would only
-// waste it); a ticket whose client is gone gives the unit back via
-// ReleaseUnused instead of sending work to the backend for nobody. Wait must
-// be called exactly once per ticket.
+// The dispatch loop can pop t, or an arrival evict it, at the same moment
+// the timer fires or ctx is cancelled. Cancel settles that race under s.mu:
+// if it returns false, t left the queue first, either evicted (t.evicted is
+// already closed, and t owns nothing) or popped (t owns one unit of
+// capacity). A timed-out popped ticket is simply served (the capacity is
+// free right now, so dropping it would only waste it); a popped ticket whose
+// client is gone gives the unit back via ReleaseUnused instead of sending
+// work to the backend for nobody. Wait must be called exactly once per
+// ticket.
 func (s *Scheduler) Wait(ctx context.Context, t *Ticket) RejectReason {
 	var deadline <-chan time.Time
 	if s.cfg.WaitTimeout > 0 {
@@ -235,13 +316,21 @@ func (s *Scheduler) Wait(ctx context.Context, t *Ticket) RejectReason {
 
 	select {
 	case <-t.Granted():
+	case <-t.evicted:
+		return RejectEvicted
 	case <-deadline:
 		if s.Cancel(t) {
 			return RejectQueueTimedOut
 		}
+		if t.wasEvicted() {
+			return RejectEvicted
+		}
 	case <-ctx.Done():
 		if s.Cancel(t) {
 			return RejectClientGone
+		}
+		if t.wasEvicted() {
+			return RejectEvicted
 		}
 	}
 
@@ -255,10 +344,11 @@ func (s *Scheduler) Wait(ctx context.Context, t *Ticket) RejectReason {
 }
 
 // Cancel removes t from the queue if it's still there, returning true; t
-// will then never be granted. It returns false if the dispatch loop has
-// already popped t, in which case t owns one unit of capacity (Granted() is
+// will then never be granted. It returns false if t already left the queue:
+// evicted (t.evicted is closed and t owns nothing), or popped by the
+// dispatch loop, in which case t owns one unit of capacity (Granted() is
 // closed or about to be). Callers outside this file should use Wait, which
-// handles both outcomes.
+// handles every outcome.
 func (s *Scheduler) Cancel(t *Ticket) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -279,8 +369,8 @@ func (s *Scheduler) Depth() int {
 }
 
 // projectedWaitLocked estimates the wait a request joining the queue right
-// now (at the given current depth) would face, Little's-law style (§4.5):
-// queue_depth * mean_latency / concurrency_limit. ok=false when there isn't
+// now behind depth tickets would face, Little's-law style (§4.5):
+// depth * mean_latency / concurrency_limit. ok=false when there isn't
 // enough data yet to project anything (no completed requests recorded, or a
 // zero/negative limit) — callers must not reject on an unknown projection,
 // only on a computed one that actually exceeds the timeout.

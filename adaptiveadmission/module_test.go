@@ -11,6 +11,9 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func newVarsRequest(score *float64) *http.Request {
@@ -132,6 +135,85 @@ func TestHandler_ServeHTTP_QueueTimeout_UsesRejectStatusAndRetryAfter(t *testing
 	s.Stop()
 	if got := c.InFlight(); got != 0 {
 		t.Errorf("InFlight() after Stop = %d, want 0", got)
+	}
+}
+
+func TestHandler_ServeHTTP_Evicted_UsesRejectStatusAndRetryAfterAndCountsReason(t *testing.T) {
+	backend := "evicted-test-backend"
+	evictedCount := admissionMetrics.requestsRejected.WithLabelValues(backend, "evicted")
+	evictedBefore := testutil.ToFloat64(evictedCount)
+	core, logs := observer.New(zap.InfoLevel)
+	c := NewFixedController(1)
+	c.Acquire(1) // hold the only slot until the higher score has evicted the lower
+	s := NewScheduler(QueueConfig{MaxSize: 1, EvictLowest: true}, c)
+	s.Start()
+
+	h := &Handler{
+		Config:     Config{Backend: backend, RejectStatus: http.StatusServiceUnavailable, RetryAfter: 2 * time.Second},
+		controller: c,
+		scheduler:  s,
+		logger:     zap.New(core),
+	}
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		if r.Header.Get("X-Name") == "low" {
+			t.Error("next must not be called for an evicted request")
+		}
+		return nil
+	})
+	serve := func(name string, score float64) (*httptest.ResponseRecorder, <-chan error) {
+		req := newVarsRequest(&score)
+		req.Header.Set("X-Name", name)
+		rec := httptest.NewRecorder()
+		errCh := make(chan error, 1)
+		go func() { errCh <- h.ServeHTTP(rec, req, next) }()
+		return rec, errCh
+	}
+
+	lowRec, lowErr := serve("low", 1)
+	for deadline := time.Now().Add(time.Second); s.Depth() != 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("low-score request never queued")
+		}
+	}
+	_, highErr := serve("high", 10)
+
+	var err error
+	select {
+	case err = <-lowErr:
+	case <-time.After(time.Second):
+		t.Fatal("low-score request still queued after a higher score arrived at the full queue")
+	}
+	var he caddyhttp.HandlerError
+	if !errors.As(err, &he) || he.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("evicted ServeHTTP error = %v, want a HandlerError with status 503", err)
+	}
+	if got := lowRec.Header().Get("Retry-After"); got != "2" {
+		t.Errorf("Retry-After = %q, want %q", got, "2")
+	}
+
+	c.Release(1, time.Millisecond, 200, false)
+	select {
+	case err = <-highErr:
+		if err != nil {
+			t.Errorf("high-score ServeHTTP: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("high-score request never dispatched")
+	}
+	s.Stop()
+	if got := c.InFlight(); got != 0 {
+		t.Errorf("InFlight() after Stop = %d, want 0", got)
+	}
+
+	if got := testutil.ToFloat64(evictedCount) - evictedBefore; got != 1 {
+		t.Errorf(`requests_rejected_total{reason="evicted"} grew by %v, want 1`, got)
+	}
+	rejected := logs.FilterField(zap.String("reject_reason", "evicted")).All()
+	if len(rejected) != 1 {
+		t.Fatalf("got %d evicted log entries, want 1", len(rejected))
+	}
+	if _, ok := rejected[0].ContextMap()["queue_wait_ms"]; !ok {
+		t.Error("evicted log entry missing queue_wait_ms")
 	}
 }
 
@@ -335,6 +417,8 @@ func TestHandler_Provision_InvalidQueueConfigReturnsError(t *testing.T) {
 	fixed := ControllerConfig{Kind: controllerKindFixed, Limit: 5}
 	cases := map[string]Config{
 		"negative queue_aging_rate": {Controller: fixed, QueueAgingRate: -1},
+		"unknown queue_full_policy": {Controller: fixed, QueueFullPolicy: "drop_oldest"},
+		"unknown queue_wait_proj":   {Controller: fixed, QueueWaitProjection: "behind"},
 		"reject_status 200":         {Controller: fixed, RejectStatus: 200},
 		"reject_status 600":         {Controller: fixed, RejectStatus: 600},
 		"negative retry_after":      {Controller: fixed, RetryAfter: -time.Second},
@@ -412,6 +496,47 @@ func TestUnmarshalCaddyfile_QueueAgingAndRejectStatus(t *testing.T) {
 
 func TestUnmarshalCaddyfile_QueueAgingAndRejectStatus_InvalidValues(t *testing.T) {
 	for _, line := range []string{"queue_aging_rate fast", "reject_status busy", "retry_after soon", "reject_status"} {
+		t.Run(line, func(t *testing.T) {
+			input := "adaptive_admission {\n" + line + "\n}"
+			var h Handler
+			if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {
+				t.Fatalf("expected an error for %q, got nil", line)
+			}
+		})
+	}
+}
+
+func TestUnmarshalCaddyfile_QueueFullPolicyAndWaitProjection(t *testing.T) {
+	cases := []struct {
+		name                     string
+		lines                    string
+		wantPolicy, wantProj     string
+		wantEvict, wantProjAhead bool
+	}{
+		{"defaults", "", "", "", false, false},
+		{"explicit defaults", "queue_full_policy reject_new\nqueue_wait_projection all", "reject_new", "all", false, false},
+		{"evict and ahead", "queue_full_policy evict_lowest\nqueue_wait_projection ahead", "evict_lowest", "ahead", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := "adaptive_admission {\n" + tc.lines + "\n}"
+			var h Handler
+			if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+				t.Fatalf("UnmarshalCaddyfile: %v", err)
+			}
+			if h.QueueFullPolicy != tc.wantPolicy || h.QueueWaitProjection != tc.wantProj {
+				t.Errorf("QueueFullPolicy, QueueWaitProjection = %q, %q; want %q, %q", h.QueueFullPolicy, h.QueueWaitProjection, tc.wantPolicy, tc.wantProj)
+			}
+			qc := h.queueConfig()
+			if qc.EvictLowest != tc.wantEvict || qc.ProjectAhead != tc.wantProjAhead {
+				t.Errorf("EvictLowest, ProjectAhead = %v, %v; want %v, %v", qc.EvictLowest, qc.ProjectAhead, tc.wantEvict, tc.wantProjAhead)
+			}
+		})
+	}
+}
+
+func TestUnmarshalCaddyfile_QueueFullPolicyAndWaitProjection_InvalidValues(t *testing.T) {
+	for _, line := range []string{"queue_full_policy drop_oldest", "queue_full_policy", "queue_wait_projection behind", "queue_wait_projection"} {
 		t.Run(line, func(t *testing.T) {
 			input := "adaptive_admission {\n" + line + "\n}"
 			var h Handler

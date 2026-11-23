@@ -192,3 +192,36 @@ fairness {
 }
 ```
 
+### When the flood fills the queue
+
+The penalty only orders the queue. Under the default queue settings, 600 penalised requests per
+second fill `queue_max_size` within seconds, and from then on every new arrival is rejected with
+`queue_full`, including normal users whose requests would have been served first. The same goes
+for `queue_wait_exceeded`: by default it projects the wait from the whole queue depth, so a deep
+queue of penalised requests turns away a normal user who would be next in line. The penalised
+requests stay queued until `queue_timeout`, while the people the penalty was meant to protect get
+the busy page.
+
+Two `adaptive_admission` settings let the score decide who gets the place (§7 of
+[`configuration.md`](configuration.md)):
+
+```caddyfile
+adaptive_admission {
+	controller fixed {
+		limit 50
+	}
+	queue_max_size        1000
+	queue_timeout         20s
+	queue_full_policy     evict_lowest
+	queue_wait_projection ahead
+	reject_status         503
+	retry_after           5s
+}
+```
+
+With `evict_lowest`, a normal user's request arriving at the full queue takes the place of the
+queued penalised request that is last in line, which is rejected as `evicted`. With `ahead`, the
+normal user's projected wait only counts the requests that would be served before theirs, not the
+flood behind them. The flood still gets whatever capacity is left over, and its excess is turned
+away as `evicted`, `queue_full` or `queue_wait_exceeded` instead of the normal users' requests.
+
