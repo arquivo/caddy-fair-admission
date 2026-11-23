@@ -77,7 +77,15 @@
 		# 503 instead of 429, with a Retry-After of 5 seconds.
 		reject_status 503
 		retry_after   5s
+		# Cancel a request still holding its slot after 60s, so a backend
+		# that stops answering can't keep every slot taken.
+		dispatch_timeout 60s
 	}
 
-	reverse_proxy page-search-api-3:8080 page-search-api-4:8080
+	reverse_proxy page-search-api-3:8080 page-search-api-4:8080 {
+		transport http {
+			dial_timeout            5s
+			response_header_timeout 30s
+		}
+	}
 }

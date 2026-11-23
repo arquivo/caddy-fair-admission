@@ -293,6 +293,7 @@ adaptive_admission {
     queue_wait_projection all|ahead
     reject_status         <int>
     retry_after           <duration>
+    dispatch_timeout      <duration>
 }
 ```
 
@@ -307,6 +308,7 @@ adaptive_admission {
 | `queue_wait_projection <all\|ahead>` | `all` | Which queued requests the `queue_wait_exceeded` projection counts: `all` of them, or only those `ahead` of the arrival in the queue (§7). Needs `queue_timeout`. |
 | `reject_status <int>` | `429` | HTTP status for `queue_full`, `queue_wait_exceeded`, `queue_timed_out` and `evicted` rejections. Any 4xx/5xx, e.g. `503` behind a proxy that counts `429`s against the client (§7). |
 | `retry_after <duration>` | unset (no header) | Sends `Retry-After` (whole seconds, rounded up) on those same rejections. |
+| `dispatch_timeout <duration>` | `0` (no limit) | Longest an admitted request may hold its slot, body included. Once it elapses, the request context passed to `reverse_proxy` is cancelled and the outcome is recorded as a timeout. Must be `>= 0`. See "How long a slot is held" below. |
 
 `controller fixed { limit <int> }` — a static concurrency ceiling. `limit` must be `> 0`.
 
@@ -332,6 +334,45 @@ grow makes forward progress even when the multiplier would otherwise round down 
 limit 1 growing always becomes at least 2). Every change is clamped to
 `[min_concurrency, max_concurrency]`. Growing the limit immediately wakes enough blocked requests
 to use the new capacity — it doesn't wait for the next request to finish and release its slot.
+
+### How long a slot is held
+
+An admitted request holds one unit of the backend's concurrency limit until the next handler
+(`reverse_proxy`) returns, so a backend that accepts connections but never answers can hold every
+slot and close the backend to new requests. Nothing is admitted while the in-flight count is at or
+above the limit. Bound it in one of two ways:
+
+- **On `reverse_proxy`** (recommended for every backend): `transport http { dial_timeout …;
+  response_header_timeout … }` turns a backend that doesn't answer into a 504, which also counts
+  towards `timeout_rate_threshold`. Behind another proxy, keep these below that proxy's own
+  timeout (e.g. httpd's `ProxyTimeout`), so Caddy gives up first.
+- **On `adaptive_admission`**: `dispatch_timeout` cancels the request after a fixed time,
+  whatever the next handler is and however it's configured. Unlike `response_header_timeout`, it
+  also cuts off a response body that is still being sent, so set it above the longest legitimate
+  response.
+
+```caddyfile
+adaptive_admission {
+    controller adaptive { ... }
+    dispatch_timeout 60s
+}
+reverse_proxy backend-1:8080 {
+    transport http {
+        dial_timeout            5s
+        response_header_timeout 30s
+    }
+}
+```
+
+A slot is also given back when the next handler panics instead of returning. `reverse_proxy` does
+that, with `http.ErrAbortHandler`, when a response body can't be copied to the end because the
+client or the backend went away. That outcome is recorded as a 499 when the client left, and as a
+500 otherwise.
+
+After an adaptive shrink, the in-flight count stays above the new limit until enough of the
+requests admitted under the old limit finish. That's expected, and the admin API reports it as
+`in_flight_over_limit` ([`monitoring.md`](monitoring.md)). It only becomes a problem if it stays
+above 0 while nothing is being admitted.
 
 ## 7. Queue semantics
 

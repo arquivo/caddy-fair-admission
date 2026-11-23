@@ -108,8 +108,8 @@ curl -s http://localhost:2019/fairness/status | jq .
 
 ### `GET /adaptive_admission/status`
 
-Per-backend controller kind, concurrency limit, current in-flight count, mean observed backend
-latency, and current queue depth.
+Per-backend controller kind, concurrency limit, current in-flight count and how far it is above
+the limit, mean observed backend latency, and current queue depth.
 
 ```sh
 curl -s http://localhost:2019/adaptive_admission/status | jq .
@@ -123,6 +123,7 @@ curl -s http://localhost:2019/adaptive_admission/status | jq .
       "controller_kind": "adaptive",
       "limit": 87,
       "in_flight": 42,
+      "in_flight_over_limit": 0,
       "mean_latency_ms": 118.4,
       "queue_size": 3
     }
@@ -138,6 +139,12 @@ curl -s http://localhost:2019/adaptive_admission/status | jq .
   backend at that instant, even while otherwise idle — the dispatch loop reserves a capacity slot
   (incrementing this counter) before it pops the next queued ticket, as a deliberate lookahead so a
   slot is never released and immediately lost to a race; this is documented behavior, not a bug.
+- `in_flight_over_limit` is `in_flight - limit`, or `0` when `in_flight` is at or below `limit`.
+  Nothing is admitted while it's above `0`. It's expected after an adaptive shrink, until the
+  requests admitted under the old limit finish ([`configuration.md`](configuration.md) §6, "How
+  long a slot is held"). If it stays above `0` with `requests_admitted_total` flat, admitted
+  requests are holding their slots without finishing: set `dispatch_timeout`, or
+  `response_header_timeout` on `reverse_proxy`.
 - There is no `upstreams`/load-balancer field here on purpose — `reverse_proxy`'s own health-check
   and upstream state is already exposed by Caddy's own `admin.api.reverse_proxy` module at
   `GET /reverse_proxy/upstreams`; this endpoint only reports what `adaptive_admission` itself owns
@@ -178,7 +185,7 @@ fairness_score_distribution_count{backend="default",user_class="anonymous"} 1523
 
 | Metric | Type | Labels | Help |
 |---|---|---|---|
-| `adaptive_admission_requests_in_flight` | Gauge | `backend` | Requests currently admitted and in flight. |
+| `adaptive_admission_requests_in_flight` | Gauge | `backend` | Requests currently admitted and in flight. Updated as requests are admitted, finish or leave the queue. Alert on a backend that stays closed, e.g. `adaptive_admission_requests_in_flight > adaptive_admission_concurrency_limit` for longer than `queue_timeout` while `rate(adaptive_admission_requests_admitted_total[5m]) == 0`. |
 | `adaptive_admission_concurrency_limit` | Gauge | `backend` | Current controller concurrency limit. |
 | `adaptive_admission_queue_size` | Gauge | `backend` | Current number of queued (not yet admitted) requests. |
 | `adaptive_admission_requests_total` | Counter | `backend` | Total requests seen. |
@@ -223,7 +230,9 @@ both modules combined, not one each.
 Fields present on **every** line: `backend` (string), `admitted` (bool).
 
 Fields present **only when `admitted: true`**: `queue_wait_ms` (int64), `backend_latency_ms`
-(int64), `status_code` (int).
+(int64), `status_code` (int). `status_code` is `504` when `dispatch_timeout` cut the request off,
+and `499` (client left) or `500` (anything else) when `reverse_proxy` aborted a response part-way
+through the body.
 
 Fields present **only when `admitted: false`**: `reject_reason` (string, `queue_full`,
 `queue_wait_exceeded`, `queue_timed_out`, `client_gone` or `evicted`). The last three were already

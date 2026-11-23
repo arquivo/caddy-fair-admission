@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -244,6 +245,49 @@ func TestScheduler_Stop_ReleasesUnusedCapacityAndDrainsQueuedTickets(t *testing.
 	s.Stop()
 	if got := c.InFlight(); got != 0 {
 		t.Errorf("InFlight() after Stop = %d, want 0 (unused acquired capacity must be released back)", got)
+	}
+}
+
+func TestScheduler_InFlightAboveShrunkLimit_AdmitsAgainOnceDrained(t *testing.T) {
+	c := NewFixedController(150)
+	s := NewScheduler(QueueConfig{}, c)
+	s.Start()
+	defer s.Stop()
+
+	const admitted = 105
+	for i := 0; i < admitted; i++ {
+		tk, reason := s.Enqueue(1)
+		if reason != RejectNone {
+			t.Fatalf("Enqueue %d rejected: %v", i, reason)
+		}
+		mustGrantWithin(t, tk, time.Second, "ticket never granted under the original limit")
+	}
+
+	// An adaptive shrink, as adjust() applies it.
+	c.mu.Lock()
+	c.limit = 16
+	c.mu.Unlock()
+
+	// The dispatch loop already holds its lookahead reservation, so one more
+	// ticket goes through; the next one has to wait for the drain.
+	lookahead, _ := s.Enqueue(1)
+	mustGrantWithin(t, lookahead, time.Second, "lookahead ticket never granted")
+	queued, _ := s.Enqueue(1)
+
+	inFlight := admitted + 1
+	for inFlight > 16 {
+		c.Release(1, time.Millisecond, http.StatusOK, false)
+		inFlight--
+	}
+	mustNotGrantWithin(t, queued, 50*time.Millisecond, "ticket granted while in-flight was still at the limit")
+
+	c.Release(1, time.Millisecond, http.StatusOK, false)
+	mustGrantWithin(t, queued, time.Second, "ticket never granted after in-flight drained below the shrunk limit")
+
+	// Finish the remaining requests so Stop's dispatch loop isn't left
+	// blocked in Acquire.
+	for ; inFlight > 0; inFlight-- {
+		c.Release(1, time.Millisecond, http.StatusOK, false)
 	}
 }
 

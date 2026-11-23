@@ -67,6 +67,14 @@ type Config struct {
 	// RetryAfter, if set, is sent as a Retry-After header (whole seconds,
 	// rounded up) on those same rejections.
 	RetryAfter time.Duration `json:"retry_after,omitempty"`
+
+	// DispatchTimeout, if set, is the longest an admitted request may hold
+	// its unit of capacity: the request context passed to the next handler
+	// is cancelled once it elapses, and the outcome is recorded as a
+	// timeout. It covers the whole response, body included. Zero/unset
+	// means no limit, leaving it to the next handler's own timeouts (e.g.
+	// reverse_proxy's response_header_timeout) and to the client.
+	DispatchTimeout time.Duration `json:"dispatch_timeout,omitempty"`
 }
 
 // validate checks the queue and rejection settings; the controller settings
@@ -86,6 +94,9 @@ func (c Config) validate() error {
 	}
 	if c.RetryAfter < 0 {
 		return fmt.Errorf("adaptive_admission: retry_after must be >= 0")
+	}
+	if c.DispatchTimeout < 0 {
+		return fmt.Errorf("adaptive_admission: dispatch_timeout must be >= 0")
 	}
 	return nil
 }
