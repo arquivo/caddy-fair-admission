@@ -355,7 +355,9 @@ another proxy, keep it below that proxy's own timeout (e.g. httpd's `ProxyTimeou
 gives up first. Connecting is already bounded: `dial_timeout` defaults to 3s, and a failed or
 timed-out connection is a 502, which counts towards `error_rate_threshold`. A client that stops
 reading the response body also holds its slot until it disconnects; the server `write` timeout
-(global option `servers { timeouts { write <duration> } }`) bounds that.
+(global option `servers { timeouts { write <duration> } }`) bounds that. A request that switches
+protocols (e.g. a WebSocket upgrade) holds its slot until the upgraded connection closes; the
+server `write` timeout doesn't apply to it, so bound it with `reverse_proxy`'s `stream_timeout`.
 
 A slot is also given back when `reverse_proxy` aborts a response part-way through the body. That
 outcome is recorded as a 499 when the client left, and as a 500 otherwise.

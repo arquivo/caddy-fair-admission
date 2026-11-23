@@ -1252,33 +1252,26 @@ func TestIntegration_EndToEnd_StreamedResponseIsFlushedThroughAdmission(t *testi
 
 	// Headers and the first line must both arrive while the upstream is
 	// still blocked on release.
-	firstLine := make(chan string, 1)
-	go func() {
-		client := &http.Client{Timeout: 10 * time.Second}
-		resp, err := client.Get("http://127.0.0.1:19120/")
-		if err != nil {
-			t.Errorf("GET: %v", err)
-			firstLine <- ""
-			return
-		}
-		defer resp.Body.Close()
-		line, _ := bufio.NewReader(resp.Body).ReadString('\n')
-		firstLine <- line
-	}()
-	select {
-	case line := <-firstLine:
-		if line != "first\n" {
-			t.Errorf("first line = %q, want %q", line, "first\n")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("first chunk was not flushed to the client while the upstream was still responding")
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:19120/")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	if err != nil || line != "first\n" {
+		t.Fatalf("first line = %q, %v; want %q while the upstream is still responding", line, err, "first\n")
 	}
 }
 
 // adaptive_admission must not hide the response writer's Hijack from
-// reverse_proxy: an HTTP/1.1 Upgrade request switches protocols end to end.
+// reverse_proxy: an HTTP/1.1 Upgrade request switches protocols end to end,
+// and its slot is given back once the upgraded connection closes.
 func TestIntegration_EndToEnd_ProtocolUpgradeWorksThroughAdmission(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") == "" {
+			return
+		}
 		conn, brw, err := http.NewResponseController(w).Hijack()
 		if err != nil {
 			t.Errorf("upstream Hijack: %v", err)
@@ -1335,5 +1328,18 @@ func TestIntegration_EndToEnd_ProtocolUpgradeWorksThroughAdmission(t *testing.T)
 	}
 	if line != "ping\n" {
 		t.Errorf("echoed %q, want %q", line, "ping\n")
+	}
+
+	// The only slot must come back: with limit 1, this request is admitted
+	// only after the upgraded connection is released.
+	conn.Close()
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err = client.Get("http://127.0.0.1:19121/")
+	if err != nil {
+		t.Fatalf("GET after upgrade: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status after upgrade = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 }

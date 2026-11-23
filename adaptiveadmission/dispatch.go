@@ -115,8 +115,8 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
-// Unwrap lets http.NewResponseController reach the wrapped writer's Flush,
-// Hijack and deadline methods, which reverse_proxy needs for streamed
+// Unwrap lets http.NewResponseController reach the wrapped writer's optional
+// methods, such as the Flush and Hijack that reverse_proxy uses for streamed
 // responses and protocol upgrades (e.g. WebSocket).
 func (r *statusRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
