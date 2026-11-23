@@ -333,6 +333,37 @@ limit 1 growing always becomes at least 2). Every change is clamped to
 `[min_concurrency, max_concurrency]`. Growing the limit immediately wakes enough blocked requests
 to use the new capacity — it doesn't wait for the next request to finish and release its slot.
 
+### How long a slot is held
+
+An admitted request holds one unit of the backend's concurrency limit until `reverse_proxy`
+returns. Nothing is admitted while the in-flight count is at or above the limit, so a backend that
+accepts connections but never answers can take every slot and close the backend to new requests.
+`reverse_proxy` waits for response headers indefinitely unless told otherwise, so set
+`response_header_timeout` on every backend:
+
+```caddyfile
+reverse_proxy backend-1:8080 {
+    transport http {
+        response_header_timeout 30s
+    }
+}
+```
+
+The timer starts once the request has been sent to the backend, so a slow client can't trigger it.
+When it fires, the client gets a 504, which counts towards `timeout_rate_threshold`. Behind
+another proxy, keep it below that proxy's own timeout (e.g. httpd's `ProxyTimeout`), so Caddy
+gives up first. Connecting is already bounded: `dial_timeout` defaults to 3s, and a failed or
+timed-out connection is a 502, which counts towards `error_rate_threshold`. A client that stops
+reading the response body also holds its slot until it disconnects; the server `write` timeout
+(global option `servers { timeouts { write <duration> } }`) bounds that.
+
+A slot is also given back when `reverse_proxy` aborts a response part-way through the body. That
+outcome is recorded as a 499 when the client left, and as a 500 otherwise.
+
+After an adaptive shrink, the in-flight count stays above the new limit until enough of the
+requests admitted under the old limit finish. That's expected; see
+[`monitoring.md`](monitoring.md) for alerting on a backend that stays closed.
+
 ## 7. Queue semantics
 
 The priority queue orders tickets by **score descending**, then **arrival order (FIFO)** within

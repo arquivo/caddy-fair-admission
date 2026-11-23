@@ -79,5 +79,11 @@
 		retry_after   5s
 	}
 
-	reverse_proxy page-search-api-3:8080 page-search-api-4:8080
+	reverse_proxy page-search-api-3:8080 page-search-api-4:8080 {
+		# A backend that stops answering gets a 504 after 30s instead of
+		# holding its admission slot indefinitely.
+		transport http {
+			response_header_timeout 30s
+		}
+	}
 }

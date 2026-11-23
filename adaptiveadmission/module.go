@@ -199,28 +199,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	reason = h.scheduler.Wait(r.Context(), ticket)
 	queueWait := time.Since(enqueuedAt)
+	// Set before the rejection check: when the client left after its slot
+	// was granted, Wait returns that slot via ReleaseUnused. InFlight() can
+	// read up to 1 higher than genuinely in-flight work -- see
+	// Controller.InFlight's doc (capacity.go).
+	admissionMetrics.requestsInFlight.WithLabelValues(backend).Set(float64(h.controller.InFlight()))
 	if reason != RejectNone {
 		admissionMetrics.queueSize.WithLabelValues(backend).Set(float64(h.scheduler.Depth()))
 		return h.reject(w, r, backend, reason, queueWait)
 	}
 	admissionMetrics.queueWaitDuration.WithLabelValues(backend).Observe(queueWait.Seconds())
 	admissionMetrics.requestsAdmitted.WithLabelValues(backend).Inc()
-	// InFlight() can read up to 1 higher than genuinely in-flight work here
-	// and below -- see Controller.InFlight's doc (capacity.go).
-	admissionMetrics.requestsInFlight.WithLabelValues(backend).Set(float64(h.controller.InFlight()))
 
-	outcome, err := h.dispatch(w, r, next)
-	admissionMetrics.requestsInFlight.WithLabelValues(backend).Set(float64(h.controller.InFlight()))
-
-	h.logDecision(r, logDecisionParams{
-		backend:    backend,
-		admitted:   true,
-		queueWait:  queueWait,
-		latency:    outcome.latency,
-		statusCode: outcome.statusCode,
-	})
-
-	return err
+	return h.dispatch(w, r, next, queueWait)
 }
 
 // reject records and logs a request that was never dispatched, and returns

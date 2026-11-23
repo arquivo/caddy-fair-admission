@@ -138,6 +138,9 @@ curl -s http://localhost:2019/adaptive_admission/status | jq .
   backend at that instant, even while otherwise idle — the dispatch loop reserves a capacity slot
   (incrementing this counter) before it pops the next queued ticket, as a deliberate lookahead so a
   slot is never released and immediately lost to a race; this is documented behavior, not a bug.
+- Nothing is admitted while `in_flight` is at or above `limit`. After an adaptive shrink that's
+  expected until the requests admitted under the old limit finish ([`configuration.md`](configuration.md)
+  §6, "How long a slot is held").
 - There is no `upstreams`/load-balancer field here on purpose — `reverse_proxy`'s own health-check
   and upstream state is already exposed by Caddy's own `admin.api.reverse_proxy` module at
   `GET /reverse_proxy/upstreams`; this endpoint only reports what `adaptive_admission` itself owns
@@ -190,6 +193,17 @@ fairness_score_distribution_count{backend="default",user_class="anonymous"} 1523
 | `adaptive_admission_backend_request_duration_seconds` | Histogram | `backend` | Dispatched request duration. Prometheus default buckets. |
 | `adaptive_admission_queue_wait_duration_seconds` | Histogram | `backend` | Time an admitted request spent queued before admission. Prometheus default buckets. |
 
+A backend that stays closed — requests arrive, but none is admitted — shows as:
+
+```promql
+rate(adaptive_admission_requests_total[10m]) > 0
+  unless rate(adaptive_admission_requests_admitted_total[10m]) > 0
+```
+
+`unless` also covers a backend that hasn't admitted anything since Caddy started, which has no
+`requests_admitted_total` series yet. Choose the window longer than the longest legitimate request,
+so the drain after an adaptive shrink doesn't fire it.
+
 Example scrape output:
 
 ```
@@ -223,7 +237,8 @@ both modules combined, not one each.
 Fields present on **every** line: `backend` (string), `admitted` (bool).
 
 Fields present **only when `admitted: true`**: `queue_wait_ms` (int64), `backend_latency_ms`
-(int64), `status_code` (int).
+(int64), `status_code` (int). When `reverse_proxy` aborted a response part-way through the body,
+`status_code` is `499` if the client left and `500` otherwise.
 
 Fields present **only when `admitted: false`**: `reject_reason` (string, `queue_full`,
 `queue_wait_exceeded`, `queue_timed_out`, `client_gone` or `evicted`). The last three were already

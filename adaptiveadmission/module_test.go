@@ -62,7 +62,7 @@ func TestHandler_ServeHTTP_DispatchesAndReleasesCapacityOnSuccess(t *testing.T) 
 	if got := c.window.total; got != 1 {
 		t.Fatalf("outcome window total = %d, want 1", got)
 	}
-	if last := c.window.ring[(c.window.pos+c.window.size-1)%c.window.size]; last.isError {
+	if last := lastOutcome(c); last.isError {
 		t.Errorf("recorded outcome isError = true for a 201 response, want false")
 	}
 }
@@ -272,6 +272,9 @@ func TestHandler_ServeHTTP_ClientGoneWhileQueued_NeverDispatches(t *testing.T) {
 	}
 	if got := rec.Header().Get("Retry-After"); got != "" {
 		t.Errorf("Retry-After = %q on client_gone, want none", got)
+	}
+	if got, want := testutil.ToFloat64(admissionMetrics.requestsInFlight.WithLabelValues(h.Config.backendLabel())), float64(c.InFlight()); got != want {
+		t.Errorf("requests_in_flight = %v after client_gone, want %v", got, want)
 	}
 
 	// The freed slot is never handed to the abandoned request.
