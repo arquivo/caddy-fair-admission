@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -90,7 +91,7 @@ func TestStatusRecorder_SwitchingProtocolsIsFinal(t *testing.T) {
 	rec := &statusRecorder{
 		ResponseWriter:    httptest.NewRecorder(),
 		statusCode:        http.StatusOK,
-		upgrade:           true,
+		switchesProtocols: func(code int) bool { return code == http.StatusSwitchingProtocols },
 		onSwitchProtocols: func(int) { calls++ },
 	}
 	rec.WriteHeader(http.StatusSwitchingProtocols)
@@ -103,32 +104,45 @@ func TestStatusRecorder_SwitchingProtocolsIsFinal(t *testing.T) {
 	}
 }
 
-func TestStatusRecorder_SwitchingProtocolsWithoutUpgradeIsInformational(t *testing.T) {
-	calls := 0
-	rec := &statusRecorder{
-		ResponseWriter:    httptest.NewRecorder(),
-		statusCode:        http.StatusOK,
-		onSwitchProtocols: func(int) { calls++ },
+// withUpstreamStatus returns r with a replacer in which reverse_proxy has
+// recorded the upstream's status (none if status is 0).
+func withUpstreamStatus(r *http.Request, status int) *http.Request {
+	repl := caddy.NewReplacer()
+	if status != 0 {
+		repl.Set("http.reverse_proxy.status_code", status)
 	}
-	rec.WriteHeader(http.StatusSwitchingProtocols)
-	rec.WriteHeader(http.StatusInternalServerError)
-	if rec.statusCode != http.StatusInternalServerError || calls != 0 {
-		t.Errorf("statusCode = %d, onSwitchProtocols calls = %d; want %d and 0 for a request that asked for no upgrade",
-			rec.statusCode, calls, http.StatusInternalServerError)
-	}
+	return r.WithContext(context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl))
 }
 
-func TestStatusRecorder_ConnectSuccessIsASwitch(t *testing.T) {
-	var switched int
-	rec := &statusRecorder{
-		ResponseWriter:    httptest.NewRecorder(),
-		statusCode:        http.StatusOK,
-		connect:           true,
-		onSwitchProtocols: func(code int) { switched = code },
+func TestSwitchesProtocols(t *testing.T) {
+	get := httptest.NewRequest(http.MethodGet, "/", nil)
+	// A WebSocket over HTTP/2 or HTTP/3 (extended CONNECT).
+	connect := httptest.NewRequest(http.MethodConnect, "/", nil)
+	connect.ProtoMajor = 3
+
+	for _, tc := range []struct {
+		name           string
+		req            *http.Request
+		upstreamStatus int
+		code           int
+		want           bool
+	}{
+		{"101 passed on", get, http.StatusSwitchingProtocols, http.StatusSwitchingProtocols, true},
+		{"101 not from an upstream switch", get, 0, http.StatusSwitchingProtocols, false},
+		{"101 while the upstream answered 500", get, http.StatusInternalServerError, http.StatusSwitchingProtocols, false},
+		{"200 to GET", get, http.StatusSwitchingProtocols, http.StatusOK, false},
+		{"200 to CONNECT after an upstream switch", connect, http.StatusSwitchingProtocols, http.StatusOK, true},
+		{"200 to CONNECT from an ordinary upstream response", connect, http.StatusOK, http.StatusOK, false},
+		{"502 to CONNECT", connect, http.StatusSwitchingProtocols, http.StatusBadGateway, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := switchesProtocols(withUpstreamStatus(tc.req, tc.upstreamStatus), tc.code); got != tc.want {
+				t.Errorf("switchesProtocols = %v, want %v", got, tc.want)
+			}
+		})
 	}
-	rec.WriteHeader(http.StatusOK)
-	if switched != http.StatusOK {
-		t.Errorf("onSwitchProtocols got %d, want %d for a 2xx to CONNECT", switched, http.StatusOK)
+	if switchesProtocols(get, http.StatusSwitchingProtocols) {
+		t.Error("switchesProtocols = true without a replacer, want false")
 	}
 }
 
@@ -197,37 +211,44 @@ func TestHandler_Dispatch_ProtocolSwitch_ReleasesCapacityAtTheSwitch(t *testing.
 	connect := httptest.NewRequest(http.MethodConnect, "/", nil)
 	connect.ProtoMajor = 3
 
+	const tunnelLifetime = 50 * time.Millisecond
 	for _, tc := range []struct {
-		name   string
-		req    *http.Request
-		status int
+		name           string
+		req            *http.Request
+		upstreamStatus int
+		status         int
+		wantSwitch     bool
 	}{
-		{"HTTP/1.1 Upgrade", upgrade, http.StatusSwitchingProtocols},
-		{"extended CONNECT", connect, http.StatusOK},
+		{"HTTP/1.1 Upgrade", upgrade, http.StatusSwitchingProtocols, http.StatusSwitchingProtocols, true},
+		{"extended CONNECT", connect, http.StatusSwitchingProtocols, http.StatusOK, true},
+		{"CONNECT answered without a switch", connect, http.StatusOK, http.StatusOK, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := NewFixedController(1)
 			c.Acquire(1)
 			h := &Handler{controller: c}
 
-			const tunnelLifetime = 50 * time.Millisecond
+			wantInFlight := 1
+			if tc.wantSwitch {
+				wantInFlight = 0
+			}
 			next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 				w.WriteHeader(tc.status)
-				if got := c.InFlight(); got != 0 {
-					t.Errorf("InFlight() = %d after the switch, want 0 while the tunnel is open", got)
+				if got := c.InFlight(); got != wantInFlight {
+					t.Errorf("InFlight() = %d after the headers, want %d while next is still running", got, wantInFlight)
 				}
 				time.Sleep(tunnelLifetime)
 				return nil
 			})
 
-			if err := h.dispatch(httptest.NewRecorder(), tc.req, next, 0); err != nil {
+			if err := h.dispatch(httptest.NewRecorder(), withUpstreamStatus(tc.req, tc.upstreamStatus), next, 0); err != nil {
 				t.Fatalf("dispatch: %v", err)
 			}
 			if got := c.window.total; got != 1 {
 				t.Fatalf("window.total = %d, want 1 (released exactly once)", got)
 			}
-			if last := lastOutcome(c); last.latency >= tunnelLifetime || last.isError {
-				t.Errorf("recorded outcome = %+v, want the time until the switch (under %v), not an error", last, tunnelLifetime)
+			if last := lastOutcome(c); (last.latency < tunnelLifetime) != tc.wantSwitch || last.isError {
+				t.Errorf("recorded outcome = %+v, want latency under %v: %v, not an error", last, tunnelLifetime, tc.wantSwitch)
 			}
 		})
 	}

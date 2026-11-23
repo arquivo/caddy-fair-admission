@@ -181,7 +181,7 @@ fairness_score_distribution_count{backend="default",user_class="anonymous"} 1523
 
 | Metric | Type | Labels | Help |
 |---|---|---|---|
-| `adaptive_admission_requests_in_flight` | Gauge | `backend` | Requests currently admitted and in flight. A request that switched protocols (e.g. a WebSocket) is no longer counted once it switched. |
+| `adaptive_admission_requests_in_flight` | Gauge | `backend` | Requests currently admitted and in flight. A request stops counting once it switches protocols (e.g. a WebSocket). |
 | `adaptive_admission_concurrency_limit` | Gauge | `backend` | Current controller concurrency limit. |
 | `adaptive_admission_queue_size` | Gauge | `backend` | Current number of queued (not yet admitted) requests. |
 | `adaptive_admission_requests_total` | Counter | `backend` | Total requests seen. |
@@ -241,7 +241,7 @@ Fields present **only when `admitted: true`**: `queue_wait_ms` (int64), `backend
 `status_code` is `499` if the client left and `500` otherwise. `status_code` is the final status:
 informational responses (e.g. `100 Continue`, `103 Early Hints`) sent before it are not recorded.
 For a request that switches protocols (e.g. a WebSocket), the line is written at the switch:
-`status_code` is `101` (HTTP/1.1 `Upgrade`) or the 2xx answering a `CONNECT` (HTTP/2 or HTTP/3),
+`status_code` is `101` (HTTP/1.1 `Upgrade`) or `200` (extended `CONNECT`, HTTP/2 or HTTP/3),
 and `backend_latency_ms` is the time until the switch; the tunnel that follows is not measured, so
 Caddy's own access log for that request, written when the tunnel closes, shows a longer duration.
 
