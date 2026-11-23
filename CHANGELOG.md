@@ -1,3 +1,9 @@
+## [3.5.1](https://github.com/arquivo/caddy-fair-admission/compare/v3.5.0...v3.5.1) (2026-11-23)
+
+### Bug Fixes
+
+* **adaptive_admission:** always release a dispatched request's slot ([#14](https://github.com/arquivo/caddy-fair-admission/issues/14)) ([ad06cf8](https://github.com/arquivo/caddy-fair-admission/commit/ad06cf8d3e9931a48aaa0770e5013e4d7a68200a)), closes [#13](https://github.com/arquivo/caddy-fair-admission/issues/13), references [arquivo/pwa-technologies#1602](https://github.com/arquivo/pwa-technologies/issues/1602)
+
 ## [3.5.0](https://github.com/arquivo/caddy-fair-admission/compare/v3.4.0...v3.5.0) (2026-11-23)
 
 ### Features
