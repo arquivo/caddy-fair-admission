@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -103,5 +104,37 @@ func TestAdminAPI_HandleStatus_SortsBackendsByLabel(t *testing.T) {
 	}
 	if len(body.Backends) != 2 || body.Backends[0].Backend != "aaa" || body.Backends[1].Backend != "zzz" {
 		t.Fatalf("backends = %+v, want [aaa zzz]", body.Backends)
+	}
+}
+
+func TestAdminAPI_HandleStatus_ReportsPriorityNetworks(t *testing.T) {
+	app := &App{}
+	h := newTestFairnessHandler("b1")
+	h.PriorityNetworks = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24"), netip.MustParsePrefix("::1/128")}
+	app.registerHandler("b1", h)
+	app.registerHandler("b2", newTestFairnessHandler("b2"))
+
+	a := &AdminAPI{app: app}
+	req := httptest.NewRequest(http.MethodGet, "/fairness/status", nil)
+	rec := httptest.NewRecorder()
+	if err := a.handleStatus(rec, req); err != nil {
+		t.Fatalf("handleStatus: %v", err)
+	}
+
+	var body struct {
+		Backends []map[string]any `json:"backends"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.Backends) != 2 {
+		t.Fatalf("backends = %+v, want 2 entries", body.Backends)
+	}
+	got, _ := json.Marshal(body.Backends[0]["priority_networks"])
+	if string(got) != `["192.0.2.0/24","::1/128"]` {
+		t.Errorf("b1 priority_networks = %s, want [\"192.0.2.0/24\",\"::1/128\"]", got)
+	}
+	if _, ok := body.Backends[1]["priority_networks"]; ok {
+		t.Errorf("b2 priority_networks = %v, want the field omitted", body.Backends[1]["priority_networks"])
 	}
 }

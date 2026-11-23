@@ -87,7 +87,7 @@ func TestServeHTTP_RecordsAllElevenMetricSeries(t *testing.T) {
 	c2 := NewFixedController(1)
 	c2.Acquire(1) // hold the only slot; dispatch loop never started
 	s2 := NewScheduler(QueueConfig{MaxSize: 1}, c2)
-	if _, reason := s2.Enqueue(1); reason != RejectNone {
+	if _, reason := s2.Enqueue(1, false); reason != RejectNone {
 		t.Fatalf("seed Enqueue rejected: %v", reason)
 	}
 	h2 := &Handler{Config: Config{Backend: backend}, controller: c2, scheduler: s2}
@@ -152,6 +152,7 @@ func TestLogDecision_AdmittedRequest_EmitsExactlyOneLineWithEveryField(t *testin
 			"country":         "PT",
 			"user_class":      "researcher",
 			"exempt":          false,
+			"priority":        false,
 			"score_breakdown": map[string]float64{"base": 100, "total_penalty": 5, "final": 95},
 		},
 	}
@@ -177,7 +178,7 @@ func TestLogDecision_AdmittedRequest_EmitsExactlyOneLineWithEveryField(t *testin
 	fields := entry.ContextMap()
 	wantKeys := []string{
 		"backend", "admitted", "queue_wait_ms", "backend_latency_ms", "status_code",
-		"ip", "asn", "country", "user_class", "exempt", "score_breakdown",
+		"ip", "asn", "country", "user_class", "exempt", "priority", "score_breakdown",
 	}
 	for _, k := range wantKeys {
 		if _, ok := fields[k]; !ok {
@@ -205,7 +206,7 @@ func TestLogDecision_RejectedRequest_EmitsExactlyOneLineWithRejectReason(t *test
 	c := NewFixedController(1)
 	c.Acquire(1) // hold the only slot; dispatch loop never started
 	s := NewScheduler(QueueConfig{MaxSize: 1}, c)
-	if _, reason := s.Enqueue(1); reason != RejectNone {
+	if _, reason := s.Enqueue(1, false); reason != RejectNone {
 		t.Fatalf("seed Enqueue rejected: %v", reason)
 	}
 

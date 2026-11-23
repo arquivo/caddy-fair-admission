@@ -1,6 +1,9 @@
 package fairness
 
-import "time"
+import (
+	"net/netip"
+	"time"
+)
 
 // defaultJWKSRefreshInterval is used when a block configures auth_jwks_url
 // but the refresh interval isn't independently configurable yet (this
@@ -75,6 +78,12 @@ type Config struct {
 	// means the feature is off on this block: the cookie is neither issued
 	// nor checked.
 	SessionCookie *SessionCookieConfig `json:"session_cookie,omitempty"`
+
+	// PriorityNetworks are the networks whose clients are classified as
+	// internal and queued in adaptive_admission's priority tier
+	// (classify.go, network.go). Matched against the resolved client IP;
+	// in JSON, a list of CIDR strings.
+	PriorityNetworks []netip.Prefix `json:"priority_networks,omitempty"`
 }
 
 // backendLabel returns the configured Backend label, or "default" if unset.

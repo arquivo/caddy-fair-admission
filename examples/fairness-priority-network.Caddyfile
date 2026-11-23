@@ -1,0 +1,61 @@
+# The deployment's own services served first (docs/configuration.md §11).
+#
+# A screenshot renderer, a search API and health-check scripts reach the
+# backend through the same proxy as the public, with no token or cookie.
+# priority_network classifies them as `internal` and makes adaptive_admission
+# serve them before every other request, within the same concurrency limit.
+# They're still tracked and penalized, so one that floods sinks behind the
+# other priority clients (but stays ahead of the public).
+#
+# Caddy sits behind a proxy here, so trusted_proxies is what makes
+# {client_ip} the real client: without it, every request would resolve to the
+# proxy's own address.
+#
+# Validate with:
+#   caddy validate --config examples/fairness-priority-network.Caddyfile --adapter caddyfile
+
+{
+	servers {
+		trusted_proxies static 10.0.0.10/32
+	}
+}
+
+# One list, imported wherever it's needed.
+(local_networks) {
+	127.0.0.1 ::1
+	172.17.0.0/16 172.18.0.0/15
+	192.0.2.0/24
+}
+
+:8080 {
+	fairness {
+		backend page-search-api
+		archived_domain_regex ^/(?:wayback|noFrame/replay)/\d+[A-Za-z_]*/https?:/+([^/?#]+)
+
+		priority_network {
+			import local_networks
+		}
+
+		scoring {
+			base_score anonymous 60
+			penalty ip              alpha=0.2 soft=20:10  hard=100:40
+			penalty ipv4_subnet     alpha=0.2 soft=100:10 hard=500:40
+			penalty archived_domain alpha=0.2 soft=500:10 hard=2000:40
+		}
+	}
+
+	adaptive_admission {
+		controller fixed {
+			limit 50
+		}
+		queue_max_size 500
+		queue_timeout  10s
+		# A priority request at a full queue takes the place of the last
+		# non-priority one, and its projected wait counts only the priority
+		# requests ahead of it (docs/configuration.md §11).
+		queue_full_policy     evict_lowest
+		queue_wait_projection ahead
+	}
+
+	reverse_proxy page-search-api-1:8080 page-search-api-2:8080
+}

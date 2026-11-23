@@ -47,6 +47,13 @@
 			ttl  30m
 		}
 
+		# Clients in these networks (CIDR or bare IP; matched against the
+		# client IP Caddy resolves after trusted_proxies) are classified
+		# internal and served first by adaptive_admission
+		# (docs/configuration.md §11). Repeatable; the lists accumulate,
+		# and a { } block form takes any number per line.
+		priority_network 127.0.0.1 ::1 192.0.2.0/24
+
 		# IPv6 client addresses are aggregated at this prefix length for the
 		# ipv6_subnet dimension. Must be exactly 48 or 56.
 		ipv6_prefix_length 48

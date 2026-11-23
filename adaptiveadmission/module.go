@@ -45,6 +45,13 @@ const fairnessScoreVarKey = "fairness_score"
 // penalized (fail-open per §3.1).
 const neutralScore float64 = 0
 
+// fairnessPriorityVarKey mirrors fairness's own priorityVarKey constant
+// (fairness/module.go) by string value only, per the same cross-package
+// convention as fairnessScoreVarKey above. A request is queued in the
+// priority tier only when it's set to true; anything else (unset, another
+// type) is an ordinary request.
+const fairnessPriorityVarKey = "fairness_priority"
+
 // fairnessLogFieldsVarKey mirrors fairness's own logFieldsVarKey constant
 // (fairness/module.go) by string value only, per the same cross-package
 // convention as fairnessScoreVarKey above.
@@ -174,10 +181,10 @@ func (h *Handler) Cleanup() error {
 }
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler. It reads the fairness
-// score that fairness (or another earlier handler) set via caddyhttp.SetVar,
-// enqueues the request, waits for admission (or rejects it, see reject),
-// then dispatches (§4.5), recording metrics and emitting one structured log
-// line per request (§4.8, §4.9).
+// score and priority flag that fairness (or another earlier handler) set via
+// caddyhttp.SetVar, enqueues the request, waits for admission (or rejects it,
+// see reject), then dispatches (§4.5), recording metrics and emitting one
+// structured log line per request (§4.8, §4.9).
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	backend := h.Config.backendLabel()
 	admissionMetrics.requestsTotal.WithLabelValues(backend).Inc()
@@ -189,8 +196,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
+	priority, _ := caddyhttp.GetVar(r.Context(), fairnessPriorityVarKey).(bool)
+
 	enqueuedAt := time.Now()
-	ticket, reason := h.scheduler.Enqueue(score)
+	ticket, reason := h.scheduler.Enqueue(score, priority)
 	admissionMetrics.queueSize.WithLabelValues(backend).Set(float64(h.scheduler.Depth()))
 
 	if reason != RejectNone {
@@ -285,6 +294,9 @@ func (h *Handler) logDecision(r *http.Request, p logDecisionParams) {
 		}
 		if v, ok := lf["exempt"].(bool); ok {
 			fields = append(fields, zap.Bool("exempt", v))
+		}
+		if v, ok := lf["priority"].(bool); ok {
+			fields = append(fields, zap.Bool("priority", v))
 		}
 		if v, ok := lf["score_breakdown"].(map[string]float64); ok {
 			fields = append(fields, zap.Any("score_breakdown", v))

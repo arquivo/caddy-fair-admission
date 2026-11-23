@@ -1360,3 +1360,173 @@ func TestIntegration_EndToEnd_ProtocolUpgradeWorksThroughAdmission(t *testing.T)
 		t.Fatal("caddy.Stop blocked while an upgraded connection was open")
 	}
 }
+
+// priorityNetworkProbe sends one GET through the running config, optionally
+// with a bearer token and an X-Forwarded-For header, and returns the
+// fairness score and priority flag the upstream received (forwarded by
+// header_up from fairness's vars).
+func priorityNetworkProbe(t *testing.T, url, token, xff string) (score, priority string) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if xff != "" {
+		req.Header.Set("X-Forwarded-For", xff)
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("request (XFF %q): %v", xff, err)
+	}
+	defer resp.Body.Close()
+	return resp.Header.Get("X-Got-Score"), resp.Header.Get("X-Got-Priority")
+}
+
+// TestIntegration_EndToEnd_PriorityNetwork_MatchesResolvedClientIP checks
+// priority_network against Caddy's resolved {client_ip}: an X-Forwarded-For
+// address counts only when the peer is a trusted proxy.
+func TestIntegration_EndToEnd_PriorityNetwork_MatchesResolvedClientIP(t *testing.T) {
+	jwksURL, researcherToken := startJWKSServerAndSignToken(t, "researcher")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Got-Score", r.Header.Get("X-Fairness-Score"))
+		w.Header().Set("X-Got-Priority", r.Header.Get("X-Fairness-Priority"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	config := func(trustedProxies string) string {
+		return fmt.Sprintf(`
+{
+	servers {
+		trusted_proxies static %s
+	}
+}
+:19122 {
+	fairness {
+		auth_jwks_url %s
+		priority_network 192.0.2.0/24
+		scoring {
+			base_score researcher 90
+			base_score anonymous  60
+		}
+	}
+	reverse_proxy %s {
+		header_up X-Fairness-Score    {http.vars.fairness_score}
+		header_up X-Fairness-Priority {http.vars.fairness_priority}
+	}
+}
+`, trustedProxies, jwksURL, upstream.Listener.Addr().String())
+	}
+	const url = "http://127.0.0.1:19122/"
+
+	t.Run("trusted peer", func(t *testing.T) {
+		loadCaddy(t, config("127.0.0.1/32"))
+		cases := []struct {
+			name, token, xff        string
+			wantScore, wantPriority string
+		}{
+			{"listed client is internal and priority", "", "192.0.2.10", "100", "true"},
+			{"unlisted client is anonymous", "", "203.0.113.5", "60", "false"},
+			{"verified JWT class wins, priority still applies", researcherToken, "192.0.2.10", "90", "true"},
+		}
+		for _, tc := range cases {
+			score, priority := priorityNetworkProbe(t, url, tc.token, tc.xff)
+			if score != tc.wantScore || priority != tc.wantPriority {
+				t.Errorf("%s: score=%q priority=%q, want %q/%q", tc.name, score, priority, tc.wantScore, tc.wantPriority)
+			}
+		}
+	})
+
+	t.Run("untrusted peer cannot spoof X-Forwarded-For", func(t *testing.T) {
+		loadCaddy(t, config("198.51.100.0/24"))
+		score, priority := priorityNetworkProbe(t, url, "", "192.0.2.10")
+		if score != "60" || priority != "false" {
+			t.Errorf("score=%q priority=%q, want 60/false", score, priority)
+		}
+	})
+}
+
+// TestIntegration_EndToEnd_PriorityNetwork_ServedBeforeHigherScore checks
+// the hand-off to adaptive_admission: a priority client with the lowest
+// score is still dispatched before an earlier, higher-score researcher.
+func TestIntegration_EndToEnd_PriorityNetwork_ServedBeforeHigherScore(t *testing.T) {
+	jwksURL, researcherToken := startJWKSServerAndSignToken(t, "researcher")
+
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/hold" {
+			<-release
+		}
+		w.Header().Set("X-Name", r.Header.Get("X-Name"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	loadCaddy(t, fmt.Sprintf(`
+{
+	servers {
+		trusted_proxies static 127.0.0.1/32
+	}
+}
+:19123 {
+	fairness {
+		auth_jwks_url %s
+		priority_network 192.0.2.0/24
+		scoring {
+			base_score researcher 100
+			base_score internal   0
+		}
+	}
+	adaptive_admission {
+		controller fixed {
+			limit 1
+		}
+		queue_max_size 10
+		queue_timeout 5s
+	}
+	reverse_proxy %s
+}
+`, jwksURL, upstream.Listener.Addr().String()))
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	send := func(path, name string, header map[string]string, done chan<- string) {
+		req, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:19123"+path, nil)
+		req.Header.Set("X-Name", name)
+		for k, v := range header {
+			req.Header.Set(k, v)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Errorf("%s request: %v", name, err)
+			done <- ""
+			return
+		}
+		resp.Body.Close()
+		done <- resp.Header.Get("X-Name")
+	}
+
+	holdDone := make(chan string, 1)
+	go send("/hold", "hold", nil, holdDone)
+	time.Sleep(150 * time.Millisecond) // the hold request has the only slot
+
+	order := make(chan string, 2)
+	go send("/", "researcher", map[string]string{"Authorization": "Bearer " + researcherToken}, order)
+	time.Sleep(100 * time.Millisecond) // arrival order: researcher first
+	go send("/", "priority", map[string]string{"X-Forwarded-For": "192.0.2.10"}, order)
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+
+	var got []string
+	for i := 0; i < 2; i++ {
+		select {
+		case name := <-order:
+			got = append(got, name)
+		case <-time.After(5 * time.Second):
+			t.Fatal("a queued request never completed")
+		}
+	}
+	<-holdDone
+	if len(got) != 2 || got[0] != "priority" || got[1] != "researcher" {
+		t.Errorf("completion order = %v, want [priority researcher]", got)
+	}
+}

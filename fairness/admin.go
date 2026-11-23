@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"sort"
 
 	"github.com/caddyserver/caddy/v2"
@@ -90,6 +91,7 @@ type backendScoringStatus struct {
 	Divisors             map[string]float64       `json:"divisors"`
 	DimensionEntryCounts map[string]int           `json:"dimension_entry_counts"`
 	SessionCookie        *sessionCookieStatus     `json:"session_cookie,omitempty"`
+	PriorityNetworks     []netip.Prefix           `json:"priority_networks,omitempty"`
 }
 
 // sessionCookieStatus is a backend's session_cookie config as reported by
@@ -161,6 +163,7 @@ func (a *AdminAPI) handleStatus(w http.ResponseWriter, r *http.Request) error {
 			Divisors:             cfg.Divisors,
 			DimensionEntryCounts: h.scoring.entryCounts(),
 			SessionCookie:        h.session.status(),
+			PriorityNetworks:     h.PriorityNetworks,
 		})
 	}
 	sort.Slice(backends, func(i, j int) bool { return backends[i].Backend < backends[j].Backend })
