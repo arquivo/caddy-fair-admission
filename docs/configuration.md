@@ -388,8 +388,8 @@ projection no longer caps the total queue depth, so `queue_max_size` is what bou
 the work each arrival does under the queue lock, which grows with the queue size. Both act only on
 score differences: requests with the same score never evict each other, so a flood that stays
 under every penalty threshold is treated like everyone else. And both make a higher score count
-for more: it now takes a queued request's place instead of being rejected. Eviction is therefore
-only as trustworthy as the score inputs, and users who share a penalised bucket with a flood (the
+for more: with `evict_lowest` it takes a queued request's place, and with `ahead` it isn't turned
+away for the queue behind it. Eviction is therefore only as trustworthy as the score inputs, and users who share a penalised bucket with a flood (the
 same subnet, ASN, country or archived domain) are the first to be evicted.
 
 Behind a proxy that rate-limits on the status code — e.g. httpd's mod_qos with

@@ -3,7 +3,6 @@ package adaptiveadmission
 import (
 	"fmt"
 	"net/http"
-	"slices"
 	"time"
 )
 
@@ -91,12 +90,12 @@ func (c Config) validate() error {
 	return nil
 }
 
-// checkOneOf accepts "" (the directive's default) and the allowed values.
-func checkOneOf(directive, v string, allowed ...string) error {
-	if v == "" || slices.Contains(allowed, v) {
+// checkOneOf accepts "" (the directive's default), a or b.
+func checkOneOf(directive, v, a, b string) error {
+	if v == "" || v == a || v == b {
 		return nil
 	}
-	return fmt.Errorf("unrecognized %s %q (want one of %q)", directive, v, allowed)
+	return fmt.Errorf("unrecognized %s %q (want %q or %q)", directive, v, a, b)
 }
 
 // rejectStatus returns the configured RejectStatus, or 429 if unset.
