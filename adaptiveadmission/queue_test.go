@@ -1,8 +1,11 @@
 package adaptiveadmission
 
 import (
+	"container/heap"
 	"context"
+	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -266,6 +269,7 @@ func TestRejectReason_String(t *testing.T) {
 		{RejectQueueWaitExceeded, "queue_wait_exceeded"},
 		{RejectQueueTimedOut, "queue_timed_out"},
 		{RejectClientGone, "client_gone"},
+		{RejectEvicted, "evicted"},
 	}
 	for _, tc := range cases {
 		if got := tc.r.String(); got != tc.want {
@@ -489,22 +493,28 @@ func TestScheduler_Wait_ClientGoneAfterGrantReleasesCapacityUnused(t *testing.T)
 	}
 }
 
-// TestScheduler_Wait_ConcurrentCancelsAndTimeouts_NoLeakNoOverAdmission
-// races grants against client cancellations and queue timeouts: some
-// requests are cancelled at random moments, often the same instant the
-// dispatch loop pops them, and a short queue_timeout expires others. Every
-// request must end exactly once, admissions must never exceed the limit,
-// and once everything drains no capacity may be left held. Run with -race.
-func TestScheduler_Wait_ConcurrentCancelsAndTimeouts_NoLeakNoOverAdmission(t *testing.T) {
-	const limit = 3
+// raceOutcomes counts how the requests in raceWaits ended.
+type raceOutcomes struct {
+	admitted, timedOut, gone, evicted, rejected int64
+}
+
+// raceWaits races grants against client cancellations and queue timeouts
+// (and, with cfg.EvictLowest, evictions): some requests are cancelled at
+// random moments, often the same instant the dispatch loop pops them, and a
+// short queue_timeout expires others. Every request must end exactly once,
+// admissions must never exceed limit, and once everything drains no
+// capacity may be left held. Run with -race.
+func raceWaits(t *testing.T, cfg QueueConfig, limit int) raceOutcomes {
+	t.Helper()
 	const goroutines = 40
 	const iterationsEach = 50
 
 	c := NewFixedController(limit)
-	s := NewScheduler(QueueConfig{MaxSize: goroutines * iterationsEach, WaitTimeout: 2 * time.Millisecond, AgingRate: 50}, c)
+	s := NewScheduler(cfg, c)
 	s.Start()
 
-	var inFlight, maxObserved, admitted, timedOut, gone int64
+	var inFlight, maxObserved int64
+	var out raceOutcomes
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
 	for g := 0; g < goroutines; g++ {
@@ -514,8 +524,8 @@ func TestScheduler_Wait_ConcurrentCancelsAndTimeouts_NoLeakNoOverAdmission(t *te
 			for i := 0; i < iterationsEach; i++ {
 				tk, reason := s.Enqueue(float64(rng.Intn(100)))
 				if reason != RejectNone {
-					t.Errorf("unexpected Enqueue rejection: %v", reason)
-					return
+					atomic.AddInt64(&out.rejected, 1)
+					continue
 				}
 				ctx, cancel := context.WithCancel(context.Background())
 				if rng.Intn(3) == 0 {
@@ -523,6 +533,9 @@ func TestScheduler_Wait_ConcurrentCancelsAndTimeouts_NoLeakNoOverAdmission(t *te
 				}
 				switch s.Wait(ctx, tk) {
 				case RejectNone:
+					if tk.wasEvicted() {
+						t.Error("ticket both granted and evicted")
+					}
 					n := atomic.AddInt64(&inFlight, 1)
 					for {
 						cur := atomic.LoadInt64(&maxObserved)
@@ -532,12 +545,14 @@ func TestScheduler_Wait_ConcurrentCancelsAndTimeouts_NoLeakNoOverAdmission(t *te
 					}
 					time.Sleep(time.Duration(rng.Intn(300)) * time.Microsecond)
 					atomic.AddInt64(&inFlight, -1)
-					atomic.AddInt64(&admitted, 1)
+					atomic.AddInt64(&out.admitted, 1)
 					c.Release(1, time.Microsecond, 200, false)
 				case RejectQueueTimedOut:
-					atomic.AddInt64(&timedOut, 1)
+					atomic.AddInt64(&out.timedOut, 1)
 				case RejectClientGone:
-					atomic.AddInt64(&gone, 1)
+					atomic.AddInt64(&out.gone, 1)
+				case RejectEvicted:
+					atomic.AddInt64(&out.evicted, 1)
 				default:
 					t.Error("Wait returned an Enqueue-only reason")
 				}
@@ -564,14 +579,276 @@ func TestScheduler_Wait_ConcurrentCancelsAndTimeouts_NoLeakNoOverAdmission(t *te
 	if got := s.Depth(); got != 0 {
 		t.Errorf("Depth() after all requests ended = %d, want 0", got)
 	}
-	if got := atomic.LoadInt64(&maxObserved); got > limit {
+	if got := atomic.LoadInt64(&maxObserved); got > int64(limit) {
 		t.Errorf("observed %d concurrently admitted, want <= limit (%d)", got, limit)
 	}
-	total := atomic.LoadInt64(&admitted) + atomic.LoadInt64(&timedOut) + atomic.LoadInt64(&gone)
-	if total != goroutines*iterationsEach {
-		t.Errorf("admitted+timed out+gone = %d, want %d", total, goroutines*iterationsEach)
+	if total := out.admitted + out.timedOut + out.gone + out.evicted + out.rejected; total != goroutines*iterationsEach {
+		t.Errorf("requests ended = %d, want %d", total, goroutines*iterationsEach)
 	}
-	if atomic.LoadInt64(&admitted) == 0 || atomic.LoadInt64(&timedOut)+atomic.LoadInt64(&gone) == 0 {
-		t.Errorf("race not exercised: admitted=%d timed_out=%d gone=%d", admitted, timedOut, gone)
+	return out
+}
+
+func TestScheduler_Wait_ConcurrentCancelsAndTimeouts_NoLeakNoOverAdmission(t *testing.T) {
+	out := raceWaits(t, QueueConfig{MaxSize: 2000, WaitTimeout: 2 * time.Millisecond, AgingRate: 50}, 3)
+	if out.rejected != 0 || out.evicted != 0 {
+		t.Errorf("rejected=%d evicted=%d, want 0 with a queue that never fills", out.rejected, out.evicted)
+	}
+	if out.admitted == 0 || out.timedOut+out.gone == 0 {
+		t.Errorf("race not exercised: %+v", out)
+	}
+}
+
+// --- eviction from a full queue (QueueConfig.EvictLowest) -------------------
+
+// enqueueAll enqueues one ticket per score, failing the test on a rejection.
+func enqueueAll(t *testing.T, s *Scheduler, scores ...float64) []*Ticket {
+	t.Helper()
+	tickets := make([]*Ticket, len(scores))
+	for i, score := range scores {
+		tk, reason := s.Enqueue(score)
+		if reason != RejectNone {
+			t.Fatalf("Enqueue(%v) rejected: %v", score, reason)
+		}
+		tickets[i] = tk
+	}
+	return tickets
+}
+
+func TestScheduler_EvictLowest_BetterArrivalEvictsLastTicket(t *testing.T) {
+	// Never started: these tests only exercise Enqueue's synchronous checks
+	// (see TestScheduler_RejectsQueueFull).
+	s := NewScheduler(QueueConfig{MaxSize: 3, EvictLowest: true}, NewFixedController(1))
+	queued := enqueueAll(t, s, 5, 1, 3)
+
+	if _, reason := s.Enqueue(2); reason != RejectNone {
+		t.Fatalf("Enqueue(2) on a full queue = %v, want it to evict the score-1 ticket", reason)
+	}
+	for i, tk := range queued {
+		if want := i == 1; tk.wasEvicted() != want {
+			t.Errorf("ticket %d (score %v) evicted = %v, want %v", i, tk.Score, tk.wasEvicted(), want)
+		}
+	}
+	if got := s.Depth(); got != 3 {
+		t.Errorf("Depth() = %d, want 3 (one out, one in)", got)
+	}
+	if got := s.Wait(context.Background(), queued[1]); got != RejectEvicted {
+		t.Errorf("Wait(evicted ticket) = %v, want RejectEvicted", got)
+	}
+}
+
+func TestScheduler_EvictLowest_ArrivalNotBetterThanLastIsRejected(t *testing.T) {
+	for _, score := range []float64{1, 0} {
+		t.Run(fmt.Sprintf("score %v", score), func(t *testing.T) {
+			s := NewScheduler(QueueConfig{MaxSize: 2, EvictLowest: true}, NewFixedController(1))
+			queued := enqueueAll(t, s, 5, 1)
+			// Equal to the last ticket's key loses on arrival order (FIFO).
+			if _, reason := s.Enqueue(score); reason != RejectQueueFull {
+				t.Fatalf("Enqueue(%v) = %v, want RejectQueueFull", score, reason)
+			}
+			for _, tk := range queued {
+				if tk.wasEvicted() {
+					t.Errorf("score-%v ticket evicted by an arrival that isn't better", tk.Score)
+				}
+			}
+		})
+	}
+}
+
+func TestScheduler_EvictLowest_NewestOfEqualLastKeysIsEvicted(t *testing.T) {
+	s := NewScheduler(QueueConfig{MaxSize: 4, EvictLowest: true}, NewFixedController(1))
+	queued := enqueueAll(t, s, 1, 5, 1, 1)
+	if _, reason := s.Enqueue(2); reason != RejectNone {
+		t.Fatalf("Enqueue(2) = %v, want RejectNone", reason)
+	}
+	for i, tk := range queued {
+		if want := i == 3; tk.wasEvicted() != want {
+			t.Errorf("ticket %d evicted = %v, want %v (the newest score-1 ticket is served last)", i, tk.wasEvicted(), want)
+		}
+	}
+}
+
+func TestScheduler_EvictLowest_ComparesAgedKeysNotScores(t *testing.T) {
+	// Rate 5/s: the score-50 ticket queued at 0s has the key of a fresh
+	// score 65 at 3s, so the fresh score-60 ticket is the one served last.
+	s, clock := newSchedulerWithClock(QueueConfig{MaxSize: 2, EvictLowest: true, AgingRate: 5}, NewFixedController(1))
+	old := enqueueAll(t, s, 50)[0]
+	clock.set(3*time.Second, s.epoch)
+	fresh := enqueueAll(t, s, 60)[0]
+
+	if _, reason := s.Enqueue(61); reason != RejectNone {
+		t.Fatalf("Enqueue(61) = %v, want RejectNone", reason)
+	}
+	if old.wasEvicted() || !fresh.wasEvicted() {
+		t.Errorf("evicted: score-50 (aged) = %v, score-60 (fresh) = %v; want false, true", old.wasEvicted(), fresh.wasEvicted())
+	}
+}
+
+func TestScheduler_EvictLowest_WaitExceededArrivalEvictsNothing(t *testing.T) {
+	c := NewFixedController(1)
+	s := NewScheduler(QueueConfig{MaxSize: 3, WaitTimeout: 150 * time.Millisecond, EvictLowest: true}, c)
+	// Filled before any latency data, so nothing is projected yet.
+	queued := enqueueAll(t, s, 5, 5, 1)
+	// After evicting one, the arrival would join behind 2 tickets, a
+	// projected 200ms wait, over the 150ms timeout.
+	fillWindow(c, 5, 100*time.Millisecond, false, false)
+
+	if _, reason := s.Enqueue(2); reason != RejectQueueWaitExceeded {
+		t.Fatalf("Enqueue(2) = %v, want RejectQueueWaitExceeded", reason)
+	}
+	if queued[2].wasEvicted() || s.Depth() != 3 {
+		t.Errorf("a rejected arrival evicted a ticket (Depth() = %d)", s.Depth())
+	}
+}
+
+func TestScheduler_EvictLowest_AllProjectionDoesNotCountTheVictim(t *testing.T) {
+	c := NewFixedController(1)
+	s := NewScheduler(QueueConfig{MaxSize: 3, WaitTimeout: 250 * time.Millisecond, EvictLowest: true}, c)
+	queued := enqueueAll(t, s, 5, 5, 1)
+	// Behind the 2 tickets left after evicting one: 200ms, under the 250ms
+	// timeout. Counting the victim too would project 300ms.
+	fillWindow(c, 5, 100*time.Millisecond, false, false)
+
+	if _, reason := s.Enqueue(2); reason != RejectNone {
+		t.Fatalf("Enqueue(2) = %v, want RejectNone", reason)
+	}
+	if !queued[2].wasEvicted() {
+		t.Error("score-1 ticket not evicted")
+	}
+}
+
+// --- projected wait from the tickets ahead (QueueConfig.ProjectAhead) ------
+
+func TestScheduler_ProjectAhead_HighScoreJoinsDeepLowScoreQueue(t *testing.T) {
+	cases := []struct {
+		projectAhead bool
+		wantHigh     RejectReason
+	}{
+		{false, RejectQueueWaitExceeded},
+		{true, RejectNone},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("ProjectAhead=%v", tc.projectAhead), func(t *testing.T) {
+			c := NewFixedController(1)
+			fillWindow(c, 5, 100*time.Millisecond, false, false)
+			// 100ms per queued ticket ahead (limit 1): 4 low-score tickets
+			// make a 400ms queue, over the 350ms timeout.
+			s := NewScheduler(QueueConfig{MaxSize: 100, WaitTimeout: 350 * time.Millisecond, ProjectAhead: tc.projectAhead}, c)
+			enqueueAll(t, s, 1, 1, 1, 1)
+
+			if _, reason := s.Enqueue(10); reason != tc.wantHigh {
+				t.Errorf("Enqueue(10) behind 4 low scores = %v, want %v", reason, tc.wantHigh)
+			}
+			if _, reason := s.Enqueue(1); reason != RejectQueueWaitExceeded {
+				t.Errorf("Enqueue(1) behind 4+ tickets = %v, want RejectQueueWaitExceeded", reason)
+			}
+		})
+	}
+}
+
+func TestScheduler_ProjectAhead_CountsEqualKeysAsAhead(t *testing.T) {
+	c := NewFixedController(1)
+	fillWindow(c, 5, 100*time.Millisecond, false, false)
+	s := NewScheduler(QueueConfig{MaxSize: 100, WaitTimeout: 250 * time.Millisecond, ProjectAhead: true}, c)
+	// The third score-5 ticket joined behind the other two (200ms); a
+	// fourth would be behind three (300ms). The score-1 ticket never counts.
+	enqueueAll(t, s, 1, 5, 5, 5)
+	if _, reason := s.Enqueue(5); reason != RejectQueueWaitExceeded {
+		t.Errorf("Enqueue(5) behind 3 score-5 tickets = %v, want RejectQueueWaitExceeded", reason)
+	}
+}
+
+// TestTicketHeap_LastAndCountAhead checks the heap walks against a sorted
+// copy of the queue, over random keys with many ties.
+func TestTicketHeap_LastAndCountAhead(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	for round := 0; round < 200; round++ {
+		var h ticketHeap
+		n := 1 + rng.Intn(50)
+		for i := 0; i < n; i++ {
+			heap.Push(&h, &Ticket{key: float64(rng.Intn(10)), seq: uint64(i)})
+		}
+		sorted := append([]*Ticket(nil), h...)
+		sort.Slice(sorted, func(i, j int) bool { return ticketHeap(sorted).Less(i, j) })
+
+		if got, want := h.last(), sorted[n-1]; got != want {
+			t.Fatalf("round %d: last() = key %v seq %d, want key %v seq %d", round, got.key, got.seq, want.key, want.seq)
+		}
+		for key := -1.0; key <= 10; key++ {
+			want := 0
+			for _, tk := range sorted {
+				if tk.key >= key {
+					want++
+				}
+			}
+			if got := h.countAhead(key, 0); got != want {
+				t.Fatalf("round %d: countAhead(%v) = %d, want %d", round, key, got, want)
+			}
+		}
+	}
+}
+
+// TestScheduler_Wait_EvictionRacesGrantsCancelsAndTimeouts adds eviction to
+// raceWaits: a small full queue makes arrivals evict queued tickets at the
+// same moments the dispatch loop pops them, timers fire and clients go away.
+// A ticket is evicted or granted, never both, and an evicted ticket owns no
+// capacity.
+func TestScheduler_Wait_EvictionRacesGrantsCancelsAndTimeouts(t *testing.T) {
+	out := raceWaits(t, QueueConfig{MaxSize: 4, WaitTimeout: 2 * time.Millisecond, AgingRate: 50, EvictLowest: true, ProjectAhead: true}, 3)
+	if out.admitted == 0 || out.evicted == 0 {
+		t.Errorf("race not exercised: %+v", out)
+	}
+}
+
+// TestScheduler_Wait_EvictedTicketReportedEvictedWhateverElseIsReady pins
+// the fallback after a lost Cancel: an evicted ticket whose deadline or
+// context is also ready must still report RejectEvicted, never be served.
+func TestScheduler_Wait_EvictedTicketReportedEvictedWhateverElseIsReady(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	cases := []struct {
+		name        string
+		waitTimeout time.Duration
+		ctx         context.Context
+	}{
+		{"deadline", time.Nanosecond, context.Background()},
+		{"client gone", 0, cancelled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewFixedController(1)
+			// Repeated because select picks among the ready cases at random.
+			for i := 0; i < 100; i++ {
+				// Never started, so nothing is ever granted.
+				s := NewScheduler(QueueConfig{MaxSize: 1, WaitTimeout: tc.waitTimeout, EvictLowest: true}, c)
+				victim := enqueueAll(t, s, 1, 2)[0]
+				if got := s.Wait(tc.ctx, victim); got != RejectEvicted {
+					t.Fatalf("iteration %d: Wait = %v, want RejectEvicted", i, got)
+				}
+				if got := c.InFlight(); got != 0 {
+					t.Fatalf("iteration %d: InFlight() = %d, want 0", i, got)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkTicketHeap_LastAndCountAhead measures the two walks an arrival
+// at a full queue makes under Scheduler.mu with evict_lowest and ahead
+// projection, for an arrival in the middle of the queue, at queue sizes
+// around and well above what deployments configure.
+func BenchmarkTicketHeap_LastAndCountAhead(b *testing.B) {
+	for _, size := range []int{1000, 10000} {
+		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+			rng := rand.New(rand.NewSource(1))
+			var h ticketHeap
+			for i := 0; i < size; i++ {
+				heap.Push(&h, &Ticket{key: float64(rng.Intn(100)), seq: uint64(i)})
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = h.last()
+				_ = h.countAhead(50, 0)
+			}
+		})
 	}
 }

@@ -66,8 +66,15 @@
 		# A queued request gains 5 score points per second waited, so a
 		# lower score is slowed down (10 points = 2s) but never starved.
 		queue_aging_rate 5
-		# Answer queue_full/queue_wait_exceeded/queue_timed_out with 503
-		# instead of 429, with a Retry-After of 5 seconds.
+		# At a full queue, an arrival that would be served before the
+		# request last in line takes its place (that one is rejected as
+		# evicted), instead of the arrival being rejected with queue_full.
+		queue_full_policy evict_lowest
+		# Project an arrival's wait from the requests that would be served
+		# before it, not from the whole queue depth.
+		queue_wait_projection ahead
+		# Answer queue_full/queue_wait_exceeded/queue_timed_out/evicted with
+		# 503 instead of 429, with a Retry-After of 5 seconds.
 		reject_status 503
 		retry_after   5s
 	}
