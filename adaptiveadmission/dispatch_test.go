@@ -1,8 +1,10 @@
 package adaptiveadmission
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -69,6 +71,40 @@ func TestStatusRecorder_FirstWriteHeaderCallWins(t *testing.T) {
 	rec.WriteHeader(http.StatusInternalServerError)
 	if rec.statusCode != http.StatusAccepted {
 		t.Errorf("statusCode = %d, want %d (first WriteHeader call should win)", rec.statusCode, http.StatusAccepted)
+	}
+}
+
+func TestStatusRecorder_FlushReachesWrappedWriter(t *testing.T) {
+	inner := httptest.NewRecorder()
+	rec := &statusRecorder{ResponseWriter: inner, statusCode: http.StatusOK}
+	if err := http.NewResponseController(rec).Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if !inner.Flushed {
+		t.Error("wrapped writer was not flushed")
+	}
+}
+
+// hijackableRecorder is an httptest.ResponseRecorder that also supports
+// Hijack, standing in for net/http's HTTP/1.1 response writer.
+type hijackableRecorder struct {
+	*httptest.ResponseRecorder
+	hijacked bool
+}
+
+func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacked = true
+	return nil, nil, nil
+}
+
+func TestStatusRecorder_HijackReachesWrappedWriter(t *testing.T) {
+	inner := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+	rec := &statusRecorder{ResponseWriter: inner, statusCode: http.StatusOK}
+	if _, _, err := http.NewResponseController(rec).Hijack(); err != nil {
+		t.Fatalf("Hijack: %v", err)
+	}
+	if !inner.hijacked {
+		t.Error("wrapped writer was not hijacked")
 	}
 }
 
