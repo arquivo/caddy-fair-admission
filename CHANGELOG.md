@@ -1,3 +1,9 @@
+## [3.5.0](https://github.com/arquivo/caddy-fair-admission/compare/v3.4.0...v3.5.0) (2026-11-23)
+
+### Features
+
+* **adaptive_admission:** add opt-in eviction and ahead-only wait projection ([#12](https://github.com/arquivo/caddy-fair-admission/issues/12)) ([ea62ab5](https://github.com/arquivo/caddy-fair-admission/commit/ea62ab5ff315860c74f596066359d894afeaeb7e)), closes [#11](https://github.com/arquivo/caddy-fair-admission/issues/11), references [arquivo/pwa-technologies#1602](https://github.com/arquivo/pwa-technologies/issues/1602)
+
 ## [3.4.0](https://github.com/arquivo/caddy-fair-admission/compare/v3.3.0...v3.4.0) (2026-11-13)
 
 ### Features
