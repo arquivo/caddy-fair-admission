@@ -119,6 +119,7 @@ func TestHandler_Dispatch_NextPanics_ReleasesCapacityAndRepanics(t *testing.T) {
 		panic(http.ErrAbortHandler)
 	})
 
+	admissionMetrics.requestsInFlight.WithLabelValues(h.Config.backendLabel()).Set(1)
 	if got := dispatchRecovering(h, httptest.NewRequest(http.MethodGet, "/", nil), next); got != http.ErrAbortHandler {
 		t.Fatalf("recovered %v, want the next handler's own panic value http.ErrAbortHandler", got)
 	}

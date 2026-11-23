@@ -197,11 +197,12 @@ A backend that stays closed — requests arrive, but none is admitted — shows 
 
 ```promql
 rate(adaptive_admission_requests_total[10m]) > 0
-  and rate(adaptive_admission_requests_admitted_total[10m]) == 0
+  unless rate(adaptive_admission_requests_admitted_total[10m]) > 0
 ```
 
-Choose the window longer than the longest legitimate request, so the drain after an adaptive
-shrink doesn't fire it.
+`unless` also covers a backend that hasn't admitted anything since Caddy started, which has no
+`requests_admitted_total` series yet. Choose the window longer than the longest legitimate request,
+so the drain after an adaptive shrink doesn't fire it.
 
 Example scrape output:
 
