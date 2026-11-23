@@ -1383,8 +1383,9 @@ func priorityNetworkProbe(t *testing.T, url, token, xff string) (score, priority
 }
 
 // TestIntegration_EndToEnd_PriorityNetwork_MatchesResolvedClientIP checks
-// priority_network against Caddy's resolved {client_ip}: an X-Forwarded-For
-// address counts only when the peer is a trusted proxy.
+// priority_network against Caddy's resolved {client_ip}, with the
+// trusted_proxies_strict setup docs/configuration.md §11 requires: an
+// X-Forwarded-For address counts only when a trusted proxy added it.
 func TestIntegration_EndToEnd_PriorityNetwork_MatchesResolvedClientIP(t *testing.T) {
 	jwksURL, researcherToken := startJWKSServerAndSignToken(t, "researcher")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1399,6 +1400,7 @@ func TestIntegration_EndToEnd_PriorityNetwork_MatchesResolvedClientIP(t *testing
 {
 	servers {
 		trusted_proxies static %s
+		trusted_proxies_strict
 	}
 }
 :19122 {
@@ -1428,6 +1430,7 @@ func TestIntegration_EndToEnd_PriorityNetwork_MatchesResolvedClientIP(t *testing
 			{"listed client is internal and priority", "", "192.0.2.10", "100", "true"},
 			{"unlisted client is anonymous", "", "203.0.113.5", "60", "false"},
 			{"verified JWT class wins, priority still applies", researcherToken, "192.0.2.10", "90", "true"},
+			{"client-supplied entry before the one the proxy appended", "", "192.0.2.10, 203.0.113.5", "60", "false"},
 		}
 		for _, tc := range cases {
 			score, priority := priorityNetworkProbe(t, url, tc.token, tc.xff)

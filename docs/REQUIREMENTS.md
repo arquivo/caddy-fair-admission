@@ -199,7 +199,11 @@ both.
   `{client_ip}`, after `trusted_proxies`) is in one of the listed networks is classified
   `internal` unless a verified JWT gave it a trusted class, and is flagged for `adaptive_admission`'s
   priority tier (§4.5). For the deployment's own services, which send no token and would otherwise
-  be penalized as `anonymous`. Penalties still apply. See `docs/configuration.md` §11.
+  be penalized as `anonymous`. Penalties still apply. Behind a proxy this requires
+  `trusted_proxies_strict` as well as `trusted_proxies`: non-strict resolution takes the left-most
+  forwarded address, which a client can set when the proxy appends to the header. Prefixes with
+  host bits set, IPv4-mapped prefixes and `/0` are rejected at config load. See
+  `docs/configuration.md` §11.
 
 ### 4.3 Scoring / penalties (`app/scoring.py`, `app/config.py`'s `ScoringConfig`) — EWMA-based, `fairness`
 

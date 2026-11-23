@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
@@ -19,9 +20,7 @@ func TestParseNetwork(t *testing.T) {
 		in, want string
 	}{
 		{"192.0.2.0/24", "192.0.2.0/24"},
-		{"192.0.2.7/24", "192.0.2.0/24"},
 		{"192.0.2.7", "192.0.2.7/32"},
-		{"::ffff:192.0.2.7", "192.0.2.7/32"},
 		{"2001:db8::/32", "2001:db8::/32"},
 		{"2001:db8::1", "2001:db8::1/128"},
 		{"::1", "::1/128"},
@@ -39,7 +38,12 @@ func TestParseNetwork(t *testing.T) {
 }
 
 func TestParseNetwork_Invalid(t *testing.T) {
-	for _, in := range []string{"", "not-an-ip", "192.0.2.0/33", "192.0.2.300", "fe80::1%eth0", "::ffff:192.0.2.0/120"} {
+	for _, in := range []string{
+		"", "not-an-ip", "192.0.2.0/33", "192.0.2.300",
+		"::ffff:192.0.2.0/120", "::ffff:192.0.2.7", // IPv4-mapped
+		"192.0.2.7/24", "192.168.1.0/8", // host bits set
+		"0.0.0.0/0", "::/0",
+	} {
 		if p, err := parseNetwork(in); err == nil {
 			t.Errorf("parseNetwork(%q) = %s, want an error", in, p)
 		}
@@ -70,6 +74,21 @@ func TestInNetworks(t *testing.T) {
 	}
 	if inNetworks(nil, net.ParseIP("192.0.2.200")) {
 		t.Error("inNetworks with no prefixes = true, want false")
+	}
+}
+
+// JSON config bypasses the Caddyfile parser, so Provision checks the list.
+func TestProvision_RejectsInvalidPriorityNetworksFromJSON(t *testing.T) {
+	for _, js := range []string{`[""]`, `["::ffff:10.0.0.0/104"]`, `["192.0.2.7/24"]`, `["::/0"]`} {
+		var cfg Config
+		if err := json.Unmarshal([]byte(`{"priority_networks":`+js+`}`), &cfg); err != nil {
+			t.Fatalf("Unmarshal %s: %v", js, err)
+		}
+		h := &Handler{Config: cfg}
+		err := h.Provision(caddy.Context{})
+		if err == nil || !strings.Contains(err.Error(), "priority_network") {
+			t.Errorf("Provision with priority_networks %s = %v, want a priority_network error", js, err)
+		}
 	}
 }
 

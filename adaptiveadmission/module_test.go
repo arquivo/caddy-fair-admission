@@ -442,7 +442,11 @@ func TestHandler_ServeHTTP_PriorityVarQueuesAheadOfHigherScore(t *testing.T) {
 				t.Errorf("ServeHTTP: %v", err)
 			}
 		}()
-		time.Sleep(20 * time.Millisecond) // arrival order: high first
+	}
+	for deadline := time.Now().Add(time.Second); s.Depth() < 2; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("both requests never queued")
+		}
 	}
 	c.Release(1, time.Millisecond, 200, false)
 

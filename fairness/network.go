@@ -5,66 +5,69 @@
 package fairness
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
-	"strings"
 
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 // parseNetwork parses one CIDR prefix, or a bare IP taken as a single-host
-// prefix (/32 or /128), like Caddy's own client_ip matcher. The result is
-// masked, so 192.0.2.7/24 is stored as 192.0.2.0/24. An IPv4-mapped IPv6
-// prefix is rejected: client IPs are matched in their unmapped form, so it
-// could never match.
+// prefix (/32 or /128), with Caddy's own client_ip matcher parser, then
+// applies validateNetwork.
 func parseNetwork(s string) (netip.Prefix, error) {
-	if strings.Contains(s, "/") {
-		p, err := netip.ParsePrefix(s)
-		if err != nil {
-			return netip.Prefix{}, err
-		}
-		if p.Addr().Is4In6() {
-			return netip.Prefix{}, fmt.Errorf("%q is an IPv4-mapped IPv6 prefix; use the IPv4 form", s)
-		}
-		return p.Masked(), nil
-	}
-	addr, err := netip.ParseAddr(s)
+	p, err := caddyhttp.CIDRExpressionToPrefix(s)
 	if err != nil {
 		return netip.Prefix{}, err
 	}
-	if addr.Zone() != "" {
-		return netip.Prefix{}, fmt.Errorf("%q has an IPv6 zone, which can't be matched", s)
-	}
-	addr = addr.Unmap()
-	return netip.PrefixFrom(addr, addr.BitLen()), nil
+	return p, validateNetwork(p)
 }
 
-// parseNetworkList parses a network-list directive's prefixes, given inline
-// as arguments, in a block (any number per line, e.g. from an imported
-// snippet), or both:
+// validateNetwork rejects priority_network prefixes that are invalid or
+// can't mean what was written: an IPv4-mapped IPv6 prefix (client IPs are
+// matched unmapped, so it could never match), host bits set (a typo such as
+// 192.168.1.0/8 would silently widen the list), and a /0 (every client).
+// Checked for Caddyfile and JSON config alike.
+func validateNetwork(p netip.Prefix) error {
+	switch {
+	case !p.IsValid():
+		return errors.New("empty or invalid prefix")
+	case p.Addr().Is4In6():
+		return fmt.Errorf("%s is an IPv4-mapped IPv6 prefix; use the IPv4 form", p)
+	case p != p.Masked():
+		return fmt.Errorf("%s has host bits set; did you mean %s?", p, p.Masked())
+	case p.Bits() == 0:
+		return fmt.Errorf("%s matches every client", p)
+	}
+	return nil
+}
+
+// parsePriorityNetworks parses a priority_network directive's prefixes,
+// given inline as arguments, in a block (any number per line, e.g. from an
+// imported snippet), or both:
 //
-//	<directive> <cidr|ip>...
-//	<directive> {
+//	priority_network <cidr|ip>...
+//	priority_network {
 //	    <cidr|ip>...
 //	}
 //
 // At least one is required.
-func parseNetworkList(d *caddyfile.Dispenser) ([]netip.Prefix, error) {
-	name := d.Val()
+func parsePriorityNetworks(d *caddyfile.Dispenser) ([]netip.Prefix, error) {
 	vals := d.RemainingArgs()
 	for d.NextBlock(1) {
 		vals = append(vals, d.Val())
 		vals = append(vals, d.RemainingArgs()...)
 	}
 	if len(vals) == 0 {
-		return nil, d.Errf("%s requires at least one network", name)
+		return nil, d.Err("priority_network requires at least one network")
 	}
 	prefixes := make([]netip.Prefix, 0, len(vals))
 	for _, v := range vals {
 		p, err := parseNetwork(v)
 		if err != nil {
-			return nil, d.Errf("invalid %s %q: %v", name, v, err)
+			return nil, d.Errf("invalid priority_network: %v", err)
 		}
 		prefixes = append(prefixes, p)
 	}
@@ -74,9 +77,6 @@ func parseNetworkList(d *caddyfile.Dispenser) ([]netip.Prefix, error) {
 // inNetworks reports whether ip is in any of prefixes. A nil (unresolved) ip
 // never matches. An IPv4-mapped IPv6 ip is matched as its IPv4 form.
 func inNetworks(prefixes []netip.Prefix, ip net.IP) bool {
-	if len(prefixes) == 0 {
-		return false
-	}
 	addr, ok := netip.AddrFromSlice(ip)
 	if !ok {
 		return false

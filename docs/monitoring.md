@@ -290,8 +290,8 @@ contributing `0` are omitted entirely rather than listed with a `0` value).
 ```
 
 **Example — rejected request** (the low-and-slow crawler ASN from
-[`scenarios.md`](scenarios.md), after a tuned `penalty asn` override pushed it into the queue's
-lowest-priority tier and it lost the race against a full queue):
+[`scenarios.md`](scenarios.md), after a tuned `penalty asn` override pushed it to the back of the
+queue and it lost the race against a full queue):
 
 ```json
 {
@@ -309,3 +309,15 @@ lowest-priority tier and it lost the race against a full queue):
   "score_breakdown": { "base": 60, "penalty_asn": 10, "total_penalty": 10, "final": 50 }
 }
 ```
+
+**Watching the priority tier** ([`configuration.md`](configuration.md) §11). The metrics don't
+split priority from other traffic; the log line does. Count decisions by tier and outcome, e.g.
+from Caddy's JSON log:
+
+```sh
+jq -r 'select(.msg == "admission_decision")
+       | [.backend, .priority, (.reject_reason // "admitted")] | @tsv' caddy.log | sort | uniq -c
+```
+
+A growing share of `priority true` among admitted requests, together with `priority false`
+requests rejected as `evicted` or `queue_timed_out`, means the tier is crowding out other traffic.

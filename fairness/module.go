@@ -122,6 +122,13 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // refinement). It also registers this instance with the App (app.go) so the
 // admin introspection API (admin.go, §4.10) can report its live state.
 func (h *Handler) Provision(ctx caddy.Context) error {
+	// The Caddyfile parser already validated these; JSON config hasn't been.
+	for _, p := range h.PriorityNetworks {
+		if err := validateNetwork(p); err != nil {
+			return fmt.Errorf("fairness: invalid priority_network: %v", err)
+		}
+	}
+
 	appIface, err := ctx.App("fairness")
 	if err != nil {
 		return err
@@ -436,7 +443,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.SessionCookie = sc
 
 			case "priority_network":
-				prefixes, err := parseNetworkList(d)
+				prefixes, err := parsePriorityNetworks(d)
 				if err != nil {
 					return err
 				}

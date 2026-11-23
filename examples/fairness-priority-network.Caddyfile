@@ -7,9 +7,11 @@
 # They're still tracked and penalized, so one that floods sinks behind the
 # other priority clients (but stays ahead of the public).
 #
-# Caddy sits behind a proxy here, so trusted_proxies is what makes
-# {client_ip} the real client: without it, every request would resolve to the
-# proxy's own address.
+# Caddy sits behind a proxy here. trusted_proxies makes {client_ip} the
+# client the proxy saw instead of the proxy itself, and trusted_proxies_strict
+# takes it from the right of X-Forwarded-For, where the proxy appended it:
+# the default left-most entry can be written by the client. Keep the proxy's
+# own address out of the listed networks (docs/configuration.md §11).
 #
 # Validate with:
 #   caddy validate --config examples/fairness-priority-network.Caddyfile --adapter caddyfile
@@ -17,10 +19,12 @@
 {
 	servers {
 		trusted_proxies static 10.0.0.10/32
+		trusted_proxies_strict
 	}
 }
 
-# One list, imported wherever it's needed.
+# The networks the services actually run in, as narrow as possible: here
+# loopback, two container networks and one documentation range.
 (local_networks) {
 	127.0.0.1 ::1
 	172.17.0.0/16 172.18.0.0/15

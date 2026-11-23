@@ -617,8 +617,9 @@ priority_network {
 ```
 
 Each value is a CIDR prefix (`192.0.2.0/24`, `2001:db8::/32`) or a bare IP, taken as `/32` or
-`/128` like Caddy's `client_ip` matcher. An invalid value is a Caddyfile parse error. The block
-form lets one snippet hold the list:
+`/128` like Caddy's `client_ip` matcher. An invalid value is a Caddyfile parse error, and so is a
+prefix with host bits set (`192.0.2.7/24`), an IPv4-mapped IPv6 prefix, or a `/0`; in JSON config,
+the same checks fail the config load. The block form lets one snippet hold the list:
 
 ```caddyfile
 (local_networks) {
@@ -638,25 +639,41 @@ A request from one of these networks:
 - **is classified `internal`** and starts from `base_score internal` (default 100), unless a
   verified JWT gave it a trusted class (§4 precedence). Its `user_class` in logs and the
   `fairness_score_distribution` metric is `internal`. It has no user ID, so the `user` dimension
-  doesn't track it;
+  doesn't track it, unless it sent a validly signed token without a trusted class, whose subject
+  is kept;
 - **is served before every other request** by `adaptive_admission` (§7's priority tier), whatever
   its score and however long other requests have waited. A JWT-verified client in the network
   keeps its class and still gets the tier;
 - **is still tracked and penalized** on every enabled dimension. Among priority requests, a
   service that floods sinks behind the others, but it stays ahead of all non-priority traffic.
 
-**Matching uses the resolved client IP**, the same `{client_ip}` Caddy computes after
-`trusted_proxies`, never a forwarded header read by this module. Behind a proxy, configure
-`trusted_proxies` for it: otherwise every client resolves to the proxy's own address, and if that
-address is in a `priority_network`, every request gets the priority. An `X-Forwarded-For` from a
-peer that isn't a trusted proxy is ignored, so clients can't claim a listed address. An IPv4-mapped
-IPv6 client address is matched as IPv4, and a request whose IP can't be resolved never matches.
+**Matching uses the resolved client IP**, the same `{client_ip}` Caddy computes from
+`trusted_proxies`, never a forwarded header read by this module. An IPv4-mapped IPv6 client address
+is matched as IPv4, and a request whose IP can't be resolved never matches. Behind a proxy:
+
+- **Set both `trusted_proxies` and `trusted_proxies_strict`** in the `servers` global options. Without
+  `trusted_proxies`, every client resolves to the proxy's address. Without `trusted_proxies_strict`,
+  Caddy takes the *left-most* `X-Forwarded-For` entry, which a client can write itself when the
+  proxy appends to the header instead of replacing it. Strict mode reads the header from the right
+  and takes the first address that isn't a trusted proxy: the one the proxy saw.
+- **Keep the proxy's own address out of every `priority_network`.** A request a trusted proxy sends
+  without a usable forwarded address (its own health checks, a route that doesn't set the header)
+  resolves to the proxy's address, and would get the priority. If the proxy runs in the same
+  container network as the services, list the services' addresses or narrower subnets instead of
+  the whole network.
+- **Don't overlap `trusted_proxies` and `priority_network`.** Strict mode skips trusted addresses,
+  so a service whose address is also trusted can resolve to another address in the forwarded
+  header, or to the proxy's.
 
 **The tier can starve other traffic.** It is strict priority, with no share cap: while priority
 demand fills the concurrency limit, other requests wait, and may time out or be evicted from the
-queue. The concurrency limit itself still holds, so backends are protected. List only
-services whose request volume you control, and watch for one that fans out (e.g. a renderer
-loading every resource of a page per call).
+queue. The concurrency limit itself still holds, so backends are protected. A service that works
+on behalf of public users (a screenshot renderer, a search API) turns their demand into priority
+traffic, multiplied by its fan-out (e.g. every resource of a rendered page): rate-limit it at its
+own public entry point. Health checks in the tier are served first too, so they keep passing while
+public traffic is starved; measure public admission with a probe that isn't listed. The
+`admission_decision` log's `priority` field shows how much of the traffic is in the tier (see
+[`monitoring.md`](monitoring.md)).
 
 **Pair it with `queue_full_policy evict_lowest` and `queue_wait_projection ahead`** (§6, §7). With
 them, a priority request at a full queue takes the place of the last non-priority request, and its
