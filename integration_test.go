@@ -1266,7 +1266,8 @@ func TestIntegration_EndToEnd_StreamedResponseIsFlushedThroughAdmission(t *testi
 
 // adaptive_admission must not hide the response writer's Hijack from
 // reverse_proxy: an HTTP/1.1 Upgrade request switches protocols end to end,
-// and its slot is given back once the upgraded connection closes.
+// and its slot is given back at the switch, not when the upgraded
+// connection closes.
 func TestIntegration_EndToEnd_ProtocolUpgradeWorksThroughAdmission(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") == "" {
@@ -1280,12 +1281,14 @@ func TestIntegration_EndToEnd_ProtocolUpgradeWorksThroughAdmission(t *testing.T)
 		defer conn.Close()
 		brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n")
 		brw.Flush()
-		line, err := brw.ReadString('\n')
-		if err != nil {
-			return
+		for {
+			line, err := brw.ReadString('\n')
+			if err != nil {
+				return
+			}
+			brw.WriteString(line)
+			brw.Flush()
 		}
-		brw.WriteString(line)
-		brw.Flush()
 	}))
 	t.Cleanup(upstream.Close)
 
@@ -1319,6 +1322,18 @@ func TestIntegration_EndToEnd_ProtocolUpgradeWorksThroughAdmission(t *testing.T)
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusSwitchingProtocols)
 	}
 
+	// With limit 1, this request is only admitted if the upgraded
+	// connection, still open, gave its slot back.
+	client := &http.Client{Timeout: 2 * time.Second}
+	plain, err := client.Get("http://127.0.0.1:19121/")
+	if err != nil {
+		t.Fatalf("GET while the upgraded connection is open: %v", err)
+	}
+	plain.Body.Close()
+	if plain.StatusCode != http.StatusOK {
+		t.Errorf("status while the upgraded connection is open = %d, want %d", plain.StatusCode, http.StatusOK)
+	}
+
 	if _, err := io.WriteString(conn, "ping\n"); err != nil {
 		t.Fatalf("write over upgraded connection: %v", err)
 	}
@@ -1330,16 +1345,15 @@ func TestIntegration_EndToEnd_ProtocolUpgradeWorksThroughAdmission(t *testing.T)
 		t.Errorf("echoed %q, want %q", line, "ping\n")
 	}
 
-	// The only slot must come back: with limit 1, this request is admitted
-	// only after the upgraded connection is released.
-	conn.Close()
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err = client.Get("http://127.0.0.1:19121/")
-	if err != nil {
-		t.Fatalf("GET after upgrade: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status after upgrade = %d, want %d", resp.StatusCode, http.StatusOK)
+	// Stopping Caddy must not wait for the upgraded connection to close.
+	stopped := make(chan error, 1)
+	go func() { stopped <- caddy.Stop() }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Errorf("caddy.Stop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("caddy.Stop blocked while an upgraded connection was open")
 	}
 }

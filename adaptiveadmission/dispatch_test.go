@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -74,6 +75,33 @@ func TestStatusRecorder_FirstWriteHeaderCallWins(t *testing.T) {
 	}
 }
 
+func TestStatusRecorder_InformationalStatusIsNotFinal(t *testing.T) {
+	rec := &statusRecorder{ResponseWriter: httptest.NewRecorder(), statusCode: http.StatusOK}
+	rec.WriteHeader(http.StatusContinue)
+	rec.WriteHeader(http.StatusEarlyHints)
+	rec.WriteHeader(http.StatusServiceUnavailable)
+	if rec.statusCode != http.StatusServiceUnavailable {
+		t.Errorf("statusCode = %d, want %d (1xx responses come before the final status)", rec.statusCode, http.StatusServiceUnavailable)
+	}
+}
+
+func TestStatusRecorder_SwitchingProtocolsIsFinal(t *testing.T) {
+	calls := 0
+	rec := &statusRecorder{
+		ResponseWriter:    httptest.NewRecorder(),
+		statusCode:        http.StatusOK,
+		onSwitchProtocols: func() { calls++ },
+	}
+	rec.WriteHeader(http.StatusSwitchingProtocols)
+	rec.WriteHeader(http.StatusOK)
+	if rec.statusCode != http.StatusSwitchingProtocols {
+		t.Errorf("statusCode = %d, want %d", rec.statusCode, http.StatusSwitchingProtocols)
+	}
+	if calls != 1 {
+		t.Errorf("onSwitchProtocols called %d times, want 1", calls)
+	}
+}
+
 func TestStatusRecorder_FlushReachesWrappedWriter(t *testing.T) {
 	inner := httptest.NewRecorder()
 	rec := &statusRecorder{ResponseWriter: inner, statusCode: http.StatusOK}
@@ -128,6 +156,54 @@ func TestHandler_Dispatch_RecordsLatencyAndReleasesCapacity(t *testing.T) {
 	}
 	if got := c.window.total; got != 1 {
 		t.Errorf("window.total = %d, want 1", got)
+	}
+}
+
+func TestHandler_Dispatch_InformationalThen5xx_RecordedAsError(t *testing.T) {
+	c := NewFixedController(1)
+	c.Acquire(1)
+	h := &Handler{controller: c}
+
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(http.StatusContinue)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return nil
+	})
+
+	if err := h.dispatch(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/", nil), next, 0); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if last := lastOutcome(c); !last.isError {
+		t.Errorf("recorded outcome = %+v, want a 5xx error", last)
+	}
+}
+
+func TestHandler_Dispatch_SwitchingProtocols_ReleasesCapacityAtTheSwitch(t *testing.T) {
+	c := NewFixedController(1)
+	c.Acquire(1)
+	h := &Handler{controller: c}
+
+	const connLifetime = 50 * time.Millisecond
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(http.StatusSwitchingProtocols)
+		if got := c.InFlight(); got != 0 {
+			t.Errorf("InFlight() = %d after the 101, want 0 while the upgraded connection is open", got)
+		}
+		time.Sleep(connLifetime) // the upgraded connection
+		return nil
+	})
+
+	if err := h.dispatch(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil), next, 0); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if got := c.InFlight(); got != 0 {
+		t.Errorf("InFlight() = %d, want 0 (released exactly once)", got)
+	}
+	if got := c.window.total; got != 1 {
+		t.Fatalf("window.total = %d, want 1", got)
+	}
+	if last := lastOutcome(c); last.latency >= connLifetime || last.isError {
+		t.Errorf("recorded outcome = %+v, want the time until the 101 (under %v), not an error", last, connLifetime)
 	}
 }
 

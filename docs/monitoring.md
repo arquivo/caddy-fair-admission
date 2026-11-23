@@ -238,9 +238,10 @@ Fields present on **every** line: `backend` (string), `admitted` (bool).
 
 Fields present **only when `admitted: true`**: `queue_wait_ms` (int64), `backend_latency_ms`
 (int64), `status_code` (int). When `reverse_proxy` aborted a response part-way through the body,
-`status_code` is `499` if the client left and `500` otherwise. For a protocol upgrade (e.g.
-WebSocket), `status_code` is `101` and `backend_latency_ms` covers the whole life of the upgraded
-connection, as does `adaptive_admission_backend_request_duration_seconds`.
+`status_code` is `499` if the client left and `500` otherwise. `status_code` is the final status:
+informational responses (e.g. `100 Continue`, `103 Early Hints`) sent before it are not recorded.
+For a protocol upgrade (e.g. WebSocket), `status_code` is `101` and `backend_latency_ms` is the time
+until the backend accepted the switch; the upgraded connection that follows is not measured.
 
 Fields present **only when `admitted: false`**: `reject_reason` (string, `queue_full`,
 `queue_wait_exceeded`, `queue_timed_out`, `client_gone` or `evicted`). The last three were already

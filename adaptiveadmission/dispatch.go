@@ -16,25 +16,24 @@ import (
 // request's structured log line (§4.9). This is the only place capacity
 // granted by ServeHTTP's Enqueue/Granted gets released.
 //
-// The release runs in a deferred call, so it also happens when next panics:
-// reverse_proxy panics with http.ErrAbortHandler when copying a response
-// body fails after the headers were sent (the client or the upstream went
-// away mid-body), and net/http recovers that panic silently. The panic is
-// not recovered here; it carries on to net/http once the slot is given back.
+// A request that switches protocols (101, e.g. a WebSocket upgrade) is
+// finished as soon as the 101 is written: its latency is the time until the
+// backend accepted the switch, and the upgraded connection that follows
+// holds no capacity, so it neither keeps a slot taken nor has its whole
+// lifetime recorded as latency.
+//
+// Any other request is finished in a deferred call, so it also happens
+// when next panics: reverse_proxy panics with http.ErrAbortHandler when
+// copying a response body fails after the headers were sent (the client or
+// the upstream went away mid-body), and net/http recovers that panic
+// silently. The panic is not recovered here; it carries on to net/http once
+// the slot is given back.
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, queueWait time.Duration) (err error) {
-	rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
-
 	start := time.Now()
-	panicked := true
-	defer func() {
+	finished := false
+	finish := func(statusCode int, timedOut bool) {
+		finished = true
 		latency := time.Since(start)
-		var statusCode int
-		var timedOut bool
-		if panicked {
-			statusCode = classifyAbort(r.Context())
-		} else {
-			statusCode, timedOut = classifyOutcome(rec.statusCode, err)
-		}
 		h.controller.Release(1, latency, statusCode, timedOut)
 
 		backend := h.Config.backendLabel()
@@ -54,6 +53,24 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, next caddyhtt
 			latency:    latency,
 			statusCode: statusCode,
 		})
+	}
+
+	rec := &statusRecorder{
+		ResponseWriter:    w,
+		statusCode:        http.StatusOK,
+		onSwitchProtocols: func() { finish(http.StatusSwitchingProtocols, false) },
+	}
+
+	panicked := true
+	defer func() {
+		if finished {
+			return
+		}
+		if panicked {
+			finish(classifyAbort(r.Context()), false)
+		} else {
+			finish(classifyOutcome(rec.statusCode, err))
+		}
 	}()
 
 	err = next.ServeHTTP(rec, r)
@@ -93,21 +110,29 @@ func classifyAbort(ctx context.Context) int {
 	return http.StatusInternalServerError
 }
 
-// statusRecorder captures the status code the wrapped handler actually
-// wrote, defaulting to 200 to match net/http's own behavior when
-// WriteHeader is never called explicitly.
+// statusRecorder captures the final status code the wrapped handler
+// actually wrote, defaulting to 200 to match net/http's own behavior when
+// WriteHeader is never called explicitly. Informational responses (1xx,
+// e.g. 100 Continue or 103 Early Hints) come before the final status and
+// are not recorded, except 101 Switching Protocols, which is final and
+// calls onSwitchProtocols.
 type statusRecorder struct {
 	http.ResponseWriter
-	statusCode  int
-	wroteHeader bool
+	statusCode        int
+	wroteHeader       bool
+	onSwitchProtocols func()
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
-	if !r.wroteHeader {
-		r.statusCode = code
-		r.wroteHeader = true
-	}
 	r.ResponseWriter.WriteHeader(code)
+	if r.wroteHeader || (code < http.StatusOK && code != http.StatusSwitchingProtocols) {
+		return
+	}
+	r.statusCode = code
+	r.wroteHeader = true
+	if code == http.StatusSwitchingProtocols && r.onSwitchProtocols != nil {
+		r.onSwitchProtocols()
+	}
 }
 
 func (r *statusRecorder) Write(b []byte) (int, error) {
