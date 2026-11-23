@@ -617,14 +617,15 @@ priority_network {
 ```
 
 Each value is a CIDR prefix (`192.0.2.0/24`, `2001:db8::/32`) or a bare IP, taken as `/32` or
-`/128` like Caddy's `client_ip` matcher. An invalid value is a Caddyfile parse error, and so is a
+`/128` like Caddy's `client_ip` matcher (an IPv6 zone on a bare IP is ignored, as there). An
+invalid value is a Caddyfile parse error, and so is a
 prefix with host bits set (`192.0.2.7/24`), an IPv4-mapped IPv6 prefix, or a `/0`; in JSON config,
 the same checks fail the config load. The block form lets one snippet hold the list:
 
 ```caddyfile
 (local_networks) {
 	127.0.0.1 ::1
-	172.17.0.0/16 192.168.0.0/16
+	172.17.0.0/16 192.168.10.0/24
 }
 
 fairness {
@@ -656,14 +657,15 @@ is matched as IPv4, and a request whose IP can't be resolved never matches. Behi
   Caddy takes the *left-most* `X-Forwarded-For` entry, which a client can write itself when the
   proxy appends to the header instead of replacing it. Strict mode reads the header from the right
   and takes the first address that isn't a trusted proxy: the one the proxy saw.
-- **Keep the proxy's own address out of every `priority_network`.** A request a trusted proxy sends
-  without a usable forwarded address (its own health checks, a route that doesn't set the header)
-  resolves to the proxy's address, and would get the priority. If the proxy runs in the same
-  container network as the services, list the services' addresses or narrower subnets instead of
-  the whole network.
-- **Don't overlap `trusted_proxies` and `priority_network`.** Strict mode skips trusted addresses,
-  so a service whose address is also trusted can resolve to another address in the forwarded
-  header, or to the proxy's.
+- **Make the proxy set or strip every header in `client_ip_headers`** (`X-Forwarded-For` by
+  default) on every route to Caddy, appending to it or overwriting it. Strict mode takes the
+  right-most untrusted address, so a header the proxy passes through unchanged is entirely the
+  client's.
+- **Keep trusted addresses out of every `priority_network`.** A request from the proxy without a
+  forwarded address (e.g. its own health checks) resolves to the proxy's address, and would get the
+  priority. Strict mode also skips trusted addresses, so a service whose address is trusted can
+  resolve to another one. If the proxy runs in the same container network as the services, list the
+  services' addresses or narrower subnets instead of the whole network.
 
 **The tier can starve other traffic.** It is strict priority, with no share cap: while priority
 demand fills the concurrency limit, other requests wait, and may time out or be evicted from the

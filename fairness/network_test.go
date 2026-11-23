@@ -23,6 +23,7 @@ func TestParseNetwork(t *testing.T) {
 		{"192.0.2.7", "192.0.2.7/32"},
 		{"2001:db8::/32", "2001:db8::/32"},
 		{"2001:db8::1", "2001:db8::1/128"},
+		{"fe80::1%eth0", "fe80::1/128"}, // zone ignored, as in Caddy's client_ip matcher
 		{"::1", "::1/128"},
 	}
 	for _, tc := range cases {

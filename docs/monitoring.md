@@ -315,8 +315,8 @@ split priority from other traffic; the log line does. Count decisions by tier an
 from Caddy's JSON log:
 
 ```sh
-jq -r 'select(.msg == "admission_decision")
-       | [.backend, .priority, (.reject_reason // "admitted")] | @tsv' caddy.log | sort | uniq -c
+jq -rR 'fromjson? | select(.msg == "admission_decision")
+        | [.backend, .priority, (.reject_reason // "admitted")] | @tsv' caddy.log | sort | uniq -c
 ```
 
 A growing share of `priority true` among admitted requests, together with `priority false`
