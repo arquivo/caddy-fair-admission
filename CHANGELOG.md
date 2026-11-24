@@ -1,3 +1,9 @@
+## [3.6.0](https://github.com/arquivo/caddy-fair-admission/compare/v3.5.2...v3.6.0) (2026-11-24)
+
+### Features
+
+* **fairness:** serve clients in priority_network first ([d7c7958](https://github.com/arquivo/caddy-fair-admission/commit/d7c795804cedaa571f2fe39cd90839c4afff5f31)), closes [#18](https://github.com/arquivo/caddy-fair-admission/issues/18), references [arquivo/pwa-technologies#1602](https://github.com/arquivo/pwa-technologies/issues/1602)
+
 ## [3.5.2](https://github.com/arquivo/caddy-fair-admission/compare/v3.5.1...v3.5.2) (2026-11-23)
 
 ### Bug Fixes
