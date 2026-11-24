@@ -26,7 +26,8 @@ const (
 	UserClassResearcher UserClass = "researcher"
 	// UserClassServiceAccount is an authenticated, verified service account.
 	UserClassServiceAccount UserClass = "service_account"
-	// UserClassInternal is an authenticated, verified internal caller.
+	// UserClassInternal is an authenticated, verified internal caller, or a
+	// client in a priority_network without a verified JWT class.
 	UserClassInternal UserClass = "internal"
 	// UserClassUnknown is a bearer token that was present but could not be
 	// verified (bad signature, expired, JWKS unreachable, wrong
@@ -82,6 +83,10 @@ type Classification struct {
 	// This identifies the *target* of the request, not the requester — it
 	// is still identity/context, not a behavior signal.
 	ArchivedDomain string
+	// Priority is true when the client IP is in one of the block's
+	// priority_network prefixes; adaptive_admission then queues the
+	// request in its priority tier.
+	Priority bool
 }
 
 // bucketIPv4 returns the IPv4 /24 CIDR bucket string for ip, or "" if ip is
@@ -168,6 +173,12 @@ func extractArchivedDomain(re *regexp.Regexp, path string) string {
 // instance. geo and auth may be nil (GeoIP/auth not configured on this
 // block); both fail open per REQUIREMENTS.md §4.2. archivedDomainRe may be
 // nil (archived_domain_regex not configured on this block); also fail open.
+//
+// A client IP in cfg.PriorityNetworks sets Priority and, unless a verified
+// JWT already gave it a trusted class (researcher/service_account/internal),
+// classifies it as internal. That runs before applySession, which leaves a
+// trusted class alone, so the network also beats a session cookie and an
+// unverifiable token (unknown).
 func classify(cfg *Config, geo *geoLookup, auth *verifier, archivedDomainRe *regexp.Regexp, ip net.IP, r *http.Request) Classification {
 	var c Classification
 
@@ -182,6 +193,12 @@ func classify(cfg *Config, geo *geoLookup, auth *verifier, archivedDomainRe *reg
 
 	c.ASN, c.Country = geo.lookup(ip)
 	c.UserClass, c.UserID = authenticate(auth, r)
+	if inNetworks(cfg.PriorityNetworks, ip) {
+		c.Priority = true
+		if !validClaimedUserClasses[c.UserClass] {
+			c.UserClass = UserClassInternal
+		}
+	}
 	c.ArchivedDomain = extractArchivedDomain(archivedDomainRe, r.URL.Path)
 
 	return c

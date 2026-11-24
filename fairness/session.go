@@ -294,11 +294,12 @@ func (sc *sessionCookies) maybeIssue(w http.ResponseWriter, s sessionRead) sessi
 }
 
 // applySession folds a checked session cookie into c (only called on
-// checking blocks). A JWT-verified trusted class always wins over the
-// cookie. Otherwise a valid cookie upgrades the request to
-// UserClassHumanVerified with the session's random-id as its UserID (the
-// `user` penalty key), and a forged/expired one downgrades anonymous to
-// unknown — same base score by default, so no gain and no penalty.
+// checking blocks). A trusted class (JWT-verified, or internal from a
+// priority_network, see classify) always wins over the cookie. Otherwise a
+// valid cookie upgrades the request to UserClassHumanVerified with the
+// session's random-id as its UserID (the `user` penalty key), and a
+// forged/expired one downgrades anonymous to unknown — same base score by
+// default, so no gain and no penalty.
 func applySession(c *Classification, s sessionRead) {
 	if validClaimedUserClasses[c.UserClass] {
 		return

@@ -30,6 +30,7 @@ across blocks with Caddy's native `import`/named-snippet mechanism. See
 | `idle_entry_ttl <duration>` | 1 | `10m` | Entities with no traffic for longer than this are garbage-collected. Swept by a fixed, non-configurable 1-minute ticker; reclaimed strictly when idle time is `>` the TTL, not `>=`. |
 | `scoring { ... }` | sub-block | absent, or with no `penalty` lines → no dimensions active | See §1.1. |
 | `session_cookie { ... }` | sub-block | absent (cookie neither issued nor checked) | Signed human-session cookie, see §10. |
+| `priority_network <cidr\|ip>...` | 1+, or a block; repeatable | unset | Clients in these networks are classified `internal` and served before all other requests by `adaptive_admission`, see §11. |
 
 Any unrecognized top-level token is a Caddyfile parse error
 (`unrecognized fairness subdirective '%s'`).
@@ -215,7 +216,7 @@ under-react to a genuinely abusive ASN and need a backend-level override.
 |---|---|---|
 | `researcher` | JWT-verified, trusted | 100 |
 | `service_account` | JWT-verified, trusted | 100 |
-| `internal` | JWT-verified, trusted | 100 |
+| `internal` | JWT-verified, trusted, or a client in a `priority_network` (§11) | 100 |
 | `anonymous` | no bearer token presented | 60 |
 | `unknown` | token presented but unverifiable (e.g. JWKS unreachable, bad signature), or a forged/expired session cookie (§10) | 60 |
 | `human_verified` | valid session cookie on a checking block (§10) — a browser that recently went through a human-facing route | 80 |
@@ -226,9 +227,13 @@ class itself, only into the score via the 7 dimensions above. `unknown` delibera
 of bad intent (it may just mean the JWKS endpoint is temporarily unreachable — a fail-open
 condition), so it isn't trusted *less* than presenting no token at all.
 
-Precedence when both signals are present: a JWT-verified trusted class (`researcher`,
-`service_account`, `internal`) always wins over the session cookie; otherwise a valid cookie gives
-`human_verified`, and a forged/expired cookie gives `unknown`.
+Precedence when several signals are present:
+
+1. a JWT-verified trusted class (`researcher`, `service_account`, `internal`) always wins;
+2. otherwise a client in a `priority_network` (§11) is `internal`, even with an unverifiable token
+   or a forged/expired session cookie: the address is a stronger signal than either;
+3. otherwise a valid session cookie gives `human_verified`, and a forged/expired one gives `unknown`;
+4. otherwise `anonymous` (no token) or `unknown` (an unverifiable token).
 
 ## 5. Exempt countries
 
@@ -390,6 +395,11 @@ The priority queue orders tickets by **score descending**, then **arrival order 
 equal scores — a higher-scored request is always served first, but two requests with the same
 score are served in the order they arrived.
 
+**Priority tier.** Requests that `fairness` flagged with `priority_network` (§11) form a tier served
+before every other request, whatever their scores or aging. Everything below — score order,
+aging, ties — applies within each tier. Capacity is shared: a priority request still waits for a
+free slot under the same concurrency limit.
+
 **Aging (`queue_aging_rate`).** Strict score order lets a lower-scored request wait for as long as
 higher-scored ones keep arriving — a 2026-11-13 load test on a broker left a penalised client
 (score 50) with nothing served for over 30s while lighter clients (score 60) ran. With a rate `r`,
@@ -458,13 +468,15 @@ wrapping in `route { }` still works and is sometimes clearer). The two modules n
 other's Go internals — the only coupling is Caddy's own `caddyhttp.SetVar`/`GetVar` request-scoped
 variable mechanism:
 
-- `fairness` writes the computed score under a `fairness_score` variable.
+- `fairness` writes the computed score under a `fairness_score` variable, and whether the client is
+  in a `priority_network` (§11) under a `fairness_priority` variable (`bool`).
 - `adaptive_admission` reads it via `GetVar`; if `fairness` wasn't chained ahead at all (or the
   variable isn't a `float64` for any reason), it falls back to a neutral score of `0` — every
   request hitting this fallback is treated identically, neither privileged nor penalized, rather
-  than causing an error.
+  than causing an error. Likewise, `adaptive_admission` queues a request in the priority tier only
+  when `fairness_priority` is `true`.
 - `fairness` also writes a `fairness_log_fields` variable (IP, ASN, country, user class, exemption
-  flag, per-dimension score breakdown) that `adaptive_admission` folds into its own structured log
+  and priority flags, per-dimension score breakdown) that `adaptive_admission` folds into its own structured log
   line — `fairness` never logs a request on its own (see [`monitoring.md`](monitoring.md)).
 
 ## 9. Example: Keycloak as the JWT issuer (researcher queue priority)
@@ -589,3 +601,84 @@ is purely a Caddyfile concern. See
 **Rollout.** Start in observation mode with `base_score human_verified 60` (equal to `anonymous`).
 Compare `fairness_session_cookies_total` and the per-class `fairness_score_distribution` /
 admission log lines (see [`monitoring.md`](monitoring.md)), then raise the score.
+
+## 11. Priority networks: `priority_network`
+
+The deployment's own services (a screenshot renderer, a search API, health-check scripts) often
+reach the protected backends through the same proxy as the public, with no token or cookie. Without
+this directive they're `anonymous`, and one service loading a page with hundreds of resources is
+penalized like any heavy client. `priority_network` lists the networks those services run in:
+
+```caddyfile
+priority_network <cidr|ip>...     # repeatable; the lists accumulate
+priority_network {
+    <cidr|ip>...                  # any number per line, e.g. from an imported snippet
+}
+```
+
+Each value is a CIDR prefix (`192.0.2.0/24`, `2001:db8::/32`) or a bare IP, taken as `/32` or
+`/128` like Caddy's `client_ip` matcher (an IPv6 zone on a bare IP is ignored, as there). An
+invalid value is a Caddyfile parse error, and so is a
+prefix with host bits set (`192.0.2.7/24`), an IPv4-mapped IPv6 prefix, or a `/0`; in JSON config,
+the same checks fail the config load. The block form lets one snippet hold the list:
+
+```caddyfile
+(local_networks) {
+	127.0.0.1 ::1
+	172.17.0.0/16 192.168.10.0/24
+}
+
+fairness {
+	priority_network {
+		import local_networks
+	}
+}
+```
+
+A request from one of these networks:
+
+- **is classified `internal`** and starts from `base_score internal` (default 100), unless a
+  verified JWT gave it a trusted class (§4 precedence). Its `user_class` in logs and the
+  `fairness_score_distribution` metric is `internal`. It has no user ID, so the `user` dimension
+  doesn't track it, unless it sent a validly signed token without a trusted class, whose subject
+  is kept;
+- **is served before every other request** by `adaptive_admission` (§7's priority tier), whatever
+  its score and however long other requests have waited. A JWT-verified client in the network
+  keeps its class and still gets the tier;
+- **is still tracked and penalized** on every enabled dimension. Among priority requests, a
+  service that floods sinks behind the others, but it stays ahead of all non-priority traffic.
+
+**Matching uses the resolved client IP**, the same `{client_ip}` Caddy computes from
+`trusted_proxies`, never a forwarded header read by this module. An IPv4-mapped IPv6 client address
+is matched as IPv4, and a request whose IP can't be resolved never matches. Behind a proxy:
+
+- **Set both `trusted_proxies` and `trusted_proxies_strict`** in the `servers` global options. Without
+  `trusted_proxies`, every client resolves to the proxy's address. Without `trusted_proxies_strict`,
+  Caddy takes the *left-most* `X-Forwarded-For` entry, which a client can write itself when the
+  proxy appends to the header instead of replacing it. Strict mode reads the header from the right
+  and takes the first address that isn't a trusted proxy: the one the proxy saw.
+- **Make the proxy set or strip every header in `client_ip_headers`** (`X-Forwarded-For` by
+  default) on every route to Caddy, appending to it or overwriting it. Strict mode takes the
+  right-most untrusted address, so a header the proxy passes through unchanged is entirely the
+  client's.
+- **Keep trusted addresses out of every `priority_network`.** A request from the proxy without a
+  forwarded address (e.g. its own health checks) resolves to the proxy's address, and would get the
+  priority. Strict mode also skips trusted addresses, so a service whose address is trusted can
+  resolve to another one. If the proxy runs in the same container network as the services, list the
+  services' addresses or narrower subnets instead of the whole network.
+
+**The tier can starve other traffic.** It is strict priority, with no share cap: while priority
+demand fills the concurrency limit, other requests wait, and may time out or be evicted from the
+queue. The concurrency limit itself still holds, so backends are protected. A service that works
+on behalf of public users (a screenshot renderer, a search API) turns their demand into priority
+traffic, multiplied by its fan-out (e.g. every resource of a rendered page): rate-limit it at its
+own public entry point. Health checks in the tier are served first too, so they keep passing while
+public traffic is starved; measure public admission with a probe that isn't listed. The
+`admission_decision` log's `priority` field shows how much of the traffic is in the tier (see
+[`monitoring.md`](monitoring.md)).
+
+**Pair it with `queue_full_policy evict_lowest` and `queue_wait_projection ahead`** (§6, §7). With
+them, a priority request at a full queue takes the place of the last non-priority request, and its
+projected wait counts only the priority requests ahead of it, so it's refused only when priority
+requests alone fill the queue. With the defaults (`reject_new`, `all`), a full or deep queue still
+refuses it.

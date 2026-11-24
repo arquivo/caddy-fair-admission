@@ -41,11 +41,11 @@ func TestScheduler_AcquireBeforePop_HigherScoreArrivingLaterWinsOverEarlierLower
 	s.Start()
 	defer s.Stop()
 
-	low, reason := s.Enqueue(1)
+	low, reason := s.Enqueue(1, false)
 	if reason != RejectNone {
 		t.Fatalf("Enqueue(low) rejected: %v", reason)
 	}
-	high, reason := s.Enqueue(10)
+	high, reason := s.Enqueue(10, false)
 	if reason != RejectNone {
 		t.Fatalf("Enqueue(high) rejected: %v", reason)
 	}
@@ -80,11 +80,11 @@ func TestScheduler_FIFOWithinEqualScore(t *testing.T) {
 	s.Start()
 	defer s.Stop()
 
-	first, reason := s.Enqueue(5)
+	first, reason := s.Enqueue(5, false)
 	if reason != RejectNone {
 		t.Fatalf("Enqueue(first) rejected: %v", reason)
 	}
-	second, reason := s.Enqueue(5)
+	second, reason := s.Enqueue(5, false)
 	if reason != RejectNone {
 		t.Fatalf("Enqueue(second) rejected: %v", reason)
 	}
@@ -113,13 +113,13 @@ func TestScheduler_RejectsQueueFull(t *testing.T) {
 	// Enqueue's synchronous depth check.
 	s := NewScheduler(QueueConfig{MaxSize: 2}, c)
 
-	if _, reason := s.Enqueue(1); reason != RejectNone {
+	if _, reason := s.Enqueue(1, false); reason != RejectNone {
 		t.Fatalf("1st Enqueue rejected: %v", reason)
 	}
-	if _, reason := s.Enqueue(1); reason != RejectNone {
+	if _, reason := s.Enqueue(1, false); reason != RejectNone {
 		t.Fatalf("2nd Enqueue rejected: %v", reason)
 	}
-	if _, reason := s.Enqueue(1); reason != RejectQueueFull {
+	if _, reason := s.Enqueue(1, false); reason != RejectQueueFull {
 		t.Fatalf("3rd Enqueue reason = %v, want RejectQueueFull", reason)
 	}
 }
@@ -138,11 +138,11 @@ func TestScheduler_RejectsQueueWaitExceeded(t *testing.T) {
 	s := NewScheduler(QueueConfig{MaxSize: 100, WaitTimeout: 350 * time.Millisecond}, c)
 
 	for i := 0; i < 4; i++ {
-		if _, reason := s.Enqueue(1); reason != RejectNone {
+		if _, reason := s.Enqueue(1, false); reason != RejectNone {
 			t.Fatalf("Enqueue #%d rejected: %v (depth-%d projected wait should not exceed timeout yet)", i, reason, i)
 		}
 	}
-	if _, reason := s.Enqueue(1); reason != RejectQueueWaitExceeded {
+	if _, reason := s.Enqueue(1, false); reason != RejectQueueWaitExceeded {
 		t.Fatalf("Enqueue at depth 4 reason = %v, want RejectQueueWaitExceeded", reason)
 	}
 }
@@ -156,7 +156,7 @@ func TestScheduler_NoRejectionWithoutLatencyData(t *testing.T) {
 
 	s := NewScheduler(QueueConfig{MaxSize: 100, WaitTimeout: time.Nanosecond}, c)
 	for i := 0; i < 10; i++ {
-		if _, reason := s.Enqueue(1); reason != RejectNone {
+		if _, reason := s.Enqueue(1, false); reason != RejectNone {
 			t.Fatalf("Enqueue #%d rejected (%v) despite no latency data yet", i, reason)
 		}
 	}
@@ -185,7 +185,7 @@ func TestScheduler_ConcurrentLoad_NeverExceedsLimitAndServesEverything(t *testin
 			defer wg.Done()
 			for i := 0; i < iterationsEach; i++ {
 				score := float64((seed + i) % 7)
-				tk, reason := s.Enqueue(score)
+				tk, reason := s.Enqueue(score, false)
 				if reason != RejectNone {
 					t.Errorf("unexpected rejection under bounded load: %v", reason)
 					return
@@ -235,7 +235,7 @@ func TestScheduler_Stop_ReleasesUnusedCapacityAndDrainsQueuedTickets(t *testing.
 	s := NewScheduler(QueueConfig{MaxSize: 10}, c)
 	s.Start()
 
-	tk, reason := s.Enqueue(1)
+	tk, reason := s.Enqueue(1, false)
 	if reason != RejectNone {
 		t.Fatalf("Enqueue rejected: %v", reason)
 	}
@@ -256,7 +256,7 @@ func TestScheduler_InFlightAboveShrunkLimit_AdmitsAgainOnceDrained(t *testing.T)
 
 	const admitted = 6
 	for i := 0; i < admitted; i++ {
-		tk, reason := s.Enqueue(1)
+		tk, reason := s.Enqueue(1, false)
 		if reason != RejectNone {
 			t.Fatalf("Enqueue %d rejected: %v", i, reason)
 		}
@@ -270,9 +270,9 @@ func TestScheduler_InFlightAboveShrunkLimit_AdmitsAgainOnceDrained(t *testing.T)
 
 	// The dispatch loop already holds its lookahead reservation, so one more
 	// ticket goes through; the next one has to wait for the drain.
-	lookahead, _ := s.Enqueue(1)
+	lookahead, _ := s.Enqueue(1, false)
 	mustGrantWithin(t, lookahead, time.Second, "lookahead ticket never granted")
-	queued, _ := s.Enqueue(1)
+	queued, _ := s.Enqueue(1, false)
 
 	inFlight := admitted + 1
 	for inFlight > 2 {
@@ -368,9 +368,9 @@ func TestScheduler_Aging_LongWaitingLowerScoreOvertakesFresherHigherScore(t *tes
 			s.Start()
 			defer s.Stop()
 
-			low, _ := s.Enqueue(50)
+			low, _ := s.Enqueue(50, false)
 			clock.set(tc.highArrival, s.epoch)
-			high, _ := s.Enqueue(60)
+			high, _ := s.Enqueue(60, false)
 
 			first, second := high, low
 			if tc.wantFirst == "low" {
@@ -398,7 +398,7 @@ func grantsBeforeLowScoreServed(t *testing.T, agingRate float64, maxRounds int) 
 	s, clock := newSchedulerWithClock(QueueConfig{MaxSize: 10, AgingRate: agingRate}, c)
 	s.Start()
 
-	low, _ := s.Enqueue(50)
+	low, _ := s.Enqueue(50, false)
 	var pending *Ticket
 	defer func() {
 		// Withdraw whatever is still queued, then free the held slot so the
@@ -416,7 +416,7 @@ func grantsBeforeLowScoreServed(t *testing.T, agingRate float64, maxRounds int) 
 
 	for round := 1; round <= maxRounds; round++ {
 		clock.set(time.Duration(round)*100*time.Millisecond, s.epoch)
-		high, _ := s.Enqueue(60)
+		high, _ := s.Enqueue(60, false)
 		pending = high
 		c.Release(1, time.Millisecond, 200, false)
 		select {
@@ -455,7 +455,7 @@ func TestScheduler_Wait_DeadlineRejectsAndRemovesTicket(t *testing.T) {
 	s := NewScheduler(QueueConfig{MaxSize: 10, WaitTimeout: 50 * time.Millisecond}, c)
 	s.Start()
 
-	tk, reason := s.Enqueue(1)
+	tk, reason := s.Enqueue(1, false)
 	if reason != RejectNone {
 		t.Fatalf("Enqueue rejected: %v", reason)
 	}
@@ -472,7 +472,7 @@ func TestScheduler_Wait_DeadlineRejectsAndRemovesTicket(t *testing.T) {
 	mustNotGrantWithin(t, tk, 20*time.Millisecond, "timed-out ticket was granted")
 
 	// The freed slot must go to the next ticket, not to the removed one.
-	next, _ := s.Enqueue(1)
+	next, _ := s.Enqueue(1, false)
 	c.Release(1, time.Millisecond, 200, false)
 	if got := s.Wait(context.Background(), next); got != RejectNone {
 		t.Fatalf("Wait(next) = %v, want RejectNone", got)
@@ -490,7 +490,7 @@ func TestScheduler_Wait_ClientGoneWhileQueuedRemovesTicketWithoutLeakingCapacity
 	s := NewScheduler(QueueConfig{MaxSize: 10}, c)
 	s.Start()
 
-	tk, _ := s.Enqueue(1)
+	tk, _ := s.Enqueue(1, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(20*time.Millisecond, cancel)
 	if got := s.Wait(ctx, tk); got != RejectClientGone {
@@ -515,7 +515,7 @@ func TestScheduler_Wait_ClientGoneAfterGrantReleasesCapacityUnused(t *testing.T)
 	s := NewScheduler(QueueConfig{MaxSize: 10}, c)
 	s.Start()
 
-	tk, _ := s.Enqueue(1)
+	tk, _ := s.Enqueue(1, false)
 	mustGrantWithin(t, tk, time.Second, "ticket never granted with free capacity")
 	if s.Cancel(tk) {
 		t.Fatal("Cancel of an already-granted ticket returned true")
@@ -567,7 +567,7 @@ func raceWaits(t *testing.T, cfg QueueConfig, limit int) raceOutcomes {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(seed))
 			for i := 0; i < iterationsEach; i++ {
-				tk, reason := s.Enqueue(float64(rng.Intn(100)))
+				tk, reason := s.Enqueue(float64(rng.Intn(100)), false)
 				if reason != RejectNone {
 					atomic.AddInt64(&out.rejected, 1)
 					continue
@@ -650,7 +650,7 @@ func enqueueAll(t *testing.T, s *Scheduler, scores ...float64) []*Ticket {
 	t.Helper()
 	tickets := make([]*Ticket, len(scores))
 	for i, score := range scores {
-		tk, reason := s.Enqueue(score)
+		tk, reason := s.Enqueue(score, false)
 		if reason != RejectNone {
 			t.Fatalf("Enqueue(%v) rejected: %v", score, reason)
 		}
@@ -665,7 +665,7 @@ func TestScheduler_EvictLowest_BetterArrivalEvictsLastTicket(t *testing.T) {
 	s := NewScheduler(QueueConfig{MaxSize: 3, EvictLowest: true}, NewFixedController(1))
 	queued := enqueueAll(t, s, 5, 1, 3)
 
-	if _, reason := s.Enqueue(2); reason != RejectNone {
+	if _, reason := s.Enqueue(2, false); reason != RejectNone {
 		t.Fatalf("Enqueue(2) on a full queue = %v, want it to evict the score-1 ticket", reason)
 	}
 	for i, tk := range queued {
@@ -687,7 +687,7 @@ func TestScheduler_EvictLowest_ArrivalNotBetterThanLastIsRejected(t *testing.T) 
 			s := NewScheduler(QueueConfig{MaxSize: 2, EvictLowest: true}, NewFixedController(1))
 			queued := enqueueAll(t, s, 5, 1)
 			// Equal to the last ticket's key loses on arrival order (FIFO).
-			if _, reason := s.Enqueue(score); reason != RejectQueueFull {
+			if _, reason := s.Enqueue(score, false); reason != RejectQueueFull {
 				t.Fatalf("Enqueue(%v) = %v, want RejectQueueFull", score, reason)
 			}
 			for _, tk := range queued {
@@ -702,7 +702,7 @@ func TestScheduler_EvictLowest_ArrivalNotBetterThanLastIsRejected(t *testing.T) 
 func TestScheduler_EvictLowest_NewestOfEqualLastKeysIsEvicted(t *testing.T) {
 	s := NewScheduler(QueueConfig{MaxSize: 4, EvictLowest: true}, NewFixedController(1))
 	queued := enqueueAll(t, s, 1, 5, 1, 1)
-	if _, reason := s.Enqueue(2); reason != RejectNone {
+	if _, reason := s.Enqueue(2, false); reason != RejectNone {
 		t.Fatalf("Enqueue(2) = %v, want RejectNone", reason)
 	}
 	for i, tk := range queued {
@@ -720,7 +720,7 @@ func TestScheduler_EvictLowest_ComparesAgedKeysNotScores(t *testing.T) {
 	clock.set(3*time.Second, s.epoch)
 	fresh := enqueueAll(t, s, 60)[0]
 
-	if _, reason := s.Enqueue(61); reason != RejectNone {
+	if _, reason := s.Enqueue(61, false); reason != RejectNone {
 		t.Fatalf("Enqueue(61) = %v, want RejectNone", reason)
 	}
 	if old.wasEvicted() || !fresh.wasEvicted() {
@@ -737,7 +737,7 @@ func TestScheduler_EvictLowest_WaitExceededArrivalEvictsNothing(t *testing.T) {
 	// projected 200ms wait, over the 150ms timeout.
 	fillWindow(c, 5, 100*time.Millisecond, false, false)
 
-	if _, reason := s.Enqueue(2); reason != RejectQueueWaitExceeded {
+	if _, reason := s.Enqueue(2, false); reason != RejectQueueWaitExceeded {
 		t.Fatalf("Enqueue(2) = %v, want RejectQueueWaitExceeded", reason)
 	}
 	if queued[2].wasEvicted() || s.Depth() != 3 {
@@ -753,7 +753,7 @@ func TestScheduler_EvictLowest_AllProjectionDoesNotCountTheVictim(t *testing.T) 
 	// timeout. Counting the victim too would project 300ms.
 	fillWindow(c, 5, 100*time.Millisecond, false, false)
 
-	if _, reason := s.Enqueue(2); reason != RejectNone {
+	if _, reason := s.Enqueue(2, false); reason != RejectNone {
 		t.Fatalf("Enqueue(2) = %v, want RejectNone", reason)
 	}
 	if !queued[2].wasEvicted() {
@@ -780,10 +780,10 @@ func TestScheduler_ProjectAhead_HighScoreJoinsDeepLowScoreQueue(t *testing.T) {
 			s := NewScheduler(QueueConfig{MaxSize: 100, WaitTimeout: 350 * time.Millisecond, ProjectAhead: tc.projectAhead}, c)
 			enqueueAll(t, s, 1, 1, 1, 1)
 
-			if _, reason := s.Enqueue(10); reason != tc.wantHigh {
+			if _, reason := s.Enqueue(10, false); reason != tc.wantHigh {
 				t.Errorf("Enqueue(10) behind 4 low scores = %v, want %v", reason, tc.wantHigh)
 			}
-			if _, reason := s.Enqueue(1); reason != RejectQueueWaitExceeded {
+			if _, reason := s.Enqueue(1, false); reason != RejectQueueWaitExceeded {
 				t.Errorf("Enqueue(1) behind 4+ tickets = %v, want RejectQueueWaitExceeded", reason)
 			}
 		})
@@ -797,8 +797,90 @@ func TestScheduler_ProjectAhead_CountsEqualKeysAsAhead(t *testing.T) {
 	// The third score-5 ticket joined behind the other two (200ms); a
 	// fourth would be behind three (300ms). The score-1 ticket never counts.
 	enqueueAll(t, s, 1, 5, 5, 5)
-	if _, reason := s.Enqueue(5); reason != RejectQueueWaitExceeded {
+	if _, reason := s.Enqueue(5, false); reason != RejectQueueWaitExceeded {
 		t.Errorf("Enqueue(5) behind 3 score-5 tickets = %v, want RejectQueueWaitExceeded", reason)
+	}
+}
+
+// --- priority tier -----------------------------------------------------------
+
+func TestScheduler_Priority_ServedBeforeHigherScoresAndAging(t *testing.T) {
+	c := NewFixedController(1)
+	c.Acquire(1)
+	// Rate 5/s over 60s: the score-90 ticket's aged key is 390 points above
+	// a fresh score 0, so only the tier can put priority tickets ahead of it.
+	s, clock := newSchedulerWithClock(QueueConfig{MaxSize: 10, AgingRate: 5}, c)
+	s.Start()
+	defer s.Stop()
+
+	public, _ := s.Enqueue(90, false)
+	clock.set(60*time.Second, s.epoch)
+	lowPriority, _ := s.Enqueue(0, true)
+	highPriority, _ := s.Enqueue(50, true)
+
+	for _, step := range []struct {
+		tk   *Ticket
+		name string
+	}{{highPriority, "score-50 priority"}, {lowPriority, "score-0 priority"}, {public, "score-90 non-priority"}} {
+		c.Release(1, time.Millisecond, 200, false)
+		mustGrantWithin(t, step.tk, time.Second, step.name+" ticket not granted next")
+	}
+	c.Release(1, time.Millisecond, 200, false)
+}
+
+func TestScheduler_Priority_FullQueue(t *testing.T) {
+	t.Run("priority arrival evicts the last non-priority ticket", func(t *testing.T) {
+		s := NewScheduler(QueueConfig{MaxSize: 2, EvictLowest: true}, NewFixedController(1))
+		queued := enqueueAll(t, s, 100, 100)
+		if _, reason := s.Enqueue(0, true); reason != RejectNone {
+			t.Fatalf("Enqueue(0, priority) = %v, want RejectNone", reason)
+		}
+		if queued[0].wasEvicted() || !queued[1].wasEvicted() {
+			t.Errorf("evicted: first = %v, second = %v; want false, true", queued[0].wasEvicted(), queued[1].wasEvicted())
+		}
+	})
+	t.Run("non-priority arrival never evicts a priority ticket", func(t *testing.T) {
+		s := NewScheduler(QueueConfig{MaxSize: 1, EvictLowest: true}, NewFixedController(1))
+		queued, _ := s.Enqueue(0, true)
+		if _, reason := s.Enqueue(100, false); reason != RejectQueueFull {
+			t.Fatalf("Enqueue(100) = %v, want RejectQueueFull", reason)
+		}
+		if queued.wasEvicted() {
+			t.Error("priority ticket evicted")
+		}
+	})
+	t.Run("reject_new still refuses a priority arrival", func(t *testing.T) {
+		s := NewScheduler(QueueConfig{MaxSize: 1}, NewFixedController(1))
+		enqueueAll(t, s, 1)
+		if _, reason := s.Enqueue(1, true); reason != RejectQueueFull {
+			t.Fatalf("Enqueue(1, priority) = %v, want RejectQueueFull", reason)
+		}
+	})
+}
+
+func TestScheduler_Priority_ProjectAheadCountsOnlyPriorityTickets(t *testing.T) {
+	for _, tc := range []struct {
+		projectAhead bool
+		want         RejectReason
+	}{
+		{false, RejectQueueWaitExceeded},
+		{true, RejectNone},
+	} {
+		t.Run(fmt.Sprintf("ProjectAhead=%v", tc.projectAhead), func(t *testing.T) {
+			c := NewFixedController(1)
+			s := NewScheduler(QueueConfig{MaxSize: 100, WaitTimeout: 350 * time.Millisecond, ProjectAhead: tc.projectAhead}, c)
+			// Filled before any latency data, so nothing is projected yet.
+			enqueueAll(t, s, 100, 100, 100)
+			if _, reason := s.Enqueue(0, true); reason != RejectNone {
+				t.Fatalf("first priority Enqueue = %v, want RejectNone", reason)
+			}
+			// The whole queue is a 400ms wait, over the 350ms timeout; the
+			// one priority ticket ahead is only 100ms.
+			fillWindow(c, 5, 100*time.Millisecond, false, false)
+			if _, reason := s.Enqueue(0, true); reason != tc.want {
+				t.Errorf("Enqueue(0, priority) behind a deep non-priority queue = %v, want %v", reason, tc.want)
+			}
+		})
 	}
 }
 
@@ -810,23 +892,25 @@ func TestTicketHeap_LastAndCountAhead(t *testing.T) {
 		var h ticketHeap
 		n := 1 + rng.Intn(50)
 		for i := 0; i < n; i++ {
-			heap.Push(&h, &Ticket{key: float64(rng.Intn(10)), seq: uint64(i)})
+			heap.Push(&h, &Ticket{key: float64(rng.Intn(10)), Priority: rng.Intn(4) == 0, seq: uint64(i)})
 		}
 		sorted := append([]*Ticket(nil), h...)
 		sort.Slice(sorted, func(i, j int) bool { return ticketHeap(sorted).Less(i, j) })
 
 		if got, want := h.last(), sorted[n-1]; got != want {
-			t.Fatalf("round %d: last() = key %v seq %d, want key %v seq %d", round, got.key, got.seq, want.key, want.seq)
+			t.Fatalf("round %d: last() = key %v priority %v seq %d, want key %v priority %v seq %d", round, got.key, got.Priority, got.seq, want.key, want.Priority, want.seq)
 		}
-		for key := -1.0; key <= 10; key++ {
-			want := 0
-			for _, tk := range sorted {
-				if tk.key >= key {
-					want++
+		for _, priority := range []bool{false, true} {
+			for key := -1.0; key <= 10; key++ {
+				want := 0
+				for _, tk := range sorted {
+					if (tk.Priority && !priority) || (tk.Priority == priority && tk.key >= key) {
+						want++
+					}
 				}
-			}
-			if got := h.countAhead(key, 0); got != want {
-				t.Fatalf("round %d: countAhead(%v) = %d, want %d", round, key, got, want)
+				if got := h.countAhead(priority, key, 0); got != want {
+					t.Fatalf("round %d: countAhead(%v, %v) = %d, want %d", round, priority, key, got, want)
+				}
 			}
 		}
 	}
@@ -892,7 +976,7 @@ func BenchmarkTicketHeap_LastAndCountAhead(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				_ = h.last()
-				_ = h.countAhead(50, 0)
+				_ = h.countAhead(false, 50, 0)
 			}
 		})
 	}

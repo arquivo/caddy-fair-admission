@@ -46,6 +46,12 @@ const classificationVarKey = "fairness_classification"
 // string value is load-bearing, not just an internal convention.
 const fairnessScoreVarKey = "fairness_score"
 
+// priorityVarKey is the caddyhttp variable key this handler writes
+// Classification.Priority to (a bool), read by adaptive_admission to queue
+// the request in its priority tier. Like fairnessScoreVarKey, the string
+// value is load-bearing: adaptiveadmission mirrors it by value.
+const priorityVarKey = "fairness_priority"
+
 // logFieldsVarKey is the caddyhttp variable key this handler writes a
 // builtin-typed map of identity/score-breakdown fields to (§4.9), so
 // adaptive_admission can fold them into its single structured log line
@@ -116,6 +122,13 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // refinement). It also registers this instance with the App (app.go) so the
 // admin introspection API (admin.go, §4.10) can report its live state.
 func (h *Handler) Provision(ctx caddy.Context) error {
+	// The Caddyfile parser already validated these; JSON config hasn't been.
+	for _, p := range h.PriorityNetworks {
+		if err := validateNetwork(p); err != nil {
+			return fmt.Errorf("fairness: invalid priority_network: %v", err)
+		}
+	}
+
 	appIface, err := ctx.App("fairness")
 	if err != nil {
 		return err
@@ -309,6 +322,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		breakdown["final"] = score
 	}
 	caddyhttp.SetVar(r.Context(), fairnessScoreVarKey, score)
+	caddyhttp.SetVar(r.Context(), priorityVarKey, classification.Priority)
 
 	fairnessMetrics.scoreDistribution.WithLabelValues(backend, string(classification.UserClass)).Observe(score)
 
@@ -319,6 +333,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		"user_class":      string(classification.UserClass),
 		"archived_domain": classification.ArchivedDomain,
 		"exempt":          h.scoring.countryExempt(classification.Country),
+		"priority":        classification.Priority,
 		"score_breakdown": breakdown,
 	})
 
@@ -426,6 +441,13 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 				h.SessionCookie = sc
+
+			case "priority_network":
+				prefixes, err := parsePriorityNetworks(d)
+				if err != nil {
+					return err
+				}
+				h.PriorityNetworks = append(h.PriorityNetworks, prefixes...)
 
 			case "scoring":
 				overrides, err := parseScoringBlock(d)

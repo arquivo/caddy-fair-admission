@@ -4,7 +4,10 @@
 // A request is enqueued with its fairness score (higher score = served
 // first; arrival order breaks ties, and an optional aging rate lets a
 // long-waiting lower score overtake fresher higher ones — see Ticket.key),
-// then waits in Scheduler.Wait until it is granted, its queue_timeout
+// in the priority tier if fairness flagged it as a priority request
+// (priority_network): every priority ticket is served before every other
+// ticket, and score and aging only order tickets within a tier. It then
+// waits in Scheduler.Wait until it is granted, its queue_timeout
 // deadline passes, its client goes away, or (with QueueConfig.EvictLowest)
 // a better-placed arrival evicts it from a full queue. A single dispatch-loop
 // goroutine repeatedly acquires one unit of capacity from the Controller and
@@ -94,10 +97,14 @@ type QueueConfig struct {
 	ProjectAhead bool
 }
 
-// Ticket represents one request's place in the queue. Score is read-only
-// after creation; callers block on Granted() until the scheduler admits it.
+// Ticket represents one request's place in the queue. Score and Priority
+// are read-only after creation; callers block on Granted() until the
+// scheduler admits it.
 type Ticket struct {
 	Score float64
+	// Priority puts the ticket in the priority tier, served before every
+	// non-priority ticket.
+	Priority bool
 
 	// key is the heap's priority, higher first: Score minus AgingRate times
 	// the enqueue time in seconds since the Scheduler was created. Every
@@ -119,6 +126,16 @@ func (t *Ticket) Granted() <-chan struct{} {
 	return t.granted
 }
 
+// ahead reports whether t would be popped before a new ticket with the given
+// priority and key: a priority ticket comes before a non-priority one, and
+// within a tier the higher key comes first (on equal keys, t arrived first).
+func (t *Ticket) ahead(priority bool, key float64) bool {
+	if t.Priority != priority {
+		return t.Priority
+	}
+	return t.key >= key
+}
+
 // wasEvicted reports whether t was removed from the queue by an eviction.
 func (t *Ticket) wasEvicted() bool {
 	select {
@@ -129,13 +146,16 @@ func (t *Ticket) wasEvicted() bool {
 	}
 }
 
-// ticketHeap is a container/heap.Interface ordering by key descending, then
-// seq ascending (FIFO within equal keys) — heap.Pop always yields the
-// current highest-priority ticket.
+// ticketHeap is a container/heap.Interface ordering priority tickets first,
+// then by key descending, then seq ascending (FIFO within equal keys) —
+// heap.Pop always yields the current highest-priority ticket.
 type ticketHeap []*Ticket
 
 func (h ticketHeap) Len() int { return len(h) }
 func (h ticketHeap) Less(i, j int) bool {
+	if h[i].Priority != h[j].Priority {
+		return h[i].Priority
+	}
 	if h[i].key != h[j].key {
 		return h[i].key > h[j].key
 	}
@@ -161,10 +181,10 @@ func (h *ticketHeap) Pop() any {
 	return t
 }
 
-// last returns the ticket the heap would pop last (lowest key, newest among
-// equal keys); h must not be empty. Every parent comes before its children
-// in Less order, so that ticket has no children: only the leaves, the second
-// half of the slice, need scanning.
+// last returns the ticket the heap would pop last (lowest tier, then lowest
+// key, newest among equal keys); h must not be empty. Every parent comes
+// before its children in Less order, so that ticket has no children: only
+// the leaves, the second half of the slice, need scanning.
 func (h ticketHeap) last() *Ticket {
 	w := len(h) / 2
 	for i := w + 1; i < len(h); i++ {
@@ -176,16 +196,15 @@ func (h ticketHeap) last() *Ticket {
 }
 
 // countAhead returns how many tickets in the subtree rooted at i would be
-// popped before a new ticket with the given key: those with a key at least
-// as high (on equal keys, every queued ticket arrived first). A child's key
-// is never higher than its parent's, so a subtree whose root has a lower
-// key is skipped whole, and the walk only visits the tickets ahead plus
-// their direct children.
-func (h ticketHeap) countAhead(key float64, i int) int {
-	if i >= len(h) || h[i].key < key {
+// popped before a new ticket with the given priority and key (see
+// Ticket.ahead). A child is never ahead of its parent, so a subtree whose
+// root isn't ahead is skipped whole, and the walk only visits the tickets
+// ahead plus their direct children.
+func (h ticketHeap) countAhead(priority bool, key float64, i int) int {
+	if i >= len(h) || !h[i].ahead(priority, key) {
 		return 0
 	}
-	return 1 + h.countAhead(key, 2*i+1) + h.countAhead(key, 2*i+2)
+	return 1 + h.countAhead(priority, key, 2*i+1) + h.countAhead(priority, key, 2*i+2)
 }
 
 // Scheduler is a backend-scoped bounded priority queue paired with a
@@ -235,17 +254,17 @@ func (s *Scheduler) Stop() {
 	s.wg.Wait()
 }
 
-// Enqueue adds a ticket for score, or rejects it outright with a
-// RejectReason if the queue is already at QueueConfig.MaxSize or the
-// projected wait for a request joining right now already exceeds
-// QueueConfig.WaitTimeout.
+// Enqueue adds a ticket for score, in the priority tier if priority is set
+// (see the package doc), or rejects it outright with a RejectReason if the
+// queue is already at QueueConfig.MaxSize or the projected wait for a
+// request joining right now already exceeds QueueConfig.WaitTimeout.
 //
 // With QueueConfig.EvictLowest, a full queue only rejects the arrival if it
 // would not be served before the queue's last ticket; otherwise that last
 // ticket is removed (its Wait returns RejectEvicted) and the arrival takes
 // its place. Equal keys keep FIFO order, so an arrival never evicts a ticket
-// with the same key.
-func (s *Scheduler) Enqueue(score float64) (*Ticket, RejectReason) {
+// with the same key in the same tier.
+func (s *Scheduler) Enqueue(score float64, priority bool) (*Ticket, RejectReason) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -261,13 +280,13 @@ func (s *Scheduler) Enqueue(score float64) (*Ticket, RejectReason) {
 			return nil, RejectQueueFull
 		}
 		victim = s.pq.last()
-		if key <= victim.key {
+		if victim.ahead(priority, key) {
 			return nil, RejectQueueFull
 		}
 		depth--
 	}
 	if s.cfg.WaitTimeout > 0 {
-		if projected, ok := s.projectedWaitLocked(key, depth); ok && projected > s.cfg.WaitTimeout {
+		if projected, ok := s.projectedWaitLocked(priority, key, depth); ok && projected > s.cfg.WaitTimeout {
 			return nil, RejectQueueWaitExceeded
 		}
 	}
@@ -278,7 +297,7 @@ func (s *Scheduler) Enqueue(score float64) (*Ticket, RejectReason) {
 	}
 	s.seq++
 	t := &Ticket{
-		Score: score, key: key, seq: s.seq,
+		Score: score, Priority: priority, key: key, seq: s.seq,
 		granted: make(chan struct{}), evicted: make(chan struct{}),
 	}
 	heap.Push(&s.pq, t)
@@ -362,23 +381,23 @@ func (s *Scheduler) Depth() int {
 	return len(s.pq)
 }
 
-// projectedWaitLocked estimates the wait a request with the given key
-// joining the queue right now would face, Little's-law style (§4.5):
+// projectedWaitLocked estimates the wait a request with the given priority
+// and key joining the queue right now would face, Little's-law style (§4.5):
 // queued * mean_latency / concurrency_limit, where queued is depth, or with
 // QueueConfig.ProjectAhead the tickets that would be served before it.
 // ok=false when there isn't enough data yet to project anything (no
 // completed requests recorded, or a zero/negative limit) — callers must not
 // reject on an unknown projection, only on a computed one that actually
 // exceeds the timeout.
-func (s *Scheduler) projectedWaitLocked(key float64, depth int) (projected time.Duration, ok bool) {
+func (s *Scheduler) projectedWaitLocked(priority bool, key float64, depth int) (projected time.Duration, ok bool) {
 	limit := s.controller.Limit()
 	mean := s.controller.MeanLatency()
 	if limit <= 0 || mean <= 0 {
 		return 0, false
 	}
 	if s.cfg.ProjectAhead {
-		// An eviction victim has a lower key, so it's never counted here.
-		depth = s.pq.countAhead(key, 0)
+		// An eviction victim is never ahead, so it's never counted here.
+		depth = s.pq.countAhead(priority, key, 0)
 	}
 	return time.Duration(float64(depth) * float64(mean) / float64(limit)), true
 }

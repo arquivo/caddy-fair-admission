@@ -195,6 +195,12 @@ both.
   one process-wide config location. Each shared reader polls its file (`geoip_reload_interval`,
   default `1m`) and swaps in a replaced file once it has opened and validated, so a
   `geoipupdate` run is picked up without a Caddy reload.
+- Priority networks (`priority_network <cidr|ip>...`): a client whose resolved IP (Caddy's
+  `{client_ip}`, after `trusted_proxies`) is in one of the listed networks is classified
+  `internal` unless a verified JWT gave it a trusted class, and is flagged for `adaptive_admission`'s
+  priority tier (§4.5). For the deployment's own services, which send no token and would otherwise
+  be penalized as `anonymous`. Penalties still apply. Behind a proxy this requires
+  `trusted_proxies_strict` as well as `trusted_proxies`. See `docs/configuration.md` §11.
 
 ### 4.3 Scoring / penalties (`app/scoring.py`, `app/config.py`'s `ScoringConfig`) — EWMA-based, `fairness`
 
@@ -305,6 +311,9 @@ both.
 
 - Backend-scoped bounded priority queue, ordered by score (higher score served first) then arrival
   time (FIFO within same score).
+- Requests `fairness` flags as from a priority network (§4.2) form a priority tier, served before
+  every other request regardless of score or aging; the order above applies within each tier.
+  Capacity is shared: the tier changes only the order, never the concurrency limit.
 - Reject with 429 if the queue is full (`queue_max_size`) or if Little's-law-style projected wait
   (`queue_depth * mean_latency_ms / concurrency_limit`) already exceeds `queue_timeout_seconds` —
   distinguish these two rejection reasons in logs/metrics exactly as the Python system does

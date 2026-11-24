@@ -51,7 +51,8 @@ curl -s http://localhost:2019/fairness/status | jq .
         "ttl_seconds": 1800,
         "signing_kid": "k2",
         "kids": ["k1", "k2"]
-      }
+      },
+      "priority_networks": ["127.0.0.1/32", "192.0.2.0/24"]
     }
   ],
   "shared": {
@@ -91,6 +92,9 @@ curl -s http://localhost:2019/fairness/status | jq .
 - `session_cookie` is present only on backends with a `session_cookie { }` block
   ([`configuration.md`](configuration.md) §10). It reports key IDs only, never secrets or key file
   paths. `kids` is sorted; `signing_kid` is the first-listed key.
+- `priority_networks` is present only on backends with a `priority_network` directive
+  ([`configuration.md`](configuration.md) §11): every listed network as a CIDR string, in config
+  order, bare IPs shown as `/32` or `/128`.
 - `dimension_entry_counts` is the number of distinct tracked entities per dimension (e.g. distinct
   source IPs seen recently for `ip`), not an EWMA value — this is the discoverability signal used
   in [`scenarios.md`](scenarios.md)'s crawler example (an ASN with a disproportionately large `ip`
@@ -256,7 +260,9 @@ AS number, only present when GeoIP ASN lookup resolved), `country` (string, ISO 
 present when GeoIP city lookup resolved), `user_class` (string), `exempt` (bool, whether this
 request's country was on the `exempt_country` list of at least one *enabled* scoring dimension —
 `exempt_country` is configured per-dimension, see §5 of [`configuration.md`](configuration.md), so
-this field summarizes across all of them rather than naming which one), `score_breakdown` (object —
+this field summarizes across all of them rather than naming which one), `priority` (bool, whether
+the client is in a `priority_network`, so the request was queued in the priority tier — see §11 of
+[`configuration.md`](configuration.md)), `score_breakdown` (object —
 always has `base` and `final`; always has `total_penalty` after fairness has computed a score,
 present as `0` if no dimension contributed a penalty; and one `penalty_<dimension>` key per dimension
 that actually contributed a non-zero penalty this request, e.g. `penalty_asn` — dimensions
@@ -278,13 +284,14 @@ contributing `0` are omitted entirely rather than listed with a `0` value).
   "country": "PT",
   "user_class": "anonymous",
   "exempt": false,
+  "priority": false,
   "score_breakdown": { "base": 60, "total_penalty": 0, "final": 60 }
 }
 ```
 
 **Example — rejected request** (the low-and-slow crawler ASN from
-[`scenarios.md`](scenarios.md), after a tuned `penalty asn` override pushed it into the queue's
-lowest-priority tier and it lost the race against a full queue):
+[`scenarios.md`](scenarios.md), after a tuned `penalty asn` override pushed it to the back of the
+queue and it lost the race against a full queue):
 
 ```json
 {
@@ -298,6 +305,19 @@ lowest-priority tier and it lost the race against a full queue):
   "country": "SG",
   "user_class": "anonymous",
   "exempt": false,
+  "priority": false,
   "score_breakdown": { "base": 60, "penalty_asn": 10, "total_penalty": 10, "final": 50 }
 }
 ```
+
+**Watching the priority tier** ([`configuration.md`](configuration.md) §11). The metrics don't
+split priority from other traffic; the log line does. Count decisions by tier and outcome, e.g.
+from Caddy's JSON log:
+
+```sh
+jq -rR 'fromjson? | select(.msg == "admission_decision")
+        | [.backend, .priority, (.reject_reason // "admitted")] | @tsv' caddy.log | sort | uniq -c
+```
+
+A growing share of `priority true` among admitted requests, together with `priority false`
+requests rejected as `evicted` or `queue_timed_out`, means the tier is crowding out other traffic.

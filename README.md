@@ -23,7 +23,7 @@ Implemented and load-tested. Two independently importable Caddy modules:
 
 - [`docs/configuration.md`](docs/configuration.md) — the full Caddyfile reference for both
   modules: every directive, the `scoring { }` grammar, what EWMA/soft/hard penalties mean, user
-  classes, exempt countries, the adaptive controller's multiplier/cooldown table, queue semantics,
+  classes, priority networks, exempt countries, the adaptive controller's multiplier/cooldown table, queue semantics,
   and the `fairness`→`adaptive_admission` score hand-off.
 - [`docs/scenarios.md`](docs/scenarios.md) — two worked examples: a distributed low-and-slow
   crawler (spread across enough source IPs that per-IP rate limiting is blind to it) vs. a normal

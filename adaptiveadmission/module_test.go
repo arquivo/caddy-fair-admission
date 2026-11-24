@@ -74,7 +74,7 @@ func TestHandler_ServeHTTP_RejectsQueueFull_As429(t *testing.T) {
 	s := NewScheduler(QueueConfig{MaxSize: 1}, c)
 	// Fill the queue directly (depth 0 -> 1), without ever starting the
 	// dispatch loop -- mirrors queue_test.go's TestScheduler_RejectsQueueFull.
-	if _, reason := s.Enqueue(1); reason != RejectNone {
+	if _, reason := s.Enqueue(1, false); reason != RejectNone {
 		t.Fatalf("seed Enqueue rejected: %v", reason)
 	}
 
@@ -409,6 +409,56 @@ func TestHandler_ServeHTTP_PrioritizesHigherScoreUnderSaturation(t *testing.T) {
 
 	if len(dispatchOrder) != 2 || dispatchOrder[0] != "high" || dispatchOrder[1] != "low" {
 		t.Errorf("dispatch order = %v, want [high low]", dispatchOrder)
+	}
+}
+
+func TestHandler_ServeHTTP_PriorityVarQueuesAheadOfHigherScore(t *testing.T) {
+	c := NewFixedController(1)
+	c.Acquire(1) // hold the only slot so nothing dispatches until released
+	s := NewScheduler(QueueConfig{MaxSize: 10}, c)
+	s.Start()
+	defer func() {
+		c.Release(1, time.Millisecond, 200, false)
+		s.Stop()
+	}()
+
+	h := &Handler{controller: c, scheduler: s}
+	order := make(chan string, 2)
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		order <- r.Header.Get("X-Name")
+		return nil
+	})
+
+	highScore, lowScore := 100.0, 0.0
+	highReq := newVarsRequest(&highScore)
+	highReq.Header.Set("X-Name", "high")
+	priorityReq := newVarsRequest(&lowScore)
+	priorityReq.Header.Set("X-Name", "priority")
+	caddyhttp.SetVar(priorityReq.Context(), fairnessPriorityVarKey, true)
+
+	for _, req := range []*http.Request{highReq, priorityReq} {
+		go func() {
+			if err := h.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+				t.Errorf("ServeHTTP: %v", err)
+			}
+		}()
+	}
+	for deadline := time.Now().Add(time.Second); s.Depth() < 2; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("both requests never queued")
+		}
+	}
+	c.Release(1, time.Millisecond, 200, false)
+
+	for _, want := range []string{"priority", "high"} {
+		select {
+		case got := <-order:
+			if got != want {
+				t.Errorf("dispatched %q, want %q next", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s request never dispatched", want)
+		}
 	}
 }
 
