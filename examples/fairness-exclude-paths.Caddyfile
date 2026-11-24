@@ -1,0 +1,84 @@
+# Paths kept out of scoring and admission (docs/configuration.md §12).
+#
+# fairness only counts the requests that reach it: its per-dimension request
+# rates belong to that handler, not to the whole server. adaptive_admission
+# likewise only limits, queues and times the requests that reach it. A path
+# that skips both, such as /static/*, is never penalized, never takes a
+# concurrency slot, and never pulls the p95 latency the adaptive controller
+# steers by towards its own (usually much faster) response times.
+#
+# Both forms below use Caddy's own request matchers; neither module has a
+# path-exclusion directive of its own.
+#
+# Validate with:
+#   caddy validate --config examples/fairness-exclude-paths.Caddyfile --adapter caddyfile
+
+(shared_scoring) {
+	scoring {
+		base_score anonymous 60
+		penalty ip          alpha=0.2 soft=20:10  hard=100:40
+		penalty ipv4_subnet alpha=0.2 soft=100:10 hard=500:40
+	}
+}
+
+# Form A -- one backend serves everything, and a named matcher on both
+# directives sends only the dynamic paths through them. Every request still
+# reaches reverse_proxy.
+:8080 {
+	# `/static/*` needs something after the slash, so `/static` itself is
+	# listed too. Add any other prefix or file the same way.
+	@scored not path /static /static/* /favicon.ico /robots.txt
+
+	fairness @scored {
+		backend page-search-api
+		import shared_scoring
+	}
+
+	# Use the same matcher on both directives. A request that skips fairness
+	# but reaches adaptive_admission is still limited and queued, with the
+	# fallback score of 0 (docs/configuration.md §8): the default min_score,
+	# so it waits behind every scored request.
+	adaptive_admission @scored {
+		controller adaptive {
+			min_concurrency 10
+			max_concurrency 200
+			target_p95      800ms
+		}
+		queue_max_size 500
+		queue_timeout  10s
+	}
+
+	reverse_proxy page-search-api-1:8080 page-search-api-2:8080
+}
+
+# Form B -- handle blocks, for when the excluded paths are handled
+# differently: here by a static-file upstream, though a block can just as
+# well hold file_server or the same reverse_proxy without the two modules.
+# Caddy runs only the first matching handle block and tries a block with no
+# matcher last, so the catch-all block takes every request the others don't.
+# Its backend label differs from form A's: the admin API keeps one handler
+# per label.
+:8081 {
+	@static path /static /static/*
+
+	handle @static {
+		reverse_proxy wayback-static:8080
+	}
+
+	handle {
+		fairness {
+			backend wayback
+			import shared_scoring
+		}
+
+		adaptive_admission {
+			controller fixed {
+				limit 50
+			}
+			queue_max_size 500
+			queue_timeout  10s
+		}
+
+		reverse_proxy wayback-1:8080 wayback-2:8080
+	}
+}

@@ -682,3 +682,30 @@ them, a priority request at a full queue takes the place of the last non-priorit
 projected wait counts only the priority requests ahead of it, so it's refused only when priority
 requests alone fill the queue. With the defaults (`reject_new`, `all`), a full or deep queue still
 refuses it.
+
+## 12. Paths kept out of scoring and admission
+
+Neither module has a path-exclusion directive; Caddy's request matchers do the job. `fairness`
+counts only the requests that reach it, since every scoring dimension's rate (§2) belongs to that
+handler, not to the whole server. `adaptive_admission` likewise limits, queues and times only the
+requests that reach it. A path that skips both, such as `/static/*`, is never penalized, never
+takes a concurrency slot, and never counts towards the p95 latency the adaptive controller (§6)
+adjusts by.
+
+Put the same named matcher on both directives when one backend serves everything:
+
+```caddyfile
+@scored not path /static /static/* /favicon.ico
+
+fairness @scored { ... }
+adaptive_admission @scored { ... }
+reverse_proxy backend-1:8080 backend-2:8080
+```
+
+`/static/*` needs something after the slash, so list `/static` too. A request that skips `fairness`
+but reaches `adaptive_admission` is still limited and queued, with the fallback score of `0` (§8):
+the default `min_score`, so it waits behind every scored request. When the excluded paths go
+elsewhere (another upstream, `file_server`), use `handle` blocks instead and put both directives
+only in the catch-all one. Don't split one backend's paths across two `fairness` blocks with the
+same `backend` label: the admin API keeps one handler per label. Both forms are in
+[`examples/fairness-exclude-paths.Caddyfile`](../examples/fairness-exclude-paths.Caddyfile).

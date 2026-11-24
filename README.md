@@ -94,6 +94,9 @@ See [`examples/`](examples/) for runnable Caddyfiles, from minimal to exhaustive
 - [`fairness-session-cookie.Caddyfile`](examples/fairness-session-cookie.Caddyfile) — a signed
   session cookie issued behind Anubis and checked on Wayback replay, giving recent human browser
   sessions a better base priority (still penalized per session if they flood).
+- [`fairness-exclude-paths.Caddyfile`](examples/fairness-exclude-paths.Caddyfile) — paths such as
+  `/static/*` kept out of scoring and admission with Caddy matchers, so they're never penalized,
+  never queued, and never counted in the adaptive controller's latency.
 - [`adaptive-admission-full.Caddyfile`](examples/adaptive-admission-full.Caddyfile) — both
   controller kinds (`fixed` and `adaptive`) with every sub-field set explicitly, one per commented
   line.
